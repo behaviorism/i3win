@@ -5,6 +5,7 @@ mod bar_layout;
 mod mainloop;
 mod paths;
 mod reconcile;
+mod status;
 mod win;
 
 use std::path::PathBuf;

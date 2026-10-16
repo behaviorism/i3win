@@ -17,6 +17,7 @@ use i3win_core::wm::{Effect, Wm};
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
 use crate::reconcile::{self, Applied, WinOp};
+use crate::status::{exit_block, StatusProcess};
 use crate::win::bar::Bars;
 use crate::win::deco::Decos;
 use crate::win::events::{self, PlatformEvent};
@@ -128,6 +129,7 @@ pub struct App {
     bars: Bars,
     /// Latest status blocks (empty until the status process feeds them).
     blocks: Vec<Block>,
+    status: Option<StatusProcess>,
     store: HiddenStore,
     config_path: PathBuf,
     last_combos: Vec<KeyCombo>,
@@ -162,7 +164,7 @@ impl App {
         if let Some(fg) = window::foreground() {
             wm.on_focus_changed(fg);
         }
-        App {
+        let mut app = App {
             wm,
             applied: Applied::default(),
             tracker: HideTracker::new(),
@@ -173,7 +175,44 @@ impl App {
             config_path,
             last_combos: Vec::new(),
             pending,
+            status: None,
+        };
+        app.restart_status();
+        app
+    }
+
+    /// Kills the running status process (if any) and starts the configured one.
+    fn restart_status(&mut self) {
+        if let Some(mut old) = self.status.take() {
+            old.kill();
         }
+        let Some(cmd) = self
+            .wm
+            .config
+            .bar
+            .as_ref()
+            .and_then(|b| b.status_command.clone())
+        else {
+            self.blocks.clear();
+            return;
+        };
+        match StatusProcess::spawn(&cmd) {
+            Ok(p) => self.status = Some(p),
+            Err(e) => {
+                log::error!("status_command {cmd:?}: {e}");
+                self.blocks = vec![exit_block()];
+            }
+        }
+    }
+
+    fn status_gen(&self) -> Option<u64> {
+        self.status.as_ref().map(|s| s.generation())
+    }
+
+    /// Redraws only the bars with the current blocks.
+    fn refresh_bars(&mut self) {
+        let arr = self.wm.arrange();
+        self.bars.update(&self.wm, &arr, &self.blocks);
     }
 
     fn try_manage_in(wm: &mut Wm, id: WindowId) {
@@ -254,9 +293,27 @@ impl App {
         self.wm.binding_pressed(combo);
     }
 
-    /// Handles a cross-thread message. Does not flush.
-    pub fn on_main_msg(&mut self, msg: MainMsg) {
+    /// Handles a cross-thread message. Does not flush; returns whether the caller
+    /// must (status messages only refresh the bars themselves).
+    pub fn on_main_msg(&mut self, msg: MainMsg) -> bool {
         match msg {
+            MainMsg::StatusUpdate(g, blocks) => {
+                if self.status_gen() == Some(g) {
+                    self.blocks = blocks;
+                    self.refresh_bars();
+                }
+                return false;
+            }
+            MainMsg::StatusExited(g) => {
+                if self.status_gen() == Some(g) {
+                    if let Some(mut p) = self.status.take() {
+                        p.kill();
+                    }
+                    self.blocks = vec![exit_block()];
+                    self.refresh_bars();
+                }
+                return false;
+            }
             // Shutdown is handled by the window procedure itself.
             MainMsg::Shutdown => {}
             #[cfg(debug_assertions)]
@@ -276,10 +333,13 @@ impl App {
                 x,
                 y,
             } => {
-                // Forwarded to the status process once it exists.
-                log::debug!("status click {name:?}/{instance:?} button {button} at {x},{y}");
+                if let Some(p) = self.status.as_mut() {
+                    p.click(name.as_deref(), instance.as_deref(), button, x, y);
+                }
+                return false;
             }
         }
+        true
     }
 
     /// Re-reads monitor geometry and re-places every window.
@@ -398,6 +458,7 @@ impl App {
                 self.pending.extend(always.into_iter().map(Effect::Exec));
                 // New geometry settings: re-place everything.
                 self.applied.rects.clear();
+                self.restart_status();
             }
             Err(e) => log::error!("reload failed: {e}"),
         }
@@ -407,6 +468,9 @@ impl App {
         events::uninstall();
         keyboard::uninstall();
         hidden::restore_all_hidden();
+        if let Some(mut p) = self.status.take() {
+            p.kill();
+        }
         self.bars.destroy_all();
         self.decos.destroy_all();
         self.store.clear_file();

@@ -27,6 +27,10 @@ pub enum MainMsg {
         x: i32,
         y: i32,
     },
+    /// Blocks from the status process of the given generation.
+    StatusUpdate(u64, Vec<i3win_core::i3bar::Block>),
+    /// The status process of the given generation ended.
+    StatusExited(u64),
     Shutdown,
     /// Debug-only crash-safety trigger; the main thread panics on it.
     #[cfg(debug_assertions)]
@@ -116,10 +120,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if !rest.is_empty() {
                 let mut slot = Some(rest);
                 let done = with_app(|app| {
+                    let mut need_flush = false;
                     for m in slot.take().into_iter().flatten() {
-                        app.on_main_msg(m);
+                        need_flush |= app.on_main_msg(m);
                     }
-                    app.flush();
+                    if need_flush {
+                        app.flush();
+                    }
                 });
                 if !done {
                     // App busy: put the messages back; `post` re-posts the wake-up.
