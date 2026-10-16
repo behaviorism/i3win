@@ -30,6 +30,10 @@ pub enum IpcEvent {
     Binding {
         command: String,
     },
+    Output,
+    Tick {
+        payload: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -357,6 +361,7 @@ impl Wm {
         } else {
             self.insert_tiled(ws, node);
         }
+        self.emit_window("new", id);
         if ws == self.focused_workspace() {
             self.tree.set_focused(node);
             self.push_focus(id);
@@ -380,7 +385,6 @@ impl Wm {
                 }
             }
         }
-        self.emit_window("new", id);
     }
 
     pub fn unmanage(&mut self, id: WindowId) {
@@ -1031,5 +1035,27 @@ mod tests {
         assert!(wm.take_effects().is_empty());
         wm.on_title_changed(WindowId(1), "other".into());
         assert_eq!(wm.take_effects().len(), 1);
+    }
+    #[test]
+    fn manage_emits_new_before_focus() {
+        let mut wm = test_wm();
+        wm.take_effects();
+        wm.manage(win(1));
+        let evs: Vec<String> = wm
+            .take_effects()
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Ipc(IpcEvent::Window { change, .. }) => Some(change),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(evs, vec!["new", "focus"]);
+    }
+    #[test]
+    fn set_outputs_emits_output_event() {
+        let mut wm = test_wm();
+        wm.take_effects();
+        wm.set_outputs(vec![out("O1", 0, 1200)]);
+        assert!(wm.take_effects().contains(&Effect::Ipc(IpcEvent::Output)));
     }
 }

@@ -402,6 +402,7 @@ impl Wm {
             let f = self.tree.focused_descendant(self.visible_workspace(first));
             self.tree.set_focused(f);
         }
+        self.emit(IpcEvent::Output);
     }
 }
 
