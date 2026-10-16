@@ -167,12 +167,15 @@ impl Wm {
         let was_floating = self.tree.is_floating(target);
         let src_was_focused = self.is_visible(src) && self.focused_workspace() == src;
         let old_parent = self.tree.parent(target);
-        let moved: Vec<_> = self
-            .tree
-            .windows_under(target)
-            .into_iter()
+        let moved_nodes = self.tree.windows_under(target);
+        let moved: Vec<_> = moved_nodes
+            .iter()
+            .copied()
             .filter_map(|n| self.tree.window_id(n))
             .collect();
+        for &n in &moved_nodes {
+            self.tree.get_mut(n).fullscreen = false;
+        }
         self.tree.detach(target);
         if let Some(p) = old_parent {
             if matches!(self.tree.get(p).kind, NodeKind::Container) {

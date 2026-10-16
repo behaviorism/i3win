@@ -363,6 +363,7 @@ impl Wm {
         let ws = self.tree.workspace_of(node);
         let was_focused = self.tree.focused_descendant(self.tree.root()) == node;
         let parent = self.tree.parent(node);
+        self.tree.get_mut(node).fullscreen = false;
         self.tree.remove(node);
         if let Some(p) = parent {
             if matches!(self.tree.get(p).kind, NodeKind::Container) {
@@ -542,7 +543,8 @@ impl Wm {
                 px,
                 ppt,
             } => return self.resize(target, *grow, *axis, *px, *ppt),
-            Command::Fullscreen(_) | Command::Floating(_) => return Err("not implemented".into()),
+            Command::Fullscreen(t) => return self.set_fullscreen(target, t),
+            Command::Floating(t) => return self.set_floating(target, t),
         }
         Ok(())
     }
