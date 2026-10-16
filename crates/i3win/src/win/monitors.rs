@@ -11,7 +11,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
 /// Strips the leading device-namespace prefix from a GDI device name (DISPLAY1 from the full path).
 pub fn output_name(device: &str) -> String {
-    device.strip_prefix(r"\.\").unwrap_or(device).to_string()
+    device.strip_prefix(r"\\.\").unwrap_or(device).to_string()
 }
 
 /// Orders outputs left-to-right, then top-to-bottom.
@@ -81,7 +81,8 @@ mod tests {
 
     #[test]
     fn names() {
-        assert_eq!(output_name(r"\.\DISPLAY2"), "DISPLAY2");
+        assert_eq!(output_name(r"\\.\DISPLAY2"), "DISPLAY2");
+        assert_eq!(output_name("\\\\.\\DISPLAY1"), "DISPLAY1");
         assert_eq!(output_name("X"), "X");
     }
     #[test]
@@ -100,6 +101,23 @@ mod tests {
         ];
         sort_outputs(&mut v);
         assert_eq!(v[0].name, "A");
+    }
+    #[test]
+    fn sort_ties_on_y() {
+        let mut v = vec![
+            OutputInfo {
+                name: "Lower".into(),
+                rect: Rect::new(0, 1080, 1920, 1040),
+                scale: 1.0,
+            },
+            OutputInfo {
+                name: "Upper".into(),
+                rect: Rect::new(0, 0, 1920, 1040),
+                scale: 1.0,
+            },
+        ];
+        sort_outputs(&mut v);
+        assert_eq!(v[0].name, "Upper");
     }
     #[test]
     fn enumerate_finds_at_least_one() {
