@@ -19,6 +19,14 @@ pub const WM_APP_MAIN: u32 = WM_APP + 3;
 #[derive(Debug)]
 pub enum MainMsg {
     FocusNode(NodeId),
+    RunCommand(String),
+    StatusClick {
+        name: Option<String>,
+        instance: Option<String>,
+        button: u8,
+        x: i32,
+        y: i32,
+    },
     Shutdown,
     /// Debug-only crash-safety trigger; the main thread panics on it.
     #[cfg(debug_assertions)]

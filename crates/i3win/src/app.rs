@@ -9,6 +9,7 @@ use std::time::Instant;
 use i3win_core::arrange::floating_frame_from_client;
 use i3win_core::config::{default_config_text, parse_config, Config};
 use i3win_core::geom::Rect;
+use i3win_core::i3bar::Block;
 use i3win_core::keys::KeyCombo;
 use i3win_core::tree::{NodeKind, WindowId};
 use i3win_core::wm::{Effect, Wm};
@@ -16,6 +17,7 @@ use i3win_core::wm::{Effect, Wm};
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
 use crate::reconcile::{self, Applied, WinOp};
+use crate::win::bar::Bars;
 use crate::win::deco::Decos;
 use crate::win::events::{self, PlatformEvent};
 use crate::win::hidden::{self, HiddenStore, HideTracker};
@@ -123,6 +125,9 @@ pub struct App {
     applied: Applied,
     tracker: HideTracker,
     decos: Decos,
+    bars: Bars,
+    /// Latest status blocks (empty until the status process feeds them).
+    blocks: Vec<Block>,
     store: HiddenStore,
     config_path: PathBuf,
     last_combos: Vec<KeyCombo>,
@@ -162,6 +167,8 @@ impl App {
             applied: Applied::default(),
             tracker: HideTracker::new(),
             decos: Decos::new(),
+            bars: Bars::new(),
+            blocks: Vec::new(),
             store: HiddenStore::open(paths::hidden_path()),
             config_path,
             last_combos: Vec::new(),
@@ -259,6 +266,19 @@ impl App {
                     self.wm.focus_node(n);
                 }
             }
+            MainMsg::RunCommand(c) => {
+                self.wm.run_command(&c);
+            }
+            MainMsg::StatusClick {
+                name,
+                instance,
+                button,
+                x,
+                y,
+            } => {
+                // Forwarded to the status process once it exists.
+                log::debug!("status click {name:?}/{instance:?} button {button} at {x},{y}");
+            }
         }
     }
 
@@ -338,6 +358,7 @@ impl App {
                 .find(|(o, _)| cx >= o.x && cx < o.right() && cy >= o.y && cy < o.bottom())
                 .map_or(1.0, |(_, s)| *s)
         });
+        self.bars.update(&self.wm, &arr, &self.blocks);
         // Focus last: focusing a still-hidden window fails.
         let leaf = self
             .wm
@@ -386,6 +407,7 @@ impl App {
         events::uninstall();
         keyboard::uninstall();
         hidden::restore_all_hidden();
+        self.bars.destroy_all();
         self.decos.destroy_all();
         self.store.clear_file();
     }

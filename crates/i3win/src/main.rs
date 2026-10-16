@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-#[allow(dead_code)] // consumed by the bar window in a later task
 mod bar_layout;
 mod mainloop;
 mod paths;
