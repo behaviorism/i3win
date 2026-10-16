@@ -1,6 +1,6 @@
 //! Tracking of hides we caused ourselves, and persistence of hidden windows so
 //! they can be restored after a crash.
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -55,53 +55,73 @@ impl HideTracker {
     }
 }
 
-/// Windows we have hidden, persisted one decimal id per line.
+/// Windows we have hidden, persisted one `hwnd pid` (decimal) line per window.
+/// The pid guards against HWND reuse when the file outlives the windows.
 pub struct HiddenStore {
     path: PathBuf,
-    set: BTreeSet<isize>,
+    set: BTreeMap<isize, u32>,
+    dirty: bool,
 }
 
 impl HiddenStore {
     pub fn open(path: PathBuf) -> HiddenStore {
         HiddenStore {
             path,
-            set: BTreeSet::new(),
+            set: BTreeMap::new(),
+            dirty: false,
         }
     }
 
+    /// Records the window (with its current owner pid). Persisted by `persist_if_dirty`.
     pub fn add(&mut self, id: WindowId) {
-        self.set.insert(id.0);
-        self.persist();
+        self.add_with_pid(id, window::window_pid(id));
+    }
+
+    pub fn add_with_pid(&mut self, id: WindowId, pid: u32) {
+        if self.set.insert(id.0, pid) != Some(pid) {
+            self.dirty = true;
+        }
     }
 
     pub fn remove(&mut self, id: WindowId) {
-        self.set.remove(&id.0);
-        self.persist();
+        if self.set.remove(&id.0).is_some() {
+            self.dirty = true;
+        }
     }
 
-    #[allow(dead_code)] // inspection helper, unused until IPC (Plan 4)
     pub fn contains(&self, id: WindowId) -> bool {
-        self.set.contains(&id.0)
+        self.set.contains_key(&id.0)
     }
 
     #[allow(dead_code)] // inspection helper, unused until IPC (Plan 4)
     pub fn ids(&self) -> Vec<WindowId> {
-        self.set.iter().map(|&i| WindowId(i)).collect()
+        self.set.keys().map(|&i| WindowId(i)).collect()
     }
 
     pub fn clear_file(&mut self) {
         self.set.clear();
-        self.persist();
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("hidden store: remove {}: {e}", self.path.display());
-            }
-        }
+        self.dirty = false;
+        *lock_mirror() = BTreeSet::new();
+        clear_store_file(&self.path);
     }
 
-    fn persist(&self) {
-        *lock_mirror() = self.set.clone();
-        let text: String = self.set.iter().map(|i| format!("{i}\n")).collect();
+    /// Writes the file (and the crash mirror) once if anything changed.
+    pub fn persist_if_dirty(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        *lock_mirror() = self.set.keys().copied().collect();
+        let text: String = self
+            .set
+            .iter()
+            .map(|(i, pid)| {
+                format!(
+                    "{i} {pid}
+"
+                )
+            })
+            .collect();
         let mut tmp = self.path.clone().into_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
@@ -112,18 +132,44 @@ impl HiddenStore {
     }
 }
 
-/// Reads ids left by a previous run (skipping bad lines) and deletes the file.
-pub fn take_previous(path: &Path) -> Vec<WindowId> {
-    let ids = std::fs::read_to_string(path)
-        .map(|s| {
-            s.lines()
-                .filter_map(|l| l.trim().parse::<isize>().ok())
-                .map(WindowId)
-                .collect()
+/// Deletes the store file (used when the session ends and everything was shown).
+pub fn clear_store_file(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("hidden store: remove {}: {e}", path.display());
+        }
+    }
+}
+
+/// Parses `hwnd pid` lines, skipping anything else (including old single-number lines).
+fn parse_store(text: &str) -> Vec<(WindowId, u32)> {
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let id = it.next()?.parse::<isize>().ok()?;
+            let pid = it.next()?.parse::<u32>().ok()?;
+            if it.next().is_some() {
+                return None;
+            }
+            Some((WindowId(id), pid))
         })
-        .unwrap_or_default();
-    let _ = std::fs::remove_file(path);
-    ids
+        .collect()
+}
+
+/// Reads `(window, pid)` pairs left by a previous run and deletes the file.
+/// On a read error other than "not found" the file is kept and an error logged.
+pub fn take_previous(path: &Path) -> Vec<(WindowId, u32)> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            let _ = std::fs::remove_file(path);
+            parse_store(&s)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            log::error!("hidden store: read {}: {e}", path.display());
+            Vec::new()
+        }
+    }
 }
 
 /// Shows every window in the mirror. Safe for panic hooks and console handlers.
@@ -159,23 +205,59 @@ mod tests {
         assert!(!t.consume(w, t0 + Duration::from_secs(3))); // expired
     }
 
+    fn temp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("i3win_test_{name}_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
     #[test]
     fn store_roundtrip_and_take_previous() {
-        let p = std::env::temp_dir().join(format!("i3win_test_hidden_{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        let p = temp("hidden_rt");
         let mut s = HiddenStore::open(p.clone());
-        s.add(WindowId(10));
-        s.add(WindowId(20));
+        s.add_with_pid(WindowId(10), 100);
+        s.add_with_pid(WindowId(20), 200);
         s.remove(WindowId(10));
+        assert!(!p.exists()); // nothing is written until persisted
+        s.persist_if_dirty();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "20 200
+"
+        );
+        assert_eq!(take_previous(&p), vec![(WindowId(20), 200)]);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn malformed_and_old_format_lines_are_skipped() {
+        let p = temp("hidden_bad");
         std::fs::write(
             &p,
-            format!(
-                "{}\ngarbage\n30\n",
-                std::fs::read_to_string(&p).unwrap().trim()
-            ),
+            "30
+garbage
+5 x
+7 8 9
+ 40  41 
+",
         )
         .unwrap();
-        assert_eq!(take_previous(&p), vec![WindowId(20), WindowId(30)]);
+        assert_eq!(take_previous(&p), vec![(WindowId(40), 41)]);
+    }
+
+    #[test]
+    fn persist_only_when_dirty() {
+        let p = temp("hidden_dirty");
+        let mut s = HiddenStore::open(p.clone());
+        s.persist_if_dirty();
         assert!(!p.exists());
+        s.add_with_pid(WindowId(1), 2);
+        s.persist_if_dirty();
+        std::fs::remove_file(&p).unwrap();
+        s.add_with_pid(WindowId(1), 2); // unchanged
+        s.persist_if_dirty();
+        assert!(!p.exists());
+        assert!(s.contains(WindowId(1)));
+        clear_store_file(&p);
     }
 }

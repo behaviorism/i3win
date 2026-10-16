@@ -44,6 +44,7 @@ const IGNORED_CLASSES: [&str; 6] = [
 /// Raw facts about a window, gathered from Win32, that drive classification.
 pub struct WindowProps {
     pub visible: bool,
+    pub minimized: bool,
     pub style: u32,
     pub ex_style: u32,
     pub has_owner: bool,
@@ -62,7 +63,14 @@ pub enum Manage {
 }
 
 pub fn classify(p: &WindowProps) -> Manage {
-    if !p.visible || p.is_child || p.has_owner || p.cloaked || p.own_process || p.title.is_empty() {
+    if !p.visible
+        || p.minimized
+        || p.is_child
+        || p.has_owner
+        || p.cloaked
+        || p.own_process
+        || p.title.is_empty()
+    {
         return Manage::No;
     }
     if p.ex_style & WS_EX_TOOLWINDOW != 0 || p.ex_style & WS_EX_NOACTIVATE != 0 {
@@ -130,6 +138,10 @@ fn class_name(h: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.clamp(0, 256) as usize])
 }
 
+pub fn window_pid(id: WindowId) -> u32 {
+    process_id(hwnd(id))
+}
+
 fn process_id(h: HWND) -> u32 {
     let mut pid = 0u32;
     // SAFETY: pid is a valid out pointer.
@@ -187,6 +199,7 @@ pub fn props(id: WindowId) -> Option<WindowProps> {
             && cloak != 0;
         Some(WindowProps {
             visible: IsWindowVisible(h).as_bool(),
+            minimized: IsIconic(h).as_bool(),
             style,
             ex_style,
             has_owner,
@@ -205,8 +218,8 @@ pub fn info(id: WindowId, wants_float: bool) -> Option<WindowInfo> {
     Some(WindowInfo {
         id,
         title: window_text(h),
-        class: class_name(h),
-        instance: exe_name(process_id(h)),
+        class: exe_name(process_id(h)),
+        instance: class_name(h),
         rect,
         wants_float,
     })
@@ -273,15 +286,27 @@ pub fn place(id: WindowId, target: Rect, raise: bool) {
     }
 }
 
-/// Hides the window; returns whether it was visible beforehand.
+thread_local! {
+    static HIDE_WARNED: RefCell<HashSet<WindowId>> = RefCell::new(HashSet::new());
+}
+
+/// Hides the window; returns whether the hide request was accepted.
 pub fn hide(id: WindowId) -> bool {
-    let h = hwnd(id);
-    // SAFETY: plain Win32 calls.
-    unsafe {
-        let was = IsWindowVisible(h).as_bool();
-        let _ = ShowWindowAsync(h, SW_HIDE);
-        was
+    // SAFETY: plain Win32 call.
+    let ok = unsafe { ShowWindowAsync(hwnd(id), SW_HIDE) }.as_bool();
+    if ok {
+        HIDE_WARNED.with(|w| {
+            w.borrow_mut().remove(&id);
+        });
+    } else if HIDE_WARNED.with(|w| w.borrow_mut().insert(id)) {
+        log::warn!("ShowWindowAsync(SW_HIDE) failed for window {:#x}", id.0);
     }
+    ok
+}
+
+pub fn is_visible(id: WindowId) -> bool {
+    // SAFETY: plain Win32 call.
+    unsafe { IsWindowVisible(hwnd(id)).as_bool() }
 }
 
 pub fn show(id: WindowId) {
@@ -308,9 +333,8 @@ pub fn focus(id: WindowId) {
     }
     send_dummy_key();
     // SAFETY: plain Win32 call.
-    unsafe {
-        let _ = SetForegroundWindow(h);
-    }
+    let ok = unsafe { SetForegroundWindow(h) }.as_bool();
+    log::debug!("SetForegroundWindow({:#x}) -> {ok}", id.0);
 }
 
 /// Injects an unassigned key press so Windows lets us take the foreground.
@@ -329,9 +353,8 @@ pub fn send_dummy_key() {
     };
     let inputs = [key(Default::default()), key(KEYEVENTF_KEYUP)];
     // SAFETY: inputs is a valid slice of INPUT structs.
-    unsafe {
-        SendInput(&inputs, size_of::<INPUT>() as i32);
-    }
+    let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    log::debug!("SendInput injected {sent} of {} events", inputs.len());
 }
 
 pub fn is_window(id: WindowId) -> bool {
@@ -375,6 +398,7 @@ mod tests {
     fn base() -> WindowProps {
         WindowProps {
             visible: true,
+            minimized: false,
             style: 0x00C0_0000 | 0x0004_0000,
             ex_style: 0,
             has_owner: false,
@@ -391,8 +415,9 @@ mod tests {
     }
     #[test]
     fn rejects() {
-        let fs: [fn(&mut WindowProps); 8] = [
+        let fs: [fn(&mut WindowProps); 9] = [
             |p| p.visible = false,
+            |p| p.minimized = true,
             |p| p.has_owner = true,
             |p| p.cloaked = true,
             |p| p.own_process = true,

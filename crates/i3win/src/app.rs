@@ -62,6 +62,29 @@ pub(crate) fn decide(ev: PlatformEvent, managed: bool, expected_hide: bool) -> E
     }
 }
 
+/// Event routing including what we know about our own hides: a Hidden event for a
+/// window in `applied.hidden` is never an unmanage, and a Foreground event for one
+/// is noise caused by our own hiding.
+pub(crate) fn route(
+    ev: PlatformEvent,
+    managed: bool,
+    tracked_hide: bool,
+    applied: &Applied,
+) -> EventDecision {
+    let hidden_by_us = applied.hidden.contains(&event_id(ev));
+    match ev {
+        PlatformEvent::Foreground(_) if hidden_by_us => EventDecision::Ignore,
+        PlatformEvent::Hidden(_) => decide(ev, managed, tracked_hide || hidden_by_us),
+        _ => decide(ev, managed, false),
+    }
+}
+
+/// Only the last queued focus request matters, and only while it still names the
+/// window at the end of the core's focus path.
+pub(crate) fn focus_to_apply(requests: &[WindowId], leaf: Option<WindowId>) -> Option<WindowId> {
+    requests.last().copied().filter(|w| Some(*w) == leaf)
+}
+
 fn event_id(ev: PlatformEvent) -> WindowId {
     use PlatformEvent::*;
     match ev {
@@ -167,15 +190,23 @@ impl App {
     /// Handles one platform event. Does not flush; the caller flushes once per batch.
     pub fn on_event(&mut self, ev: PlatformEvent) {
         let id = event_id(ev);
-        let expected_hide =
+        let tracked_hide =
             matches!(ev, PlatformEvent::Hidden(_)) && self.tracker.consume(id, Instant::now());
-        match decide(ev, self.is_managed(id), expected_hide) {
+        match route(ev, self.is_managed(id), tracked_hide, &self.applied) {
             EventDecision::Ignore => {}
             EventDecision::TryManage => Self::try_manage_in(&mut self.wm, id),
             EventDecision::Unmanage => {
+                // A window we hid must never be stranded: show it before forgetting it.
+                if !matches!(ev, PlatformEvent::Destroyed(_))
+                    && self.store.contains(id)
+                    && window::is_window(id)
+                {
+                    window::show(id);
+                }
                 self.wm.unmanage(id);
                 self.tracker.forget(id);
                 self.store.remove(id);
+                self.store.persist_if_dirty();
             }
             EventDecision::Focus => self.wm.on_focus_changed(id),
             EventDecision::Title => {
@@ -265,13 +296,23 @@ impl App {
             .map(|p| p.id)
             .chain(arr.hidden.iter().copied())
             .collect();
-        for op in reconcile::plan(&mut self.applied, &arr, &managed) {
+        let ops = reconcile::plan(&mut self.applied, &arr, &managed);
+        // Write-ahead: persist every pending hide before issuing any of them.
+        for op in &ops {
+            if let WinOp::Hide(id) = op {
+                self.store.add(*id);
+            }
+        }
+        self.store.persist_if_dirty();
+        for op in ops {
             match op {
                 WinOp::Hide(id) => {
-                    if window::hide(id) {
-                        self.tracker.expect(id, Instant::now());
+                    self.tracker.expect(id, Instant::now());
+                    if !window::hide(id) {
+                        // Not hidden after all: do not claim it, retry on a later flush.
+                        self.applied.hidden.remove(&id);
+                        self.store.remove(id);
                     }
-                    self.store.add(id);
                 }
                 WinOp::Show(id) => {
                     window::show(id);
@@ -280,6 +321,7 @@ impl App {
                 WinOp::Place { id, rect, raise } => window::place(id, rect, raise),
             }
         }
+        self.store.persist_if_dirty();
         let outputs: Vec<(Rect, f32)> = self
             .wm
             .outputs()
@@ -297,13 +339,30 @@ impl App {
                 .map_or(1.0, |(_, s)| *s)
         });
         // Focus last: focusing a still-hidden window fails.
-        for w in focus {
+        let leaf = self
+            .wm
+            .tree
+            .window_id(self.wm.tree.focused_descendant(self.wm.tree.root()));
+        if let Some(w) = focus_to_apply(&focus, leaf) {
             window::focus(w);
+        } else if leaf.is_none() {
+            self.park_foreground();
         }
         let combos = self.wm.active_combos();
         if combos != self.last_combos {
             keyboard::set_combos(&combos);
             self.last_combos = combos;
+        }
+    }
+
+    /// With nothing to focus, keep typing out of windows we have hidden.
+    fn park_foreground(&self) {
+        let main = mainloop::main_hwnd();
+        if main == 0 {
+            return;
+        }
+        if window::foreground().is_some_and(|fg| self.applied.hidden.contains(&fg)) {
+            window::focus(WindowId(main));
         }
     }
 
@@ -341,6 +400,51 @@ mod tests {
             decide(PlatformEvent::Hidden(WindowId(1)), true, true),
             EventDecision::Ignore
         );
+    }
+    #[test]
+    fn hidden_for_window_we_hid_is_ignored_without_tracker_entry() {
+        let mut applied = Applied::default();
+        applied.hidden.insert(WindowId(1));
+        assert_eq!(
+            route(PlatformEvent::Hidden(WindowId(1)), true, false, &applied),
+            EventDecision::Ignore
+        );
+        // An id we did not hide still unmanages.
+        assert_eq!(
+            route(PlatformEvent::Hidden(WindowId(2)), true, false, &applied),
+            EventDecision::Unmanage
+        );
+    }
+    #[test]
+    fn foreground_of_hidden_window_is_ignored() {
+        let mut applied = Applied::default();
+        applied.hidden.insert(WindowId(1));
+        assert_eq!(
+            route(
+                PlatformEvent::Foreground(WindowId(1)),
+                true,
+                false,
+                &applied
+            ),
+            EventDecision::Ignore
+        );
+        assert_eq!(
+            route(
+                PlatformEvent::Foreground(WindowId(2)),
+                true,
+                false,
+                &applied
+            ),
+            EventDecision::Focus
+        );
+    }
+    #[test]
+    fn only_last_matching_focus_is_applied() {
+        let (a, b) = (WindowId(1), WindowId(2));
+        assert_eq!(focus_to_apply(&[a, b], Some(b)), Some(b));
+        assert_eq!(focus_to_apply(&[a, b], Some(a)), None);
+        assert_eq!(focus_to_apply(&[a], None), None);
+        assert_eq!(focus_to_apply(&[], Some(a)), None);
     }
     #[test]
     fn hidden_unexpected_unmanages() {

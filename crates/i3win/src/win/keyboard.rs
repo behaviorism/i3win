@@ -97,6 +97,8 @@ impl KeyMatcher {
                 let mask_menu = mods.contains(Modifiers::ALT) || mods.contains(Modifiers::WIN);
                 return KeyAction::Fire { combo, mask_menu };
             }
+            // A missed key-up must not leave this vk swallowing a later key-up.
+            self.swallowed.remove(&vk);
             KeyAction::Pass
         } else if self.swallowed.remove(&vk) {
             KeyAction::Swallow
@@ -219,6 +221,19 @@ mod tests {
         assert_eq!(k.on_key(0x0D, false, false), KeyAction::Swallow);
         assert_eq!(k.on_key(0xA4, false, false), KeyAction::Pass);
         assert_eq!(k.on_key(0x0D, true, false), KeyAction::Pass);
+    }
+    #[test]
+    fn missed_key_up_is_forgotten_on_next_plain_key_down() {
+        let mut k = m(&["Mod1+Return"]);
+        k.on_key(0xA4, true, false);
+        assert!(matches!(
+            k.on_key(0x0D, true, false),
+            KeyAction::Fire { .. }
+        ));
+        // key-up of Return and Alt were missed; Alt is released later.
+        k.on_key(0xA4, false, false);
+        assert_eq!(k.on_key(0x0D, true, false), KeyAction::Pass);
+        assert_eq!(k.on_key(0x0D, false, false), KeyAction::Pass);
     }
     #[test]
     fn exact_modifier_match() {

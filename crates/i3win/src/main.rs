@@ -7,6 +7,8 @@ mod reconcile;
 mod win;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::thread::ThreadId;
 
 use simplelog::{
     ColorChoice, CombinedLogger, Config, LevelFilter, SharedLogger, TermLogger, TerminalMode,
@@ -61,11 +63,17 @@ unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> BOOL {
     }
 }
 
+static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
+
 fn install_crash_safety() {
+    let _ = MAIN_THREAD.set(std::thread::current().id());
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Only a panic on the main thread poisons the app; restore first, then log.
+        if MAIN_THREAD.get() == Some(&std::thread::current().id()) {
+            win::hidden::restore_all_hidden();
+        }
         log::error!("panic: {info}");
-        win::hidden::restore_all_hidden();
         default_hook(info);
     }));
     // SAFETY: the handler is a plain `extern "system"` fn that lives for the whole process.
@@ -120,23 +128,28 @@ fn main() {
 
     let config_path = paths::config_path(config_override);
 
-    // Recover windows a crashed previous run left hidden.
-    for id in win::hidden::take_previous(&paths::hidden_path()) {
-        if win::window::is_window(id) {
-            win::window::show(id);
-        }
-    }
-
     if let Err(e) = mainloop::create_main_window() {
         log::error!("cannot create main window: {e}");
         std::process::exit(1);
     }
-    app::APP.with(|a| *a.borrow_mut() = Some(app::App::start(config_path)));
-
-    // Hooks go in only after the main window exists, so their wake-ups have a target.
+    // Hooks go in as soon as the main window exists (their wake-ups need a target),
+    // so windows shown by the recovery below are seen as late Shown events.
     if let Err(e) = win::events::install() {
         log::error!("cannot install event hooks: {e}");
     }
+
+    // Recover windows a crashed previous run left hidden. Only windows that are
+    // still owned by the same process and are still invisible (HWNDs get reused).
+    for (id, pid) in win::hidden::take_previous(&paths::hidden_path()) {
+        if win::window::is_window(id)
+            && win::window::window_pid(id) == pid
+            && !win::window::is_visible(id)
+        {
+            win::window::show(id);
+        }
+    }
+
+    app::APP.with(|a| *a.borrow_mut() = Some(app::App::start(config_path)));
     if let Err(e) = win::keyboard::install() {
         log::error!("cannot install keyboard hook: {e}");
     }

@@ -161,6 +161,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ENDSESSION if wp.0 != 0 => {
             hidden::restore_all_hidden();
+            hidden::clear_store_file(&crate::paths::hidden_path());
             LRESULT(0)
         }
         WM_CLOSE => {
