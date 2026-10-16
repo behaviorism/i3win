@@ -1,11 +1,20 @@
 //! status_command process manager: spawn, read blocks, forward click events.
 use std::io::{BufRead, BufReader, Write};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 
 use i3win_core::i3bar::{Block, ClickWriter, StatusParser};
+
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 
 use crate::mainloop::{post, MainMsg};
 
@@ -16,7 +25,10 @@ static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
 
 pub struct StatusProcess {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// Feeds the writer thread; click() never blocks on the pipe.
+    stdin_tx: Option<Sender<String>>,
+    /// Job holding cmd.exe and its descendants; closing it kills the tree.
+    job: Option<HANDLE>,
     writer: ClickWriter,
     click_events: Arc<AtomicBool>,
     generation: u64,
@@ -53,7 +65,17 @@ impl StatusProcess {
             }
         }
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take();
+        let job = make_job(&child);
+        let (stdin_tx, stdin_rx) = channel::<String>();
+        if let Some(mut stdin) = child.stdin.take() {
+            std::thread::spawn(move || {
+                for line in stdin_rx {
+                    if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         let stdout = child.stdout.take();
         let click_events = Arc::new(AtomicBool::new(false));
         let generation = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
@@ -82,7 +104,8 @@ impl StatusProcess {
         });
         Ok(StatusProcess {
             child,
-            stdin,
+            stdin_tx: Some(stdin_tx),
+            job,
             writer: ClickWriter::new(),
             click_events,
             generation,
@@ -106,16 +129,58 @@ impl StatusProcess {
             return;
         }
         let line = self.writer.encode(name, instance, button, x, y);
-        if let Some(stdin) = self.stdin.as_mut() {
-            let _ = stdin.write_all(line.as_bytes());
-            let _ = stdin.flush();
+        if let Some(tx) = self.stdin_tx.as_ref() {
+            let _ = tx.send(line);
         }
     }
 
     pub fn kill(&mut self) {
-        self.stdin = None;
+        self.stdin_tx = None;
+        if let Some(job) = self.job.take() {
+            // SAFETY: the handle is ours and is not used again.
+            unsafe {
+                let _ = TerminateJobObject(job, 1);
+                let _ = CloseHandle(job);
+            }
+        }
         let _ = self.child.kill();
-        let _ = self.child.try_wait();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for StatusProcess {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Creates a kill-on-close job and assigns the child to it. Failure only costs the
+/// tree-kill guarantee, so it is logged and ignored.
+fn make_job(child: &Child) -> Option<HANDLE> {
+    // SAFETY: plain Win32 calls on handles we own.
+    unsafe {
+        let job = match CreateJobObjectW(None, None) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("status job: {e}");
+                return None;
+            }
+        };
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .and_then(|_| AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())));
+        if let Err(e) = ok {
+            log::warn!("status job: {e}");
+            let _ = CloseHandle(job);
+            return None;
+        }
+        Some(job)
     }
 }
 
@@ -123,6 +188,9 @@ impl StatusProcess {
 mod tests {
     use super::*;
     use crate::mainloop::{drain_main_msgs, MainMsg};
+
+    /// Tests share the global message queue; run them one at a time.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn exit_block_text() {
@@ -134,6 +202,7 @@ mod tests {
 
     #[test]
     fn spawn_and_read_plain_output() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut p = StatusProcess::spawn("echo hello").unwrap();
         let gen = p.generation();
         let t = std::time::Instant::now();
@@ -152,5 +221,29 @@ mod tests {
             |m| matches!(m, MainMsg::StatusUpdate(g, b) if *g == gen && b[0].full_text == "hello")
         ));
         p.kill();
+    }
+
+    #[test]
+    fn kill_terminates_grandchild_holding_the_pipe() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = StatusProcess::spawn("ping -n 30 127.0.0.1").unwrap();
+        let gen = p.generation();
+        let wait_for = |pred: &dyn Fn(&MainMsg) -> bool| {
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_secs(5) {
+                if drain_main_msgs().iter().any(pred) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(wait_for(
+            &|m| matches!(m, MainMsg::StatusUpdate(g, _) if *g == gen)
+        ));
+        p.kill();
+        assert!(wait_for(
+            &|m| matches!(m, MainMsg::StatusExited(g) if *g == gen)
+        ));
     }
 }
