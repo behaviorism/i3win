@@ -43,6 +43,10 @@ pub enum MainMsg {
     DebugPanic,
 }
 
+/// Serializes tests that use the process-global queue.
+#[cfg(test)]
+pub(crate) static QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static QUEUE: Mutex<VecDeque<MainMsg>> = Mutex::new(VecDeque::new());
 /// True while a WM_APP_MAIN wake-up is posted and not yet being handled.
@@ -271,6 +275,7 @@ mod tests {
 
     #[test]
     fn thousand_posts_without_window_are_all_queued() {
+        let _g = QUEUE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(main_hwnd(), 0);
         let _ = drain_main_msgs();
         for i in 0..1000 {

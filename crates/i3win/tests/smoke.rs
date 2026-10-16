@@ -166,7 +166,7 @@ fn request(f: &mut std::fs::File, ty: u32, payload: &str) -> serde_json::Value {
 
 fn ipc_run(children: &mut Vec<Child>) {
     use i3win_core::ipc::{GET_VERSION, GET_WORKSPACES, RUN_COMMAND, SUBSCRIBE};
-    let pipe = format!(r"\.\pipe\i3win-test-{}", std::process::id());
+    let pipe = format!(r"\\.\pipe\i3win-test-{}", std::process::id());
     let cfg = std::env::temp_dir().join("i3win-smoke-ipc-config");
     std::fs::write(&cfg, "default_border none\n").unwrap();
     children.push(
