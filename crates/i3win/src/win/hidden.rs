@@ -79,10 +79,12 @@ impl HiddenStore {
         self.persist();
     }
 
+    #[allow(dead_code)] // inspection helper, unused until IPC (Plan 4)
     pub fn contains(&self, id: WindowId) -> bool {
         self.set.contains(&id.0)
     }
 
+    #[allow(dead_code)] // inspection helper, unused until IPC (Plan 4)
     pub fn ids(&self) -> Vec<WindowId> {
         self.set.iter().map(|&i| WindowId(i)).collect()
     }

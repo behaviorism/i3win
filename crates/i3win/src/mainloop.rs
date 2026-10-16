@@ -1,8 +1,12 @@
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use i3win_core::tree::NodeId;
+
+use crate::app::{App, APP};
+use crate::win::{events, hidden, keyboard, window};
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -14,6 +18,8 @@ pub const WM_APP_MAIN: u32 = WM_APP + 3;
 
 #[derive(Debug)]
 pub enum MainMsg {
+    // Constructed by the bar in Plan 3.
+    #[allow(dead_code)]
     FocusNode(NodeId),
     Shutdown,
 }
@@ -47,14 +53,99 @@ pub fn drain_main_msgs() -> Vec<MainMsg> {
     }
 }
 
+const SPI_SETWORKAREA: usize = 0x2F;
+
+/// Runs `f` against the App if it is not already borrowed; returns false when busy.
+/// A panic inside `f` restores all hidden windows and shuts down.
+fn with_app(f: impl FnOnce(&mut App)) -> bool {
+    APP.with(|cell| {
+        let Ok(mut guard) = cell.try_borrow_mut() else {
+            return false;
+        };
+        if let Some(app) = guard.as_mut() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(app))) {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                log::error!("panic in message handler: {msg}");
+                hidden::restore_all_hidden();
+                post(MainMsg::Shutdown);
+            }
+        }
+        true
+    })
+}
+
+fn repost(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
+    // SAFETY: plain Win32 call on our own window.
+    unsafe {
+        let _ = PostMessageW(hwnd, msg, wp, lp);
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_MAIN => {
+            let mut rest = Vec::new();
             for m in drain_main_msgs() {
                 match m {
                     MainMsg::Shutdown => PostQuitMessage(0),
-                    MainMsg::FocusNode(_) => {}
+                    other => rest.push(other),
                 }
+            }
+            if !rest.is_empty() {
+                let mut slot = Some(rest);
+                let done = with_app(|app| {
+                    for m in slot.take().into_iter().flatten() {
+                        app.on_main_msg(m);
+                    }
+                    app.flush();
+                });
+                if !done {
+                    // App busy: put the messages back; `post` re-posts the wake-up.
+                    for m in slot.take().into_iter().flatten() {
+                        post(m);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_EVENTS => {
+            if !with_app(|app| {
+                for ev in events::drain() {
+                    app.on_event(ev);
+                }
+                app.flush();
+            }) {
+                repost(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
+        WM_APP_KEY => {
+            if !with_app(|app| {
+                for (combo, mask_menu) in keyboard::drain() {
+                    if mask_menu {
+                        window::send_dummy_key();
+                    }
+                    app.on_binding(combo);
+                }
+                app.flush();
+            }) {
+                repost(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            if !with_app(|app| app.refresh_outputs()) {
+                repost(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE if wp.0 == SPI_SETWORKAREA => {
+            if !with_app(|app| app.refresh_outputs()) {
+                repost(hwnd, msg, wp, lp);
             }
             LRESULT(0)
         }

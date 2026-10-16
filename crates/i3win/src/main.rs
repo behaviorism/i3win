@@ -1,11 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-// Scaffold: some items are only consumed by later tasks.
-#[allow(dead_code)]
+mod app;
 mod mainloop;
-#[allow(dead_code)]
 mod paths;
-#[allow(dead_code)]
+mod reconcile;
 mod win;
 
 use std::path::PathBuf;
@@ -73,12 +71,42 @@ fn main() {
         std::process::exit(1);
     }
 
-    let _config_path = paths::config_path(config_override);
-    // Later tasks add startup steps here.
+    let config_path = paths::config_path(config_override);
+
+    // Recover windows a crashed previous run left hidden.
+    for id in win::hidden::take_previous(&paths::hidden_path()) {
+        if win::window::is_window(id) {
+            win::window::show(id);
+        }
+    }
 
     if let Err(e) = mainloop::create_main_window() {
         log::error!("cannot create main window: {e}");
         std::process::exit(1);
     }
-    std::process::exit(mainloop::run());
+    app::APP.with(|a| *a.borrow_mut() = Some(app::App::start(config_path)));
+
+    // Hooks go in only after the main window exists, so their wake-ups have a target.
+    if let Err(e) = win::events::install() {
+        log::error!("cannot install event hooks: {e}");
+    }
+    if let Err(e) = win::keyboard::install() {
+        log::error!("cannot install keyboard hook: {e}");
+    }
+    app::APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            for ev in win::events::drain() {
+                app.on_event(ev);
+            }
+            app.flush();
+        }
+    });
+
+    let code = mainloop::run();
+    app::APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.shutdown();
+        }
+    });
+    std::process::exit(code);
 }
