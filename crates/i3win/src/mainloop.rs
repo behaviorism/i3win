@@ -21,6 +21,11 @@ pub enum MainMsg {
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static QUEUE: Mutex<VecDeque<MainMsg>> = Mutex::new(VecDeque::new());
 
+/// Raw handle of the main window, or 0 before it exists.
+pub fn main_hwnd() -> isize {
+    MAIN_HWND.load(Ordering::SeqCst)
+}
+
 /// Queue a message for the main thread; callable from any thread.
 /// If no main window exists yet, the message stays queued.
 pub fn post(msg: MainMsg) {
