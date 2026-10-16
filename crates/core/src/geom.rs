@@ -6,39 +6,58 @@ pub struct Rect {
     pub h: i32,
 }
 
+/// Largest coordinate/size magnitude accepted for floating rects.
+pub const MAX_PX: i32 = 100_000;
+/// Smallest width/height of a floating window.
+pub const MIN_FLOAT_SIZE: i32 = 50;
+
 impl Rect {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Rect {
         Rect { x, y, w, h }
     }
 
     pub fn right(&self) -> i32 {
-        self.x + self.w
+        self.x.saturating_add(self.w)
     }
 
     pub fn bottom(&self) -> i32 {
-        self.y + self.h
+        self.y.saturating_add(self.h)
     }
 
     pub fn center(&self) -> (i32, i32) {
-        (self.x + self.w / 2, self.y + self.h / 2)
+        (
+            self.x.saturating_add(self.w / 2),
+            self.y.saturating_add(self.h / 2),
+        )
     }
 
     pub fn inset(&self, left: i32, top: i32, right: i32, bottom: i32) -> Rect {
         Rect {
-            x: self.x + left,
-            y: self.y + top,
-            w: (self.w - left - right).max(1),
-            h: (self.h - top - bottom).max(1),
+            x: self.x.saturating_add(left),
+            y: self.y.saturating_add(top),
+            w: self.w.saturating_sub(left).saturating_sub(right).max(1),
+            h: self.h.saturating_sub(top).saturating_sub(bottom).max(1),
         }
     }
 
     pub fn centered_in(&self, outer: &Rect) -> Rect {
         Rect {
-            x: outer.x + (outer.w - self.w) / 2,
-            y: outer.y + (outer.h - self.h) / 2,
+            x: outer.x.saturating_add(outer.w.saturating_sub(self.w) / 2),
+            y: outer.y.saturating_add(outer.h.saturating_sub(self.h) / 2),
             w: self.w,
             h: self.h,
         }
+    }
+}
+
+/// Clamps a floating rect to sane bounds: position within +-MAX_PX and
+/// size within [MIN_FLOAT_SIZE, MAX_PX].
+pub fn sanitize_floating(r: Rect) -> Rect {
+    Rect {
+        x: r.x.clamp(-MAX_PX, MAX_PX),
+        y: r.y.clamp(-MAX_PX, MAX_PX),
+        w: r.w.clamp(MIN_FLOAT_SIZE, MAX_PX),
+        h: r.h.clamp(MIN_FLOAT_SIZE, MAX_PX),
     }
 }
 
@@ -88,6 +107,21 @@ mod tests {
             Rect::new(0, 0, 400, 300).centered_in(&Rect::new(0, 0, 1000, 500)),
             Rect::new(300, 100, 400, 300)
         );
+    }
+    #[test]
+    fn rect_math_saturates() {
+        let r = Rect::new(i32::MAX, i32::MAX, i32::MAX, i32::MAX);
+        assert_eq!(r.right(), i32::MAX);
+        assert_eq!(r.bottom(), i32::MAX);
+        let _ = r.center();
+        let _ = r.inset(i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+        let _ = r.inset(i32::MAX, i32::MAX, i32::MAX, i32::MAX);
+        let _ = r.centered_in(&Rect::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX));
+    }
+    #[test]
+    fn sanitize_clamps() {
+        let r = sanitize_floating(Rect::new(i32::MAX, i32::MIN, 0, i32::MAX));
+        assert_eq!(r, Rect::new(MAX_PX, -MAX_PX, MIN_FLOAT_SIZE, MAX_PX));
     }
     #[test]
     fn direction_props() {

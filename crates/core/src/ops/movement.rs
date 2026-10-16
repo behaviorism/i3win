@@ -1,4 +1,4 @@
-use crate::geom::Direction;
+use crate::geom::{sanitize_floating, Direction};
 use crate::tree::{Layout, NodeId, NodeKind};
 use crate::wm::{IpcEvent, Wm};
 
@@ -29,6 +29,7 @@ impl Wm {
                         Direction::Up => r.y = r.y.saturating_sub(d),
                         Direction::Down => r.y = r.y.saturating_add(d),
                     }
+                    *r = sanitize_floating(*r);
                 }
             }
             self.emit_moved(n);
@@ -46,7 +47,11 @@ impl Wm {
             }
         }
         self.focused_container = None;
-        self.tree.set_focused(n);
+        if new_ws.is_some() {
+            self.tree.set_focused(n);
+        } else {
+            self.focus_in_place(n);
+        }
         if matches!(self.tree.get(n).kind, NodeKind::Container) {
             let leaf = self.tree.focused_descendant(n);
             self.focused_container = Some((n, leaf));

@@ -1,5 +1,5 @@
 use crate::command::{OutputTarget, WorkspaceTarget};
-use crate::geom::{Direction, Rect};
+use crate::geom::{sanitize_floating, Direction, Rect};
 use crate::tree::{Layout, NodeId, NodeKind};
 use crate::wm::{IpcEvent, OutputInfo, Wm};
 
@@ -27,6 +27,48 @@ impl Wm {
             NodeKind::Output { name, .. } => name,
             _ => "",
         }
+    }
+
+    /// Shifts the floating window `n` from output rect `from` to `to` and
+    /// keeps it inside `to`.
+    fn shift_floating(&mut self, n: NodeId, from: Rect, to: Rect) {
+        let dx = i64::from(to.x) - i64::from(from.x);
+        let dy = i64::from(to.y) - i64::from(from.y);
+        let sat = |v: i32, d: i64| {
+            (i64::from(v) + d).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        if let NodeKind::Window(d) = &mut self.tree.get_mut(n).kind {
+            if let Some(r) = d.floating_rect.as_mut() {
+                r.x = sat(r.x, dx);
+                r.y = sat(r.y, dy);
+                r.x = r.x.clamp(to.x, to.x.max(to.right().saturating_sub(r.w)));
+                r.y = r.y.clamp(to.y, to.y.max(to.bottom().saturating_sub(r.h)));
+                *r = sanitize_floating(*r);
+            }
+        }
+    }
+
+    fn shift_workspace_floating(&mut self, ws: NodeId, from: Rect, to: Rect) {
+        for f in self.tree.get(ws).floating.clone() {
+            self.shift_floating(f, from, to);
+        }
+    }
+
+    /// Output a newly created workspace `name` belongs on: the first existing
+    /// output configured for it, else the focused output.
+    pub(crate) fn output_for_new_workspace(&self, name: &str) -> NodeId {
+        self.config
+            .workspace_outputs
+            .iter()
+            .find(|(ws, _)| ws == name)
+            .and_then(|(_, outs)| {
+                outs.iter().find_map(|o| {
+                    self.outputs()
+                        .into_iter()
+                        .find(|&n| self.output_name(n) == o)
+                })
+            })
+            .unwrap_or_else(|| self.focused_output())
     }
 
     fn is_workspace_empty(&self, ws: NodeId) -> bool {
@@ -138,7 +180,7 @@ impl Wm {
         match self.find_workspace(name) {
             Some(w) => w,
             None => {
-                let out = self.focused_output();
+                let out = self.output_for_new_workspace(name);
                 self.create_workspace(out, name)
             }
         }
@@ -165,6 +207,7 @@ impl Wm {
             return Ok(());
         }
         let was_floating = self.tree.is_floating(target);
+        let src_rect = self.tree.output_of(src).map(|o| self.output_rect(o));
         let src_was_focused = self.is_visible(src) && self.focused_workspace() == src;
         let old_parent = self.tree.parent(target);
         let moved_nodes = self.tree.windows_under(target);
@@ -184,6 +227,10 @@ impl Wm {
         }
         if was_floating {
             self.tree.attach_floating(dest, target);
+            let dest_rect = self.tree.output_of(dest).map(|o| self.output_rect(o));
+            if let (Some(from), Some(to)) = (src_rect, dest_rect) {
+                self.shift_floating(target, from, to);
+            }
         } else {
             self.insert_tiled(dest, target);
         }
@@ -261,8 +308,10 @@ impl Wm {
             }
             self.create_workspace(src_out, &n.to_string());
         }
+        let (from, to) = (self.output_rect(src_out), self.output_rect(dest));
         self.tree.detach(ws);
         self.attach_workspace_sorted(dest, ws);
+        self.shift_workspace_floating(ws, from, to);
         self.show_workspace(ws);
         let name = self.workspace_name(ws).to_string();
         self.emit(IpcEvent::Workspace {
@@ -286,6 +335,12 @@ impl Wm {
                 .find(|&n| self.output_name(n) == o.name);
             match existing {
                 Some(n) => {
+                    let old_rect = self.output_rect(n);
+                    if old_rect != o.rect {
+                        for ws in self.tree.get(n).children.clone() {
+                            self.shift_workspace_floating(ws, old_rect, o.rect);
+                        }
+                    }
                     self.tree.get_mut(n).kind = NodeKind::Output {
                         name: o.name,
                         rect: o.rect,
@@ -318,12 +373,15 @@ impl Wm {
             .into_iter()
             .find(|&o| names.iter().any(|n| n == self.output_name(o)));
         let focused_vanished = gone.contains(&focused_out);
+        let former_visible = self.visible_workspace(focused_out);
         for o in gone {
             for ws in self.tree.get(o).children.clone() {
                 match dest {
                     Some(d) if !self.is_workspace_empty(ws) => {
+                        let (from, to) = (self.output_rect(o), self.output_rect(d));
                         self.tree.detach(ws);
                         self.attach_workspace_sorted(d, ws);
+                        self.shift_workspace_floating(ws, from, to);
                     }
                     _ => {
                         let name = self.workspace_name(ws).to_string();
@@ -337,7 +395,9 @@ impl Wm {
             }
             self.tree.remove(o);
         }
-        if focused_vanished {
+        if focused_vanished && self.tree.contains(former_visible) {
+            self.show_workspace(former_visible);
+        } else if focused_vanished {
             let first = self.outputs()[0];
             let f = self.tree.focused_descendant(self.visible_workspace(first));
             self.tree.set_focused(f);
@@ -440,7 +500,10 @@ mod tests {
         wm.set_outputs(vec![out("A", 0, 1000)]);
         assert_eq!(wm.outputs().len(), 1);
         assert!(wm.find_workspace("2").is_some());
-        assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
+        // I8: the vanished focused output's workspace (with the window) stays focused.
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "2");
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        check_invariants(&wm);
     }
     #[test]
     fn added_output_gets_workspace() {
@@ -458,5 +521,69 @@ mod tests {
         wm.run_command("[class=\"c1\"] focus");
         assert_eq!(wm.focused_window(), Some(WindowId(1)));
         assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
+    }
+    fn two_out() -> Wm {
+        Wm::new(
+            Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        )
+    }
+    #[test]
+    fn i5_floating_rect_follows_rehomed_workspace() {
+        let mut wm = two_out();
+        wm.run_command("focus output right");
+        let mut i = win(1);
+        i.wants_float = true;
+        wm.manage(i);
+        wm.run_command("move right 500 px");
+        wm.set_outputs(vec![out("A", 0, 1000)]);
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        let r = match &wm.tree.get(n).kind {
+            crate::tree::NodeKind::Window(d) => d.floating_rect.unwrap(),
+            _ => panic!(),
+        };
+        let a = crate::geom::Rect::new(0, 0, 1000, 500);
+        assert!(r.x >= a.x && r.right() <= a.right(), "{r:?}");
+        assert!(r.y >= a.y && r.bottom() <= a.bottom(), "{r:?}");
+        check_invariants(&wm);
+    }
+    #[test]
+    fn i5_floating_window_moved_to_other_output_workspace() {
+        let mut wm = two_out();
+        let mut i = win(1);
+        i.wants_float = true;
+        wm.manage(i);
+        wm.run_command("workspace 7");
+        wm.run_command("focus output right");
+        wm.run_command("[class=\"c1\"] move container to workspace 2");
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        let r = match &wm.tree.get(n).kind {
+            crate::tree::NodeKind::Window(d) => d.floating_rect.unwrap(),
+            _ => panic!(),
+        };
+        assert!(r.x >= 1000 && r.right() <= 2000, "{r:?}");
+    }
+    #[test]
+    fn i7_workspace_created_on_configured_output() {
+        let cfg = crate::config::parse_config("workspace 5 output B\n");
+        let mut wm = Wm::new(cfg, vec![out("A", 0, 1000), out("B", 1000, 1000)]);
+        wm.run_command("focus output right");
+        wm.run_command("workspace 7");
+        assert!(wm.find_workspace("5").is_none());
+        wm.run_command("focus output left");
+        wm.run_command("workspace 5");
+        let ws5 = wm.find_workspace("5").unwrap();
+        assert_eq!(wm.tree.output_of(ws5), Some(wm.outputs()[1]));
+        assert_eq!(wm.focused_workspace(), ws5);
+        check_invariants(&wm);
+    }
+    #[test]
+    fn i8_all_outputs_renamed_keeps_windows_visible() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.set_outputs(vec![out("B", 0, 1000)]);
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
+        check_invariants(&wm);
     }
 }

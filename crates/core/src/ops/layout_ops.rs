@@ -1,11 +1,10 @@
 use crate::command::{LayoutArg, SplitArg};
-use crate::geom::Orientation;
+use crate::geom::{sanitize_floating, Orientation, MIN_FLOAT_SIZE};
 use crate::tree::{Layout, NodeId, NodeKind};
 use crate::wm::Wm;
 
 const MIN_PERCENT: f64 = 0.05;
 const EPS: f64 = 1e-9;
-const MIN_FLOAT_SIZE: i64 = 50;
 
 fn clamp_i32(v: i64) -> i32 {
     v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
@@ -209,10 +208,11 @@ impl Wm {
         let signed = if grow { d } else { d.saturating_neg() };
         let new_size = (*size as i64)
             .saturating_add(signed)
-            .clamp(MIN_FLOAT_SIZE, i32::MAX as i64);
+            .clamp(i64::from(MIN_FLOAT_SIZE), i32::MAX as i64);
         let actual = new_size - *size as i64;
         *pos = clamp_i32((*pos as i64).saturating_sub(actual / 2));
         *size = clamp_i32(new_size);
+        *r = sanitize_floating(*r);
         Ok(())
     }
 }

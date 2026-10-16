@@ -312,11 +312,14 @@ fn arrange_workspace(
                 fullscreen: true,
             });
             ctx.out.fullscreen_outputs.push(out_name.to_string());
-            for &w in all.iter().filter(|&&w| w != fs) {
+            let floating = &tree.get(ws).floating;
+            for &w in all.iter().filter(|&&w| w != fs && !floating.contains(&w)) {
                 if let Some(wid) = tree.window_id(w) {
                     ctx.out.hidden.push(wid);
                 }
             }
+            // Floating windows (dialogs) stay on top of the fullscreen window.
+            place_floating(ctx, config, ws, Some(fs));
             return;
         }
     }
@@ -336,7 +339,16 @@ fn arrange_workspace(
     let trail = out + g / 2;
     ctx.place(ws, area.inset(lead, lead, trail, trail), false);
 
+    place_floating(ctx, config, ws, None);
+}
+
+/// Places the floating windows of `ws` (skipping `skip`) above the tiled ones.
+fn place_floating(ctx: &mut Ctx, config: &Config, ws: NodeId, skip: Option<NodeId>) {
+    let tree = ctx.tree;
     for &f in &tree.get(ws).floating {
+        if Some(f) == skip {
+            continue;
+        }
         let NodeKind::Window(d) = &tree.get(f).kind else {
             continue;
         };
@@ -571,5 +583,21 @@ mod tests {
         };
         assert_eq!(st(2), DecoState::Focused);
         assert_eq!(st(1), DecoState::Unfocused);
+    }
+    #[test]
+    fn fullscreen_keeps_floating_dialog_on_top() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.manage(win(3));
+        wm.run_command("floating enable");
+        wm.run_command("[class=\"c1\"] fullscreen enable");
+        let a = wm.arrange();
+        let pos = |w: isize| a.windows.iter().position(|p| p.id == WindowId(w));
+        assert!(pos(1).is_some() && pos(3).is_some());
+        assert!(pos(3) > pos(1), "dialog placed after fullscreen window");
+        assert!(a.hidden.contains(&WindowId(2)));
+        assert!(!a.hidden.contains(&WindowId(3)));
+        assert!(a.windows[pos(3).unwrap()].floating);
     }
 }

@@ -1,6 +1,6 @@
 use crate::command::{parse_commands, Command, WorkspaceTarget};
 use crate::config::Config;
-use crate::geom::Rect;
+use crate::geom::{sanitize_floating, Rect};
 use crate::keys::KeyCombo;
 use crate::tree::{Layout, NodeId, NodeKind, Tree, WindowData, WindowId, WindowInfo};
 
@@ -74,6 +74,9 @@ fn is_window_command(cmd: &Command) -> bool {
             | Command::Exit
             | Command::Mode(_)
             | Command::Nop
+            | Command::Workspace(_)
+            | Command::FocusOutput(_)
+            | Command::MoveWorkspaceToOutput(_)
     )
 }
 
@@ -217,6 +220,28 @@ impl Wm {
         self.tree.get(self.tree.root()).children.clone()
     }
 
+    /// Focuses `node` without changing which workspace is visible: when the
+    /// node lives on another workspace only that workspace's own focus path
+    /// is updated.
+    pub(crate) fn focus_in_place(&mut self, node: NodeId) {
+        match self.tree.workspace_of(node) {
+            Some(ws) if ws != self.focused_workspace() => self.tree.set_focused_within(node, ws),
+            _ => self.tree.set_focused(node),
+        }
+    }
+
+    /// Window id at the end of the focus path (ignores a container selection).
+    pub(crate) fn focus_leaf_window(&self) -> Option<WindowId> {
+        self.tree
+            .window_id(self.tree.focused_descendant(self.tree.root()))
+    }
+
+    /// Asks the OS to focus `w` and announces the focus change over IPC.
+    pub(crate) fn push_focus(&mut self, w: WindowId) {
+        self.effects.push(Effect::Focus(w));
+        self.emit_window("focus", w);
+    }
+
     pub(crate) fn emit(&mut self, e: IpcEvent) {
         self.effects.push(Effect::Ipc(e));
     }
@@ -280,7 +305,7 @@ impl Wm {
         match self.find_workspace(&name) {
             Some(ws) => ws,
             None => {
-                let out = self.focused_output();
+                let out = self.output_for_new_workspace(&name);
                 self.create_workspace(out, &name)
             }
         }
@@ -324,7 +349,9 @@ impl Wm {
                 })
                 .unwrap_or(rect);
             if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
-                d.floating_rect = Some(rect.centered_in(&out_rect));
+                d.floating_rect = Some(sanitize_floating(
+                    sanitize_floating(rect).centered_in(&out_rect),
+                ));
             }
             self.tree.attach_floating(ws, node);
         } else {
@@ -332,7 +359,7 @@ impl Wm {
         }
         if ws == self.focused_workspace() {
             self.tree.set_focused(node);
-            self.effects.push(Effect::Focus(id));
+            self.push_focus(id);
         } else {
             self.tree.set_focused_within(node, ws);
         }
@@ -384,7 +411,7 @@ impl Wm {
                 let f = self.tree.focused_descendant(ws);
                 self.tree.set_focused(f);
                 if let Some(w) = self.tree.window_id(f) {
-                    self.effects.push(Effect::Focus(w));
+                    self.push_focus(w);
                 }
             }
         }
@@ -392,15 +419,24 @@ impl Wm {
     }
 
     pub fn on_focus_changed(&mut self, id: WindowId) {
-        self.focused_container = None;
         let Some(node) = self.tree.window_node(id) else {
             return;
         };
+        // Already the focus-path leaf: nothing changes, keep any selection.
+        if self.tree.focused_descendant(self.tree.root()) == node {
+            return;
+        }
         let Some(ws) = self.tree.workspace_of(node) else {
             return;
         };
         if self.is_visible(ws) {
+            self.focused_container = None;
+            let old_ws = self.focused_workspace();
+            let old_name = self.workspace_name(old_ws).to_string();
             self.tree.set_focused(node);
+            if self.focused_workspace() != old_ws {
+                self.note_workspace_focus(old_name, ws);
+            }
             if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
                 d.urgent = false;
             }
@@ -409,8 +445,8 @@ impl Wm {
             if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
                 d.urgent = true;
             }
-            if let Some(w) = self.focused_window() {
-                self.effects.push(Effect::Focus(w));
+            if let Some(w) = self.focus_leaf_window() {
+                self.push_focus(w);
             }
         }
     }
@@ -420,6 +456,9 @@ impl Wm {
             return;
         };
         if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
+            if d.info.title == title {
+                return;
+            }
             d.info.title = title;
         }
         self.emit_window("title", id);
@@ -433,7 +472,7 @@ impl Wm {
             return;
         }
         if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
-            d.floating_rect = Some(rect);
+            d.floating_rect = Some(sanitize_floating(rect));
         }
     }
 
@@ -447,7 +486,7 @@ impl Wm {
                 }]
             }
         };
-        let before = self.focused_window();
+        let before = self.focus_leaf_window();
         let mut results = Vec::new();
         for g in groups {
             let matched: Option<Vec<NodeId>> = g.criteria.as_ref().map(|c| {
@@ -467,9 +506,13 @@ impl Wm {
                     Some(t) => t.clone(),
                     None => vec![self.focused()],
                 };
-                // Non-window commands run once, not once per matched window.
+                // Non-window commands run exactly once, regardless of how
+                // many (or whether any) windows matched.
                 if !is_window_command(cmd) {
                     targets.truncate(1);
+                    if targets.is_empty() {
+                        targets.push(self.focused());
+                    }
                 }
                 let mut error = None;
                 for t in targets {
@@ -486,10 +529,10 @@ impl Wm {
                 });
             }
         }
-        let after = self.focused_window();
+        let after = self.focus_leaf_window();
         if after != before {
             if let Some(w) = after {
-                self.effects.push(Effect::Focus(w));
+                self.push_focus(w);
             }
         }
         results
@@ -515,15 +558,7 @@ impl Wm {
             Command::Reload | Command::Restart => self.effects.push(Effect::Reload),
             Command::Exit => self.effects.push(Effect::Exit),
             Command::Nop => {}
-            Command::FocusMatched => {
-                self.focused_container = None;
-                if let Some(ws) = self.tree.workspace_of(target) {
-                    if !self.is_visible(ws) {
-                        self.show_workspace(ws);
-                    }
-                }
-                self.tree.set_focused(target);
-            }
+            Command::FocusMatched => self.focus_target(target),
             Command::FocusOutput(t) => return self.focus_output(t),
             Command::MoveToWorkspace(t) => return self.move_to_workspace(target, t),
             Command::MoveWorkspaceToOutput(t) => return self.move_workspace_to_output(t),
@@ -813,5 +848,188 @@ mod tests {
                 current: Some("2".into()),
                 old: None
             })));
+    }
+    #[test]
+    fn c1_for_window_on_assigned_ws_does_not_switch() {
+        let cfg = crate::config::parse_config(
+            "assign [class=\"c2\"] 9\nfor_window [class=\"c2\"] floating enable\n",
+        );
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        wm.manage(win(2));
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        check_invariants(&wm);
+    }
+    #[test]
+    fn c1_fullscreen_matched_on_hidden_ws_keeps_visible_ws() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("workspace 3");
+        wm.run_command("[class=\"c1\"] fullscreen enable");
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "3");
+        assert!(wm.find_workspace("3").is_some());
+        check_invariants(&wm);
+    }
+    #[test]
+    fn i1_huge_floating_move_does_not_panic() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("floating enable");
+        wm.run_command("move right 2147483647 px");
+        wm.run_command("move down 2147483647 px");
+        let _ = wm.arrange();
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        match &wm.tree.get(n).kind {
+            NodeKind::Window(d) => assert!(d.floating_rect.unwrap().x <= crate::geom::MAX_PX),
+            _ => panic!(),
+        }
+    }
+    #[test]
+    fn i1_wants_float_absurd_rect_is_sanitized() {
+        let mut wm = test_wm();
+        let mut i = win(1);
+        i.wants_float = true;
+        i.rect = Rect::new(i32::MAX, i32::MIN, i32::MAX, i32::MAX);
+        wm.manage(i);
+        let _ = wm.arrange();
+        check_invariants(&wm);
+    }
+    #[test]
+    fn i1_on_floating_moved_enforces_min_size() {
+        let mut wm = test_wm();
+        let mut i = win(1);
+        i.wants_float = true;
+        wm.manage(i);
+        wm.on_floating_moved(WindowId(1), Rect::new(0, 0, 0, 0));
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        match &wm.tree.get(n).kind {
+            NodeKind::Window(d) => {
+                let r = d.floating_rect.unwrap();
+                assert!(r.w >= 50 && r.h >= 50);
+            }
+            _ => panic!(),
+        }
+    }
+    fn two_out() -> Wm {
+        Wm::new(
+            Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        )
+    }
+    #[test]
+    fn i2_focus_left_emits_effect_and_window_event() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.take_effects();
+        wm.run_command("focus left");
+        let e = wm.take_effects();
+        assert!(e.contains(&Effect::Focus(WindowId(1))));
+        assert!(e.contains(&Effect::Ipc(IpcEvent::Window {
+            change: "focus".into(),
+            window: WindowId(1)
+        })));
+    }
+    #[test]
+    fn i2_on_focus_changed_for_current_leaf_is_noop() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("focus parent");
+        let sel = wm.focused();
+        wm.take_effects();
+        wm.on_focus_changed(WindowId(2));
+        assert_eq!(wm.focused(), sel);
+        assert!(wm.take_effects().is_empty());
+    }
+    #[test]
+    fn i3_returning_to_selected_container_refocuses_leaf() {
+        let mut wm = two_out();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("focus output right");
+        wm.manage(win(9));
+        wm.run_command("focus output left");
+        wm.run_command("focus parent");
+        wm.run_command("focus output right");
+        wm.take_effects();
+        wm.run_command("focus output left");
+        assert!(wm.take_effects().contains(&Effect::Focus(WindowId(2))));
+        check_invariants(&wm);
+    }
+    #[test]
+    fn i4_on_focus_changed_other_output_notes_workspace() {
+        let mut wm = two_out();
+        wm.run_command("focus output right");
+        wm.manage(win(9));
+        wm.run_command("focus output left");
+        wm.take_effects();
+        wm.on_focus_changed(WindowId(9));
+        assert!(wm
+            .take_effects()
+            .contains(&Effect::Ipc(IpcEvent::Workspace {
+                change: "focus".into(),
+                current: Some("2".into()),
+                old: Some("1".into())
+            })));
+        wm.run_command("workspace back_and_forth");
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
+    }
+    #[test]
+    fn i4_focus_matched_other_output_notes_workspace() {
+        let mut wm = two_out();
+        wm.run_command("focus output right");
+        wm.manage(win(9));
+        wm.run_command("focus output left");
+        wm.take_effects();
+        wm.run_command("[class=\"c9\"] focus");
+        assert!(wm
+            .take_effects()
+            .contains(&Effect::Ipc(IpcEvent::Workspace {
+                change: "focus".into(),
+                current: Some("2".into()),
+                old: Some("1".into())
+            })));
+        check_invariants(&wm);
+    }
+    #[test]
+    fn m1_matched_workspace_next_advances_once() {
+        let mut wm = test_wm();
+        let mut a = win(1);
+        a.class = "c".into();
+        let mut b = win(2);
+        b.class = "c".into();
+        wm.manage(a);
+        wm.manage(b);
+        wm.run_command("workspace 2");
+        wm.manage(win(3));
+        wm.run_command("workspace 3");
+        wm.manage(win(4));
+        wm.run_command("workspace 1");
+        wm.run_command("[class=\"c\"] workspace next");
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "2");
+    }
+    #[test]
+    fn m2_non_window_command_with_no_match_runs_once() {
+        let mut wm = test_wm();
+        wm.take_effects();
+        wm.run_command("[class=\"nomatch\"] exec foo");
+        let n = wm
+            .take_effects()
+            .iter()
+            .filter(|e| **e == Effect::Exec("foo".into()))
+            .count();
+        assert_eq!(n, 1);
+    }
+    #[test]
+    fn m7_unchanged_title_emits_nothing() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.take_effects();
+        wm.on_title_changed(WindowId(1), "w1".into());
+        assert!(wm.take_effects().is_empty());
+        wm.on_title_changed(WindowId(1), "other".into());
+        assert_eq!(wm.take_effects().len(), 1);
     }
 }

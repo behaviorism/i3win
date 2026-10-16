@@ -238,7 +238,11 @@ fn parse_workspace_target(args: &[Tok]) -> Result<WorkspaceTarget, String> {
             _ => {}
         }
     }
-    Ok(WorkspaceTarget::Name(join(args)))
+    let name = join(args);
+    if name.is_empty() {
+        return Err("missing workspace".into());
+    }
+    Ok(WorkspaceTarget::Name(name))
 }
 
 fn parse_int(s: &str) -> Result<i32, String> {
@@ -347,6 +351,9 @@ fn parse_one(seg: &str) -> Result<Command, String> {
             }
             if let Ok(t) = tokenize(rest) {
                 if t.len() == 1 && t[0].1 {
+                    if t[0].0.is_empty() {
+                        return Err("exec: missing command".into());
+                    }
                     return Ok(Command::Exec(t[0].0.clone()));
                 }
             }
@@ -395,6 +402,7 @@ fn parse_one(seg: &str) -> Result<Command, String> {
         "kill" => Ok(Command::Kill),
         "resize" => parse_resize(args),
         "mode" => match args.first() {
+            Some(t) if t.0.is_empty() => Err("mode: missing name".into()),
             Some(t) => Ok(Command::Mode(t.0.clone())),
             None => Err("mode: missing name".into()),
         },
@@ -536,6 +544,9 @@ mod tests {
     fn errors() {
         assert!(parse_commands("frobnicate").is_err());
         assert!(parse_commands("exec").is_err());
+        assert!(parse_commands("exec \"\"").is_err());
+        assert!(parse_commands("workspace \"\"").is_err());
+        assert!(parse_commands("mode \"\"").is_err());
         assert!(parse_commands("workspace number abc").is_err());
     }
 }

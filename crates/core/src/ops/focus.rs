@@ -1,6 +1,6 @@
 use crate::geom::Direction;
 use crate::tree::{NodeId, NodeKind};
-use crate::wm::{Effect, Wm};
+use crate::wm::Wm;
 
 impl Wm {
     pub fn focus_direction(&mut self, from: NodeId, dir: Direction) -> Result<(), String> {
@@ -19,7 +19,7 @@ impl Wm {
             } else {
                 (i + len - 1) % len
             };
-            self.tree.set_focused(floating[j]);
+            self.focus_in_place(floating[j]);
             return Ok(());
         }
         let mut cur = from;
@@ -41,7 +41,7 @@ impl Wm {
                     };
                     if let Some(&s) = sibling {
                         let f = self.tree.focused_tiling_descendant(s);
-                        self.tree.set_focused(f);
+                        self.focus_in_place(f);
                         return Ok(());
                     }
                 }
@@ -70,7 +70,7 @@ impl Wm {
     pub fn focus_parent(&mut self, from: NodeId) {
         if let Some(p) = self.tree.parent(from) {
             if matches!(self.tree.get(p).kind, NodeKind::Container) {
-                self.tree.set_focused(from);
+                self.focus_in_place(from);
                 let leaf = self.tree.focused_descendant(p);
                 self.focused_container = Some((p, leaf));
             }
@@ -81,7 +81,7 @@ impl Wm {
         let n = self.tree.get(from);
         if matches!(n.kind, NodeKind::Container) {
             if let Some(&c) = n.focus.first() {
-                self.tree.set_focused(c);
+                self.focus_in_place(c);
                 let leaf = self.tree.focused_descendant(c);
                 self.focused_container =
                     matches!(self.tree.get(c).kind, NodeKind::Container).then_some((c, leaf));
@@ -99,33 +99,50 @@ impl Wm {
         if want_floating {
             let n = self.tree.get(ws);
             if let Some(&f) = n.focus.iter().find(|c| n.floating.contains(c)) {
-                self.tree.set_focused(f);
+                self.focus_in_place(f);
             }
         } else {
             let f = self.tree.focused_tiling_descendant(ws);
             if f != ws {
-                self.tree.set_focused(f);
+                self.focus_in_place(f);
             }
         }
     }
 
-    pub fn focus_node(&mut self, n: NodeId) {
+    /// Makes `n` focused, switching to its workspace (with workspace
+    /// bookkeeping) when needed. Emits no OS focus effect.
+    pub(crate) fn focus_target(&mut self, n: NodeId) {
         self.focused_container = None;
         if !self.tree.contains(n) {
             return;
         }
-        let before = self.focused_window();
+        let old_ws = self.focused_workspace();
+        let old_name = self.workspace_name(old_ws).to_string();
+        let mut noted = false;
         if let Some(ws) = self.tree.workspace_of(n) {
             if !self.is_visible(ws) {
                 self.show_workspace(ws);
+                noted = true;
             }
         }
         let f = self.tree.focused_descendant(n);
         self.tree.set_focused(f);
-        let after = self.focused_window();
+        let new_ws = self.focused_workspace();
+        if !noted && new_ws != old_ws {
+            self.note_workspace_focus(old_name, new_ws);
+        }
+    }
+
+    pub fn focus_node(&mut self, n: NodeId) {
+        if !self.tree.contains(n) {
+            return;
+        }
+        let before = self.focus_leaf_window();
+        self.focus_target(n);
+        let after = self.focus_leaf_window();
         if after != before {
             if let Some(w) = after {
-                self.effects.push(Effect::Focus(w));
+                self.push_focus(w);
             }
         }
     }
@@ -220,7 +237,7 @@ mod tests {
         wm.focus_node(n2);
         assert_eq!(wm.focused(), n2);
         wm.run_command("focus parent");
-        wm.on_focus_changed(WindowId(2));
+        wm.focus_node(n2);
         assert_eq!(wm.focused(), n2);
         wm.run_command("focus parent");
         wm.run_command("focus tiling");

@@ -1,5 +1,5 @@
 use crate::command::Toggle;
-use crate::geom::Rect;
+use crate::geom::{sanitize_floating, Rect};
 use crate::tree::{NodeId, NodeKind};
 use crate::wm::{IpcEvent, Wm};
 
@@ -44,14 +44,14 @@ impl Wm {
             if let NodeKind::Window(d) = &mut self.tree.get_mut(target).kind {
                 if d.floating_rect.is_none() {
                     let r = d.info.rect;
-                    d.floating_rect = Some(match out_rect {
+                    d.floating_rect = Some(sanitize_floating(match out_rect {
                         Some(o) => {
                             // i64 math: 80% of the output without overflow.
                             let cap = |v: i32| (i64::from(v) * 4 / 5) as i32;
                             Rect::new(0, 0, r.w.min(cap(o.w)), r.h.min(cap(o.h))).centered_in(&o)
                         }
                         None => r,
-                    });
+                    }));
                 }
             }
             self.tree.attach_floating(ws, target);
@@ -59,7 +59,7 @@ impl Wm {
             self.insert_tiled(ws, target);
         }
         self.focused_container = None;
-        self.tree.set_focused(target);
+        self.focus_in_place(target);
         if let Some(w) = self.tree.window_id(target) {
             self.emit(IpcEvent::Window {
                 change: "floating".into(),
@@ -84,7 +84,7 @@ impl Wm {
             }
             self.tree.get_mut(target).fullscreen = true;
             self.focused_container = None;
-            self.tree.set_focused(target);
+            self.focus_in_place(target);
         } else {
             self.tree.get_mut(target).fullscreen = false;
         }
