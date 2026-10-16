@@ -1,0 +1,716 @@
+use crate::command::WorkspaceTarget;
+use crate::criteria::{parse_criteria, Criteria};
+use crate::keys::{parse_combo, KeyCombo};
+use crate::tree::Layout;
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Color(pub u8, pub u8, pub u8);
+
+/// Parses `#rrggbb` or `#rrggbbaa` (alpha ignored).
+pub fn parse_color(s: &str) -> Option<Color> {
+    let h = s.strip_prefix('#')?;
+    if !h.is_ascii() || (h.len() != 6 && h.len() != 8) {
+        return None;
+    }
+    let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some(Color(p(0)?, p(2)?, p(4)?))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorClass {
+    pub border: Color,
+    pub background: Color,
+    pub text: Color,
+    pub indicator: Color,
+    pub child_border: Color,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClientColors {
+    pub focused: ColorClass,
+    pub focused_inactive: ColorClass,
+    pub unfocused: ColorClass,
+    pub urgent: ColorClass,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarColorTriple {
+    pub border: Color,
+    pub background: Color,
+    pub text: Color,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarColors {
+    pub background: Color,
+    pub statusline: Color,
+    pub separator: Color,
+    pub focused_workspace: BarColorTriple,
+    pub active_workspace: BarColorTriple,
+    pub inactive_workspace: BarColorTriple,
+    pub urgent_workspace: BarColorTriple,
+    pub binding_mode: BarColorTriple,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarPosition {
+    Top,
+    Bottom,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Font {
+    pub family: String,
+    pub size_pt: f32,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct BarConfig {
+    pub position: BarPosition,
+    pub status_command: Option<String>,
+    pub font: Option<Font>,
+    pub height: Option<i32>,
+    pub workspace_buttons: bool,
+    pub colors: BarColors,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Border {
+    Normal(i32),
+    Pixel(i32),
+    None,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binding {
+    pub combo: KeyCombo,
+    pub command: String,
+}
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub bindings: HashMap<String, Vec<Binding>>, // key "default" always present
+    pub exec: Vec<String>,
+    pub exec_always: Vec<String>,
+    pub font: Font,
+    pub default_border: Border,
+    pub default_floating_border: Border,
+    pub workspace_layout: Layout,
+    pub for_window: Vec<(Criteria, String)>,
+    pub assigns: Vec<(Criteria, WorkspaceTarget)>,
+    pub workspace_outputs: Vec<(String, Vec<String>)>,
+    pub gaps_inner: i32,
+    pub gaps_outer: i32,
+    pub colors: ClientColors,
+    pub bar: Option<BarConfig>,
+    pub warnings: Vec<String>, // "line N: message"
+}
+
+fn c(hex: u32) -> Color {
+    Color((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+fn class(border: u32, background: u32, text: u32, indicator: u32, child_border: u32) -> ColorClass {
+    ColorClass {
+        border: c(border),
+        background: c(background),
+        text: c(text),
+        indicator: c(indicator),
+        child_border: c(child_border),
+    }
+}
+fn triple(border: u32, background: u32, text: u32) -> BarColorTriple {
+    BarColorTriple {
+        border: c(border),
+        background: c(background),
+        text: c(text),
+    }
+}
+
+impl Default for ClientColors {
+    fn default() -> Self {
+        ClientColors {
+            focused: class(0x4c7899, 0x285577, 0xffffff, 0x2e9ef4, 0x285577),
+            focused_inactive: class(0x333333, 0x5f676a, 0xffffff, 0x484e50, 0x5f676a),
+            unfocused: class(0x333333, 0x222222, 0x888888, 0x292d2e, 0x222222),
+            urgent: class(0x2f343a, 0x900000, 0xffffff, 0x900000, 0x900000),
+        }
+    }
+}
+impl Default for BarColors {
+    fn default() -> Self {
+        BarColors {
+            background: c(0x000000),
+            statusline: c(0xffffff),
+            separator: c(0x666666),
+            focused_workspace: triple(0x4c7899, 0x285577, 0xffffff),
+            active_workspace: triple(0x333333, 0x5f676a, 0xffffff),
+            inactive_workspace: triple(0x333333, 0x222222, 0x888888),
+            urgent_workspace: triple(0x2f343a, 0x900000, 0xffffff),
+            binding_mode: triple(0x2f343a, 0x900000, 0xffffff),
+        }
+    }
+}
+impl Default for BarConfig {
+    fn default() -> Self {
+        BarConfig {
+            position: BarPosition::Top,
+            status_command: None,
+            font: None,
+            height: None,
+            workspace_buttons: true,
+            colors: BarColors::default(),
+        }
+    }
+}
+impl Default for Config {
+    fn default() -> Self {
+        parse_config("")
+    }
+}
+
+pub fn default_config_text(has_wt: bool) -> String {
+    let t = include_str!("default_config");
+    if has_wt {
+        t.to_string()
+    } else {
+        t.replace("exec wt", "exec cmd")
+    }
+}
+
+/// Returns the remainder of `s` after skipping `n` whitespace-separated tokens, trimmed.
+fn skip_tokens(s: &str, n: usize) -> &str {
+    let mut rest = s.trim_start();
+    for _ in 0..n {
+        rest = rest
+            .find([' ', '\t'])
+            .map_or("", |i| rest[i..].trim_start());
+    }
+    rest.trim()
+}
+
+fn first_token(s: &str) -> &str {
+    s.split([' ', '\t']).next().unwrap_or("")
+}
+
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches('"').to_string()
+}
+
+fn parse_font(args: &str) -> Result<Font, String> {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    let (size, fam) = toks
+        .split_last()
+        .ok_or_else(|| "font: missing arguments".to_string())?;
+    let size_pt: f32 = size
+        .parse()
+        .ok()
+        .filter(|s: &f32| s.is_finite() && *s > 0.0)
+        .ok_or_else(|| format!("font: invalid size '{size}'"))?;
+    let family = fam.join(" ");
+    let family = family.strip_prefix("pango:").unwrap_or(&family).to_string();
+    if family.is_empty() {
+        return Err("font: missing family".to_string());
+    }
+    Ok(Font { family, size_pt })
+}
+
+fn parse_border(args: &str) -> Result<Border, String> {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    let num = |i: usize| -> Option<i32> { toks.get(i)?.parse().ok().filter(|n| *n >= 0) };
+    match toks.first().copied() {
+        Some("normal") => match toks.get(1) {
+            None => Ok(Border::Normal(2)),
+            Some(_) => num(1)
+                .map(Border::Normal)
+                .ok_or_else(|| format!("invalid border width: {args}")),
+        },
+        Some("pixel") => num(1)
+            .map(Border::Pixel)
+            .ok_or_else(|| format!("invalid border width: {args}")),
+        Some("none") => Ok(Border::None),
+        _ => Err(format!("invalid border style: {args}")),
+    }
+}
+
+fn parse_colors(args: &str, min: usize, max: usize) -> Result<Vec<Color>, String> {
+    let cols: Vec<Color> = args
+        .split_whitespace()
+        .map(|t| parse_color(t).ok_or_else(|| format!("invalid color '{t}'")))
+        .collect::<Result<_, _>>()?;
+    if cols.len() < min || cols.len() > max {
+        return Err(format!("expected {min}-{max} colors, got {}", cols.len()));
+    }
+    Ok(cols)
+}
+
+fn parse_triple(args: &str) -> Result<BarColorTriple, String> {
+    let v = parse_colors(args, 3, 3)?;
+    Ok(BarColorTriple {
+        border: v[0],
+        background: v[1],
+        text: v[2],
+    })
+}
+
+fn parse_class(args: &str, def: ColorClass) -> Result<ColorClass, String> {
+    let v = parse_colors(args, 3, 5)?;
+    Ok(ColorClass {
+        border: v[0],
+        background: v[1],
+        text: v[2],
+        indicator: v.get(3).copied().unwrap_or(def.indicator),
+        child_border: v.get(4).copied().unwrap_or(v[1]),
+    })
+}
+
+/// Splits `[criteria] rest` into the criteria and the trimmed remainder.
+fn split_criteria(s: &str) -> Result<(Criteria, &str), String> {
+    let s = s.trim_start();
+    let body = s
+        .strip_prefix('[')
+        .ok_or_else(|| "expected [criteria]".to_string())?;
+    let mut in_quote = false;
+    let mut end = None;
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            ']' if !in_quote => {
+                end = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let end = end.ok_or_else(|| "unterminated [criteria]".to_string())?;
+    Ok((parse_criteria(&body[..end])?, body[end + 1..].trim()))
+}
+
+enum Block {
+    Mode(String),
+    Bar,
+    BarColors,
+    Unknown,
+}
+
+pub fn parse_config(text: &str) -> Config {
+    let mut cfg = Config {
+        bindings: HashMap::new(),
+        exec: Vec::new(),
+        exec_always: Vec::new(),
+        font: Font {
+            family: "Segoe UI".into(),
+            size_pt: 9.0,
+        },
+        default_border: Border::Normal(2),
+        default_floating_border: Border::Normal(2),
+        workspace_layout: Layout::SplitH,
+        for_window: Vec::new(),
+        assigns: Vec::new(),
+        workspace_outputs: Vec::new(),
+        gaps_inner: 0,
+        gaps_outer: 0,
+        colors: ClientColors::default(),
+        bar: None,
+        warnings: Vec::new(),
+    };
+    cfg.bindings.insert("default".to_string(), Vec::new());
+
+    let text = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .replace("\r\n", "\n");
+    // Logical lines (continuations joined), tagged with their starting line number.
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (i, raw) in text.split('\n').enumerate() {
+        let (start, mut acc) = pending.take().unwrap_or((i + 1, String::new()));
+        match raw.strip_suffix('\\') {
+            Some(head) => {
+                acc.push_str(head);
+                pending = Some((start, acc));
+            }
+            None => {
+                acc.push_str(raw);
+                lines.push((start, acc));
+            }
+        }
+    }
+    if let Some(p) = pending {
+        lines.push(p);
+    }
+
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut stack: Vec<Block> = Vec::new();
+    for (no, raw) in lines {
+        let line = raw.trim().to_string();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // For `set $name value`, only the value is substituted, never the name.
+        let split = if first_token(&line) == "set" {
+            let after_set = skip_tokens(&line, 1);
+            let name_len = first_token(after_set).len();
+            line.len() - after_set.len() + name_len
+        } else {
+            0
+        };
+        let (head, tail) = line.split_at(split);
+        let mut tail = tail.to_string();
+        for (name, value) in &vars {
+            if tail.contains(name.as_str()) {
+                tail = tail.replace(name.as_str(), value);
+            }
+        }
+        let line = format!("{head}{tail}");
+        let line = line.trim();
+        if let Err(msg) = handle_line(&mut cfg, &mut stack, &mut vars, line) {
+            cfg.warnings.push(format!("line {no}: {msg}"));
+        }
+    }
+    cfg
+}
+
+fn handle_line(
+    cfg: &mut Config,
+    stack: &mut Vec<Block>,
+    vars: &mut Vec<(String, String)>,
+    line: &str,
+) -> Result<(), String> {
+    if line == "}" {
+        stack.pop();
+        return Ok(());
+    }
+    let kw = first_token(line);
+    let args = skip_tokens(line, 1);
+    match stack.last() {
+        Some(Block::Unknown) => {
+            if line.ends_with('{') {
+                stack.push(Block::Unknown);
+            }
+            Ok(())
+        }
+        Some(Block::Mode(name)) => {
+            if kw == "bindsym" {
+                let name = name.clone();
+                bindsym(cfg, &name, args)
+            } else {
+                Err(format!("unsupported line in mode block: {line}"))
+            }
+        }
+        Some(Block::Bar) => {
+            if kw == "colors" && args == "{" {
+                stack.push(Block::BarColors);
+                return Ok(());
+            }
+            bar_key(cfg, kw, args)
+        }
+        Some(Block::BarColors) => bar_color_key(cfg, kw, args),
+        None => top_level(cfg, stack, vars, kw, args, line),
+    }
+}
+
+fn bindsym(cfg: &mut Config, mode: &str, args: &str) -> Result<(), String> {
+    let mut rest = args;
+    loop {
+        let tok = first_token(rest);
+        if tok == "--release" {
+            return Err("bindsym --release is not supported".to_string());
+        }
+        if tok.starts_with("--") {
+            rest = skip_tokens(rest, 1);
+        } else {
+            break;
+        }
+    }
+    let combo_text = first_token(rest);
+    let command = skip_tokens(rest, 1);
+    if combo_text.is_empty() || command.is_empty() {
+        return Err("bindsym: expected COMBO COMMAND".to_string());
+    }
+    let combo = parse_combo(combo_text)?;
+    cfg.bindings
+        .entry(mode.to_string())
+        .or_default()
+        .push(Binding {
+            combo,
+            command: command.to_string(),
+        });
+    Ok(())
+}
+
+fn bar_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
+    let bar = cfg.bar.get_or_insert_with(BarConfig::default);
+    match kw {
+        "position" => {
+            bar.position = match args {
+                "top" => BarPosition::Top,
+                "bottom" => BarPosition::Bottom,
+                _ => return Err(format!("bar: invalid position '{args}'")),
+            }
+        }
+        "status_command" => bar.status_command = Some(args.to_string()).filter(|s| !s.is_empty()),
+        "font" => bar.font = Some(parse_font(args)?),
+        "height" => {
+            bar.height = Some(
+                args.parse()
+                    .map_err(|_| format!("bar: invalid height '{args}'"))?,
+            )
+        }
+        "workspace_buttons" => {
+            bar.workspace_buttons = match args {
+                "yes" | "true" | "on" => true,
+                "no" | "false" | "off" => false,
+                _ => return Err(format!("bar: invalid workspace_buttons '{args}'")),
+            }
+        }
+        _ => return Err(format!("unknown bar directive: {kw}")),
+    }
+    Ok(())
+}
+
+fn bar_color_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
+    let colors = &mut cfg.bar.get_or_insert_with(BarConfig::default).colors;
+    let one = |args: &str| parse_colors(args, 1, 1).map(|v| v[0]);
+    match kw {
+        "background" => colors.background = one(args)?,
+        "statusline" => colors.statusline = one(args)?,
+        "separator" => colors.separator = one(args)?,
+        "focused_workspace" => colors.focused_workspace = parse_triple(args)?,
+        "active_workspace" => colors.active_workspace = parse_triple(args)?,
+        "inactive_workspace" => colors.inactive_workspace = parse_triple(args)?,
+        "urgent_workspace" => colors.urgent_workspace = parse_triple(args)?,
+        "binding_mode" => colors.binding_mode = parse_triple(args)?,
+        _ => return Err(format!("unknown bar colors directive: {kw}")),
+    }
+    Ok(())
+}
+
+fn top_level(
+    cfg: &mut Config,
+    stack: &mut Vec<Block>,
+    vars: &mut Vec<(String, String)>,
+    kw: &str,
+    args: &str,
+    line: &str,
+) -> Result<(), String> {
+    match kw {
+        "set" => {
+            let name = first_token(args);
+            if !name.starts_with('$') || name.len() < 2 {
+                return Err("set: expected $name value".to_string());
+            }
+            vars.retain(|(n, _)| n != name);
+            vars.push((name.to_string(), skip_tokens(args, 1).to_string()));
+            vars.sort_by_key(|(n, _)| std::cmp::Reverse(n.len()));
+        }
+        "bindsym" => bindsym(cfg, "default", args)?,
+        "mode" => {
+            let name = args
+                .strip_suffix('{')
+                .ok_or_else(|| "mode: expected `{` on the same line".to_string())?;
+            let name = unquote(name);
+            cfg.bindings.entry(name.clone()).or_default();
+            stack.push(Block::Mode(name));
+        }
+        "bar" if args == "{" => {
+            cfg.bar = Some(BarConfig::default());
+            stack.push(Block::Bar);
+        }
+        "font" => cfg.font = parse_font(args).map_err(|e| format!("{e}; keeping default"))?,
+        "exec" | "exec_always" => {
+            let mut cmd = args;
+            if first_token(cmd) == "--no-startup-id" {
+                cmd = skip_tokens(cmd, 1);
+            }
+            if cmd.is_empty() {
+                return Err(format!("{kw}: missing command"));
+            }
+            let list = if kw == "exec" {
+                &mut cfg.exec
+            } else {
+                &mut cfg.exec_always
+            };
+            list.push(cmd.to_string());
+        }
+        "default_border" | "new_window" => cfg.default_border = parse_border(args)?,
+        "default_floating_border" => cfg.default_floating_border = parse_border(args)?,
+        "workspace_layout" => {
+            cfg.workspace_layout = match args {
+                "default" => Layout::SplitH,
+                "stacking" | "stacked" => Layout::Stacked,
+                "tabbed" => Layout::Tabbed,
+                _ => return Err(format!("workspace_layout: invalid value '{args}'")),
+            }
+        }
+        "for_window" => {
+            let (crit, cmd) = split_criteria(args)?;
+            if cmd.is_empty() {
+                return Err("for_window: missing command".to_string());
+            }
+            cfg.for_window.push((crit, cmd.to_string()));
+        }
+        "assign" => {
+            let (crit, rest) = split_criteria(args)?;
+            let mut toks: Vec<&str> = rest.split_whitespace().collect();
+            if matches!(toks.first(), Some(&"\u{2192}") | Some(&"->")) {
+                toks.remove(0);
+            }
+            if toks.first() == Some(&"workspace") {
+                toks.remove(0);
+            }
+            let target = if toks.first() == Some(&"number") {
+                let n = toks
+                    .get(1)
+                    .and_then(|t| unquote(t).parse().ok())
+                    .ok_or_else(|| "assign: invalid workspace number".to_string())?;
+                WorkspaceTarget::Number(n)
+            } else {
+                let name = unquote(&toks.join(" "));
+                if name.is_empty() {
+                    return Err("assign: missing workspace".to_string());
+                }
+                WorkspaceTarget::Name(name)
+            };
+            cfg.assigns.push((crit, target));
+        }
+        "workspace" => {
+            let toks: Vec<&str> = args.split_whitespace().collect();
+            let i = toks
+                .iter()
+                .position(|t| *t == "output")
+                .filter(|i| *i >= 1 && *i + 1 < toks.len())
+                .ok_or_else(|| "workspace: expected NAME output OUTPUT...".to_string())?;
+            let name = unquote(&toks[..i].join(" "));
+            let outs = toks[i + 1..].iter().map(|o| unquote(o)).collect();
+            cfg.workspace_outputs.push((name, outs));
+        }
+        "gaps" => {
+            let toks: Vec<&str> = args.split_whitespace().collect();
+            match toks.as_slice() {
+                [which @ ("inner" | "outer"), n] => {
+                    let n: i32 = n
+                        .parse()
+                        .map_err(|_| format!("gaps: invalid value '{n}'"))?;
+                    if *which == "inner" {
+                        cfg.gaps_inner = n;
+                    } else {
+                        cfg.gaps_outer = n;
+                    }
+                }
+                _ => return Err(format!("unsupported gaps form: {args}")),
+            }
+        }
+        "client.focused" => cfg.colors.focused = parse_class(args, cfg.colors.focused)?,
+        "client.focused_inactive" => {
+            cfg.colors.focused_inactive = parse_class(args, cfg.colors.focused_inactive)?
+        }
+        "client.unfocused" => cfg.colors.unfocused = parse_class(args, cfg.colors.unfocused)?,
+        "client.urgent" => cfg.colors.urgent = parse_class(args, cfg.colors.urgent)?,
+        "client.placeholder" | "client.background" => {}
+        _ => {
+            if line.ends_with('{') {
+                stack.push(Block::Unknown);
+            }
+            return Err(format!("unknown directive: {line}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::Modifiers;
+    use crate::tree::Layout;
+
+    #[test]
+    fn defaults() {
+        let c = Config::default();
+        assert_eq!(
+            c.font,
+            Font {
+                family: "Segoe UI".into(),
+                size_pt: 9.0
+            }
+        );
+        assert_eq!(c.default_border, Border::Normal(2));
+        assert!(c.bindings.contains_key("default") && c.bar.is_none());
+        assert_eq!(c.colors.focused.background, Color(0x28, 0x55, 0x77));
+    }
+    #[test]
+    fn variables_and_bindsym() {
+        let c = parse_config("set $mod Mod4\nbindsym $mod+Return exec wt\n");
+        let b = &c.bindings["default"][0];
+        assert_eq!(b.combo, crate::keys::parse_combo("Mod4+Return").unwrap());
+        assert_eq!(b.command, "exec wt");
+    }
+    #[test]
+    fn longest_variable_first() {
+        let c = parse_config("set $m Mod1\nset $mod Mod4\nbindsym $mod+a nop\n");
+        assert_eq!(c.bindings["default"][0].combo.mods, Modifiers::WIN);
+    }
+    #[test]
+    fn modes() {
+        let c = parse_config("mode \"resize\" {\n bindsym Escape mode \"default\"\n}\n");
+        assert_eq!(c.bindings["resize"][0].command, "mode \"default\"");
+    }
+    #[test]
+    fn bar_block() {
+        let c = parse_config("bar {\n position bottom\n status_command i3win-status --x\n colors {\n background #111111\n focused_workspace #010203 #040506 #070809\n }\n}\n");
+        let b = c.bar.unwrap();
+        assert_eq!(b.position, BarPosition::Bottom);
+        assert_eq!(b.status_command.as_deref(), Some("i3win-status --x"));
+        assert_eq!(b.colors.background, Color(0x11, 0x11, 0x11));
+        assert_eq!(b.colors.focused_workspace.text, Color(7, 8, 9));
+    }
+    #[test]
+    fn font_borders_gaps_layout() {
+        let c = parse_config("font pango:DejaVu Sans Mono 10.5\ndefault_border pixel 3\ngaps inner 10\ngaps outer 4\nworkspace_layout tabbed\n");
+        assert_eq!(
+            c.font,
+            Font {
+                family: "DejaVu Sans Mono".into(),
+                size_pt: 10.5
+            }
+        );
+        assert_eq!(c.default_border, Border::Pixel(3));
+        assert_eq!((c.gaps_inner, c.gaps_outer), (10, 4));
+        assert_eq!(c.workspace_layout, Layout::Tabbed);
+    }
+    #[test]
+    fn client_colors_child_border_defaults_to_background() {
+        let c = parse_config("client.focused #111111 #222222 #333333\n");
+        assert_eq!(c.colors.focused.child_border, Color(0x22, 0x22, 0x22));
+        assert_eq!(c.colors.focused.indicator, Color(0x2e, 0x9e, 0xf4));
+    }
+    #[test]
+    fn for_window_assign_workspace_output() {
+        let c = parse_config("for_window [class=\"calc\"] floating enable\nassign [class=\"slack\"] → number 3\nworkspace 1 output DISPLAY1 DISPLAY2\n");
+        assert_eq!(c.for_window[0].1, "floating enable");
+        assert_eq!(c.assigns[0].1, WorkspaceTarget::Number(3));
+        assert_eq!(
+            c.workspace_outputs[0],
+            (
+                "1".to_string(),
+                vec!["DISPLAY1".to_string(), "DISPLAY2".to_string()]
+            )
+        );
+    }
+    #[test]
+    fn bad_lines_warn_not_panic() {
+        let c = parse_config("bogus line\nbindsym Mod7+a nop\nfont x y\n");
+        assert_eq!(c.warnings.len(), 3);
+    }
+    #[test]
+    fn parses_crlf_tabs_and_bom() {
+        let c = parse_config(
+            "\u{feff}set $mod Mod1\r\nbindsym\t$mod+a   nop  \r\nexec_always \\\r\n  wt\r\n",
+        );
+        assert_eq!(c.bindings["default"].len(), 1);
+        assert_eq!(c.exec_always, vec!["wt".to_string()]);
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    }
+    #[test]
+    fn default_config_parses_cleanly() {
+        let c = parse_config(&default_config_text(true));
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert!(c.bindings["default"].len() >= 50 && c.bindings["resize"].len() == 11);
+        assert_eq!(
+            c.bar.unwrap().status_command.as_deref(),
+            Some("i3win-status")
+        );
+        assert!(default_config_text(false).contains("exec cmd"));
+    }
+}
