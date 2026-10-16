@@ -52,7 +52,6 @@ pub struct Wm {
     pub tree: Tree,
     pub config: Config,
     pub mode: String,
-    #[allow(dead_code)] // read by the workspace op (Task 8)
     pub(crate) prev_workspace: Option<String>,
     pub(crate) effects: Vec<Effect>,
 }
@@ -118,28 +117,34 @@ impl Wm {
                 NodeKind::Output { name, .. } => name.clone(),
                 _ => String::new(),
             };
-            let assigned = wm
-                .config
-                .workspace_outputs
-                .iter()
-                .find(|(ws, outs)| outs.contains(&oname) && wm.find_workspace(ws).is_none())
-                .map(|(ws, _)| ws.clone());
-            let name = assigned.unwrap_or_else(|| {
-                let mut n = 1;
-                while wm.find_workspace(&n.to_string()).is_some()
-                    || wm.config.workspace_outputs.iter().any(|(ws, outs)| {
-                        *ws == n.to_string()
-                            && outs.iter().any(|o| *o != oname && output_names.contains(o))
-                    })
-                {
-                    n += 1;
-                }
-                n.to_string()
-            });
+            let name = wm.initial_workspace_name(&oname, &output_names);
             wm.create_workspace(node, &name);
         }
         wm.effects.clear();
         wm
+    }
+
+    /// Name for the first workspace of a new output, skipping names
+    /// reserved (via `workspace_outputs`) for other existing outputs.
+    pub(crate) fn initial_workspace_name(&self, oname: &str, output_names: &[String]) -> String {
+        let assigned = self
+            .config
+            .workspace_outputs
+            .iter()
+            .find(|(ws, outs)| outs.iter().any(|o| o == oname) && self.find_workspace(ws).is_none())
+            .map(|(ws, _)| ws.clone());
+        assigned.unwrap_or_else(|| {
+            let mut n = 1;
+            while self.find_workspace(&n.to_string()).is_some()
+                || self.config.workspace_outputs.iter().any(|(ws, outs)| {
+                    *ws == n.to_string()
+                        && outs.iter().any(|o| o != oname && output_names.contains(o))
+                })
+            {
+                n += 1;
+            }
+            n.to_string()
+        })
     }
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
@@ -219,22 +224,7 @@ impl Wm {
             },
             self.config.workspace_layout,
         );
-        // Sort key: numbered workspaces first (ascending), then by name.
-        let key = |n: Option<i32>, s: &str| (n.is_none(), n.unwrap_or(0), s.to_string());
-        let new_key = key(num, name);
-        let idx =
-            self.tree
-                .get(output)
-                .children
-                .iter()
-                .position(|&c| match &self.tree.get(c).kind {
-                    NodeKind::Workspace {
-                        name: cn,
-                        num: cnum,
-                    } => key(*cnum, cn) > new_key,
-                    _ => false,
-                });
-        self.tree.attach(output, ws, idx);
+        self.attach_workspace_sorted(output, ws);
         self.emit(IpcEvent::Workspace {
             change: "init".into(),
             current: Some(name.into()),
@@ -509,19 +499,25 @@ impl Wm {
             Command::Reload | Command::Restart => self.effects.push(Effect::Reload),
             Command::Exit => self.effects.push(Effect::Exit),
             Command::Nop => {}
-            // Task 8 will switch to the target's workspace when it is not visible.
-            Command::FocusMatched => self.tree.set_focused(target),
+            Command::FocusMatched => {
+                if let Some(ws) = self.tree.workspace_of(target) {
+                    if !self.is_visible(ws) {
+                        self.show_workspace(ws);
+                    }
+                }
+                self.tree.set_focused(target);
+            }
+            Command::FocusOutput(t) => return self.focus_output(t),
+            Command::MoveToWorkspace(t) => return self.move_to_workspace(target, t),
+            Command::MoveWorkspaceToOutput(t) => return self.move_workspace_to_output(t),
+            Command::Workspace(t) => return self.switch_workspace(t),
             Command::Focus(_)
             | Command::FocusParent
             | Command::FocusChild
             | Command::FocusModeToggle
             | Command::FocusFloating
             | Command::FocusTiling
-            | Command::FocusOutput(_)
             | Command::Move(..)
-            | Command::MoveToWorkspace(_)
-            | Command::MoveWorkspaceToOutput(_)
-            | Command::Workspace(_)
             | Command::Split(_)
             | Command::Layout(_)
             | Command::Fullscreen(_)
