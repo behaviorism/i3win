@@ -24,10 +24,10 @@ impl Wm {
             if let NodeKind::Window(w) = &mut self.tree.get_mut(n).kind {
                 if let Some(r) = w.floating_rect.as_mut() {
                     match dir {
-                        Direction::Left => r.x -= d,
-                        Direction::Right => r.x += d,
-                        Direction::Up => r.y -= d,
-                        Direction::Down => r.y += d,
+                        Direction::Left => r.x = r.x.saturating_sub(d),
+                        Direction::Right => r.x = r.x.saturating_add(d),
+                        Direction::Up => r.y = r.y.saturating_sub(d),
+                        Direction::Down => r.y = r.y.saturating_add(d),
                     }
                 }
             }
@@ -37,15 +37,22 @@ impl Wm {
         if self.tree.parent(n).is_none() {
             return Ok(());
         }
-        if matches!(self.walk_move(n, dir), Outcome::Output)
-            && !self.move_to_adjacent_output(n, dir)
-        {
-            return Ok(());
+        let old_focused_ws = self.workspace_name(self.focused_workspace()).to_string();
+        let mut new_ws = None;
+        if matches!(self.walk_move(n, dir), Outcome::Output) {
+            match self.move_to_adjacent_output(n, dir) {
+                Some(ws2) => new_ws = Some(ws2),
+                None => return Ok(()),
+            }
         }
+        self.focused_container = None;
         self.tree.set_focused(n);
         if matches!(self.tree.get(n).kind, NodeKind::Container) {
             let leaf = self.tree.focused_descendant(n);
             self.focused_container = Some((n, leaf));
+        }
+        if let Some(ws2) = new_ws {
+            self.note_workspace_focus(old_focused_ws, ws2);
         }
         self.emit_moved(n);
         Ok(())
@@ -167,27 +174,17 @@ impl Wm {
     }
 
     /// Moves `n` to the visible workspace of the output in `dir`.
-    /// Returns false when there is no such output.
-    fn move_to_adjacent_output(&mut self, n: NodeId, dir: Direction) -> bool {
-        let Some(from) = self.tree.output_of(n) else {
-            return false;
-        };
-        let Some(o) = self.output_in_direction(from, dir) else {
-            return false;
-        };
+    /// Returns the destination workspace, or None when there is no such output.
+    fn move_to_adjacent_output(&mut self, n: NodeId, dir: Direction) -> Option<NodeId> {
+        let from = self.tree.output_of(n)?;
+        let o = self.output_in_direction(from, dir)?;
         let ws2 = self.visible_workspace(o);
-        let old_name = self
-            .tree
-            .workspace_of(n)
-            .map(|w| self.workspace_name(w).to_string())
-            .unwrap_or_default();
         let old = self.tree.parent(n);
         self.tree.detach(n);
         self.cleanup_container(old);
         let at = if dir.is_forward() { Some(0) } else { None };
         self.tree.attach(ws2, n, at);
-        self.note_workspace_focus(old_name, ws2);
-        true
+        Some(ws2)
     }
 }
 
@@ -274,6 +271,34 @@ mod tests {
             NodeKind::Window(d) => assert_eq!(d.floating_rect.unwrap().x, 250),
             _ => panic!(),
         }
+    }
+    #[test]
+    fn floating_move_huge_px_does_not_overflow() {
+        let mut wm = test_wm();
+        let mut f = win(1);
+        f.wants_float = true;
+        wm.manage(f);
+        let r = wm.run_command("move right 2147483647 px");
+        assert!(r[0].success);
+        let r = wm.run_command("move left 2147483647 px");
+        assert!(r[0].success);
+    }
+    #[test]
+    fn cross_output_event_old_is_focused_workspace() {
+        let mut wm = Wm::new(
+            Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        );
+        wm.manage(win(1));
+        wm.take_effects();
+        wm.run_command("move right");
+        assert!(wm.take_effects().contains(&crate::wm::Effect::Ipc(
+            crate::wm::IpcEvent::Workspace {
+                change: "focus".into(),
+                current: Some("2".into()),
+                old: Some("1".into()),
+            }
+        )));
     }
     #[test]
     fn move_across_outputs() {
