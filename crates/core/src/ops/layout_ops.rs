@@ -4,6 +4,7 @@ use crate::tree::{Layout, NodeId, NodeKind};
 use crate::wm::Wm;
 
 const MIN_PERCENT: f64 = 0.05;
+const EPS: f64 = 1e-9;
 const MIN_FLOAT_SIZE: i64 = 50;
 
 fn clamp_i32(v: i64) -> i32 {
@@ -39,7 +40,9 @@ impl Wm {
                 }
             }
         };
-        self.focused_container = None;
+        if is_window {
+            self.focused_container = None;
+        }
         if is_ws {
             if self.tree.get(target).children.len() <= 1 {
                 self.tree.get_mut(target).layout = layout;
@@ -153,7 +156,10 @@ impl Wm {
         let n = sibs.len();
         let old = self.tree.get(c).percent;
         let new = old + delta;
-        if !new.is_finite() || new < MIN_PERCENT || new > 1.0 - MIN_PERCENT * (n as f64 - 1.0) {
+        if !new.is_finite()
+            || new < MIN_PERCENT - EPS
+            || new > 1.0 - MIN_PERCENT * (n as f64 - 1.0) + EPS
+        {
             return Err("cannot resize further".into());
         }
         let denom = 1.0 - old;
@@ -164,7 +170,7 @@ impl Wm {
         let mut updates = Vec::with_capacity(n);
         for &s in sibs.iter().filter(|&&s| s != c) {
             let v = self.tree.get(s).percent * factor;
-            if !v.is_finite() || v < MIN_PERCENT - 1e-12 {
+            if !v.is_finite() || v < MIN_PERCENT - EPS {
                 return Err("cannot resize further".into());
             }
             updates.push((s, v));
@@ -331,5 +337,37 @@ mod tests {
         wm.run_command("resize grow width 2147483647 px");
         wm.run_command("resize shrink width 2147483647 px");
         wm.run_command("resize grow height 2147483647 ppt");
+    }
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use crate::testutil::*;
+    use crate::tree::{Layout, WindowId};
+
+    #[test]
+    fn split_on_selected_container_keeps_selection() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        let c = wm.tree.wrap(n2, Layout::SplitV);
+        wm.manage(win(3));
+        wm.run_command("focus parent");
+        assert_eq!(wm.focused(), c);
+        wm.run_command("split v");
+        assert_eq!(wm.focused(), c);
+    }
+    #[test]
+    fn resize_landing_exactly_on_min_is_accepted() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let ws = wm.focused_workspace();
+        let ch = wm.tree.get(ws).children.clone();
+        wm.tree.get_mut(ch[0]).percent = 0.15;
+        wm.tree.get_mut(ch[1]).percent = 0.85;
+        let r = wm.run_command("resize shrink width 10 ppt");
+        assert!(r[0].success, "{:?}", r[0].error);
     }
 }
