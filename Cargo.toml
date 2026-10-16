@@ -1,4 +1,4 @@
 [workspace]
-members = ["crates/core", "crates/i3win"]
+members = ["crates/core", "crates/i3win", "crates/status"]
 resolver = "2"
 
