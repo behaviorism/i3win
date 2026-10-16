@@ -53,6 +53,10 @@ pub struct Wm {
     pub config: Config,
     pub mode: String,
     pub(crate) prev_workspace: Option<String>,
+    /// (container, leaf): `focus parent`/`focus child` selection. Only valid
+    /// while the focus-path leaf is still `leaf`, so any other focus change
+    /// implicitly invalidates it.
+    pub(crate) focused_container: Option<(NodeId, NodeId)>,
     pub(crate) effects: Vec<Effect>,
 }
 
@@ -80,6 +84,7 @@ impl Wm {
             config,
             mode: "default".into(),
             prev_workspace: None,
+            focused_container: None,
             effects: Vec::new(),
         };
         let outputs = if outputs.is_empty() {
@@ -152,7 +157,11 @@ impl Wm {
     }
 
     pub fn focused(&self) -> NodeId {
-        self.tree.focused_descendant(self.tree.root())
+        let leaf = self.tree.focused_descendant(self.tree.root());
+        match self.focused_container {
+            Some((c, l)) if l == leaf && self.tree.contains(c) => c,
+            _ => leaf,
+        }
     }
 
     pub fn focused_window(&self) -> Option<WindowId> {
@@ -511,13 +520,13 @@ impl Wm {
             Command::MoveToWorkspace(t) => return self.move_to_workspace(target, t),
             Command::MoveWorkspaceToOutput(t) => return self.move_workspace_to_output(t),
             Command::Workspace(t) => return self.switch_workspace(t),
-            Command::Focus(_)
-            | Command::FocusParent
-            | Command::FocusChild
-            | Command::FocusModeToggle
-            | Command::FocusFloating
-            | Command::FocusTiling
-            | Command::Move(..)
+            Command::Focus(d) => return self.focus_direction(target, *d),
+            Command::FocusParent => self.focus_parent(target),
+            Command::FocusChild => self.focus_child(target),
+            Command::FocusModeToggle => self.focus_layer(target, None),
+            Command::FocusFloating => self.focus_layer(target, Some(true)),
+            Command::FocusTiling => self.focus_layer(target, Some(false)),
+            Command::Move(..)
             | Command::Split(_)
             | Command::Layout(_)
             | Command::Fullscreen(_)

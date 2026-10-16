@@ -84,14 +84,20 @@ impl Wm {
         }
         if old_global != ws {
             self.remove_if_empty_hidden(old_global);
-            self.prev_workspace = Some(old_global_name.clone());
-            let current = self.workspace_name(ws).to_string();
-            self.emit(IpcEvent::Workspace {
-                change: "focus".into(),
-                current: Some(current),
-                old: Some(old_global_name),
-            });
+            self.note_workspace_focus(old_global_name, ws);
         }
+    }
+
+    /// Records `old_name` as the previous workspace and emits the
+    /// workspace "focus" event for `ws`.
+    pub(crate) fn note_workspace_focus(&mut self, old_name: String, ws: NodeId) {
+        self.prev_workspace = Some(old_name.clone());
+        let current = self.workspace_name(ws).to_string();
+        self.emit(IpcEvent::Workspace {
+            change: "focus".into(),
+            current: Some(current),
+            old: Some(old_name),
+        });
     }
 
     pub(crate) fn resolve_workspace(&mut self, t: &WorkspaceTarget) -> Option<NodeId> {
@@ -231,13 +237,7 @@ impl Wm {
         self.tree.set_focused(f);
         if old != ws {
             let old_name = self.workspace_name(old).to_string();
-            self.prev_workspace = Some(old_name.clone());
-            let current = self.workspace_name(ws).to_string();
-            self.emit(IpcEvent::Workspace {
-                change: "focus".into(),
-                current: Some(current),
-                old: Some(old_name),
-            });
+            self.note_workspace_focus(old_name, ws);
         }
         Ok(())
     }

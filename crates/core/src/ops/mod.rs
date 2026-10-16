@@ -1,1 +1,2 @@
+mod focus;
 mod workspace;
