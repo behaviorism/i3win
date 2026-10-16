@@ -159,7 +159,11 @@ impl Wm {
     pub fn focused(&self) -> NodeId {
         let leaf = self.tree.focused_descendant(self.tree.root());
         match self.focused_container {
-            Some((c, l)) if l == leaf && self.tree.contains(c) => c,
+            Some((c, l))
+                if l == leaf && self.tree.contains(c) && self.tree.is_ancestor(c, leaf) =>
+            {
+                c
+            }
             _ => leaf,
         }
     }
@@ -293,6 +297,7 @@ impl Wm {
             .find(|(c, _)| c.matches(&info.class, &info.instance, &info.title))
             .map(|(_, t)| t.clone());
         let ws = self.resolve_assign(assigned.as_ref());
+        self.focused_container = None;
         let id = info.id;
         let wants_float = info.wants_float;
         let rect = info.rect;
@@ -356,7 +361,7 @@ impl Wm {
             return;
         };
         let ws = self.tree.workspace_of(node);
-        let was_focused = self.focused() == node;
+        let was_focused = self.tree.focused_descendant(self.tree.root()) == node;
         let parent = self.tree.parent(node);
         self.tree.remove(node);
         if let Some(p) = parent {
@@ -386,6 +391,7 @@ impl Wm {
     }
 
     pub fn on_focus_changed(&mut self, id: WindowId) {
+        self.focused_container = None;
         let Some(node) = self.tree.window_node(id) else {
             return;
         };
@@ -509,6 +515,7 @@ impl Wm {
             Command::Exit => self.effects.push(Effect::Exit),
             Command::Nop => {}
             Command::FocusMatched => {
+                self.focused_container = None;
                 if let Some(ws) = self.tree.workspace_of(target) {
                     if !self.is_visible(ws) {
                         self.show_workspace(ws);

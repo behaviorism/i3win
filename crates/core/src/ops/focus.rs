@@ -4,6 +4,7 @@ use crate::wm::{Effect, Wm};
 
 impl Wm {
     pub fn focus_direction(&mut self, from: NodeId, dir: Direction) -> Result<(), String> {
+        self.focused_container = None;
         if self.tree.is_floating(from) {
             let Some(ws) = self.tree.workspace_of(from) else {
                 return Ok(());
@@ -90,6 +91,7 @@ impl Wm {
 
     /// `floating`: None toggles layer, Some(true) floating, Some(false) tiling.
     pub fn focus_layer(&mut self, from: NodeId, floating: Option<bool>) {
+        self.focused_container = None;
         let Some(ws) = self.tree.workspace_of(from) else {
             return;
         };
@@ -108,6 +110,7 @@ impl Wm {
     }
 
     pub fn focus_node(&mut self, n: NodeId) {
+        self.focused_container = None;
         if !self.tree.contains(n) {
             return;
         }
@@ -204,6 +207,55 @@ mod tests {
         assert_eq!(wm.focused(), c); // never focuses the workspace
         wm.run_command("focus child");
         assert_eq!(wm.focused_window(), Some(WindowId(2)));
+    }
+    #[test]
+    fn selection_cleared_by_explicit_focus() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        let c = wm.tree.wrap(n2, Layout::SplitV);
+        wm.run_command("focus parent");
+        assert_eq!(wm.focused(), c);
+        wm.focus_node(n2);
+        assert_eq!(wm.focused(), n2);
+        wm.run_command("focus parent");
+        wm.on_focus_changed(WindowId(2));
+        assert_eq!(wm.focused(), n2);
+        wm.run_command("focus parent");
+        wm.run_command("focus tiling");
+        assert_eq!(wm.focused(), n2);
+    }
+    #[test]
+    fn selection_ignored_when_leaf_leaves_container() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        wm.tree.wrap(n2, Layout::SplitV);
+        wm.run_command("focus parent");
+        let ws = wm.focused_workspace();
+        wm.tree.detach(n2);
+        wm.tree.attach(ws, n2, None);
+        wm.tree.set_focused(n2);
+        assert_eq!(wm.focused(), n2);
+    }
+    #[test]
+    fn unmanage_leaf_under_selected_container_refocuses() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        let c = wm.tree.wrap(n2, Layout::SplitV);
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        wm.tree.detach(n1);
+        wm.tree.attach(c, n1, None);
+        wm.tree.set_focused(n2);
+        wm.run_command("focus parent");
+        assert_eq!(wm.focused(), c);
+        wm.take_effects();
+        wm.unmanage(WindowId(2));
+        assert!(wm.take_effects().contains(&Effect::Focus(WindowId(1))));
     }
     #[test]
     fn mode_toggle() {
