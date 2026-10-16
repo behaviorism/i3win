@@ -534,11 +534,15 @@ impl Wm {
             Command::FocusFloating => self.focus_layer(target, Some(true)),
             Command::FocusTiling => self.focus_layer(target, Some(false)),
             Command::Move(d, px) => return self.move_direction(target, *d, *px),
-            Command::Split(_)
-            | Command::Layout(_)
-            | Command::Fullscreen(_)
-            | Command::Floating(_)
-            | Command::Resize { .. } => return Err("not implemented".into()),
+            Command::Split(a) => return self.split(target, a),
+            Command::Layout(a) => return self.set_layout(target, a),
+            Command::Resize {
+                grow,
+                axis,
+                px,
+                ppt,
+            } => return self.resize(target, *grow, *axis, *px, *ppt),
+            Command::Fullscreen(_) | Command::Floating(_) => return Err("not implemented".into()),
         }
         Ok(())
     }
