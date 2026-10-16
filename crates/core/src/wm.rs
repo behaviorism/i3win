@@ -533,8 +533,8 @@ impl Wm {
             Command::FocusModeToggle => self.focus_layer(target, None),
             Command::FocusFloating => self.focus_layer(target, Some(true)),
             Command::FocusTiling => self.focus_layer(target, Some(false)),
-            Command::Move(..)
-            | Command::Split(_)
+            Command::Move(d, px) => return self.move_direction(target, *d, *px),
+            Command::Split(_)
             | Command::Layout(_)
             | Command::Fullscreen(_)
             | Command::Floating(_)
