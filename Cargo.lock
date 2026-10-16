@@ -124,6 +124,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "i3win-msg"
+version = "0.1.0"
+dependencies = [
+ "i3win-core",
+ "serde_json",
+]
+
+[[package]]
 name = "i3win-status"
 version = "0.1.0"
 dependencies = [
