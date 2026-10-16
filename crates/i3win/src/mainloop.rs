@@ -20,6 +20,9 @@ pub const WM_APP_MAIN: u32 = WM_APP + 3;
 pub enum MainMsg {
     FocusNode(NodeId),
     Shutdown,
+    /// Debug-only crash-safety trigger; the main thread panics on it.
+    #[cfg(debug_assertions)]
+    DebugPanic,
 }
 
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -154,6 +157,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if !with_app(|app| app.refresh_outputs()) {
                 repost(hwnd, msg, wp, lp);
             }
+            LRESULT(0)
+        }
+        WM_ENDSESSION if wp.0 != 0 => {
+            hidden::restore_all_hidden();
             LRESULT(0)
         }
         WM_CLOSE => {

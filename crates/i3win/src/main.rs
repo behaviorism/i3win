@@ -13,7 +13,11 @@ use simplelog::{
     WriteLogger,
 };
 use windows::core::w;
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, FALSE, TRUE};
+use windows::Win32::System::Console::{
+    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+    CTRL_SHUTDOWN_EVENT,
+};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -44,6 +48,46 @@ fn init_logging() {
     let _ = CombinedLogger::init(loggers);
 }
 
+/// Runs on a system-created thread: touches only the hidden mirror and the main queue.
+unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> BOOL {
+    match ctrl {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
+            win::hidden::restore_all_hidden();
+            mainloop::post(mainloop::MainMsg::Shutdown);
+            TRUE
+        }
+        _ => FALSE,
+    }
+}
+
+fn install_crash_safety() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("panic: {info}");
+        win::hidden::restore_all_hidden();
+        default_hook(info);
+    }));
+    // SAFETY: the handler is a plain `extern "system"` fn that lives for the whole process.
+    if let Err(e) = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), true) } {
+        log::warn!("cannot install console ctrl handler: {e}");
+    }
+}
+
+#[cfg(debug_assertions)]
+fn spawn_debug_panic_trigger() {
+    let Some(secs) = std::env::var("I3WIN_PANIC_AFTER_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        mainloop::post(mainloop::MainMsg::DebugPanic);
+    });
+}
+
 fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -63,6 +107,9 @@ fn main() {
     }
 
     init_logging();
+    install_crash_safety();
+    #[cfg(debug_assertions)]
+    spawn_debug_panic_trigger();
 
     // Single instance. The handle is intentionally held until process exit.
     let _mutex = unsafe { CreateMutexW(None, true, w!("Local\\i3win-single-instance")) };

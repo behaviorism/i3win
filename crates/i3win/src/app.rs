@@ -221,6 +221,8 @@ impl App {
         match msg {
             // Shutdown is handled by the window procedure itself.
             MainMsg::Shutdown => {}
+            #[cfg(debug_assertions)]
+            MainMsg::DebugPanic => panic!("debug panic requested via I3WIN_PANIC_AFTER_SECS"),
             MainMsg::FocusNode(n) => {
                 if self.wm.tree.contains(n) {
                     self.wm.focus_node(n);
