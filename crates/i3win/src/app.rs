@@ -224,17 +224,7 @@ impl App {
 
     /// Re-reads monitor geometry and re-places every window.
     pub fn refresh_outputs(&mut self) {
-        for o in monitors::enumerate() {
-            for node in self.wm.outputs() {
-                if let NodeKind::Output { name, rect, scale } = &mut self.wm.tree.get_mut(node).kind
-                {
-                    if *name == o.name {
-                        *rect = o.rect;
-                        *scale = o.scale;
-                    }
-                }
-            }
-        }
+        self.wm.set_outputs(monitors::enumerate());
         self.applied.rects.clear();
         self.flush();
     }

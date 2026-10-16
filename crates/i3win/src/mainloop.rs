@@ -53,11 +53,19 @@ pub fn drain_main_msgs() -> Vec<MainMsg> {
     }
 }
 
+thread_local! {
+    /// Set after a handler panic; only Shutdown is processed from then on.
+    static POISONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 const SPI_SETWORKAREA: usize = 0x2F;
 
 /// Runs `f` against the App if it is not already borrowed; returns false when busy.
 /// A panic inside `f` restores all hidden windows and shuts down.
 fn with_app(f: impl FnOnce(&mut App)) -> bool {
+    if POISONED.with(|p| p.get()) {
+        return true;
+    }
     APP.with(|cell| {
         let Ok(mut guard) = cell.try_borrow_mut() else {
             return false;
@@ -70,6 +78,7 @@ fn with_app(f: impl FnOnce(&mut App)) -> bool {
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unknown panic".into());
                 log::error!("panic in message handler: {msg}");
+                POISONED.with(|p| p.set(true));
                 hidden::restore_all_hidden();
                 post(MainMsg::Shutdown);
             }
