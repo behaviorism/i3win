@@ -71,10 +71,26 @@ impl Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn inset_shrinks() { assert_eq!(Rect::new(0,0,100,50).inset(2,20,2,2), Rect::new(2,20,96,28)); }
-    #[test] fn inset_never_below_one() { assert_eq!(Rect::new(0,0,10,10).inset(8,8,8,8).w, 1); }
-    #[test] fn centered_in_outer() { assert_eq!(Rect::new(0,0,400,300).centered_in(&Rect::new(0,0,1000,500)), Rect::new(300,100,400,300)); }
-    #[test] fn direction_props() {
+    #[test]
+    fn inset_shrinks() {
+        assert_eq!(
+            Rect::new(0, 0, 100, 50).inset(2, 20, 2, 2),
+            Rect::new(2, 20, 96, 28)
+        );
+    }
+    #[test]
+    fn inset_never_below_one() {
+        assert_eq!(Rect::new(0, 0, 10, 10).inset(8, 8, 8, 8).w, 1);
+    }
+    #[test]
+    fn centered_in_outer() {
+        assert_eq!(
+            Rect::new(0, 0, 400, 300).centered_in(&Rect::new(0, 0, 1000, 500)),
+            Rect::new(300, 100, 400, 300)
+        );
+    }
+    #[test]
+    fn direction_props() {
         assert_eq!(Direction::Left.orientation(), Orientation::Horizontal);
         assert_eq!(Direction::Down.orientation(), Orientation::Vertical);
         assert!(Direction::Right.is_forward() && Direction::Down.is_forward());
