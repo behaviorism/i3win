@@ -1,4 +1,5 @@
 pub mod arrange;
+pub mod bar_model;
 pub mod command;
 pub mod config;
 pub mod criteria;
