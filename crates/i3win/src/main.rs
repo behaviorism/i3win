@@ -2,6 +2,7 @@
 
 mod app;
 mod bar_layout;
+mod ipc_server;
 mod mainloop;
 mod paths;
 mod reconcile;
@@ -104,6 +105,7 @@ fn main() {
     }
 
     let mut config_override: Option<PathBuf> = None;
+    let mut ipc_pipe = String::from(r"\\.\pipe\i3win-ipc");
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -112,6 +114,11 @@ fn main() {
                 return;
             }
             "--config" => config_override = args.next().map(PathBuf::from),
+            "--ipc-pipe" => {
+                if let Some(name) = args.next() {
+                    ipc_pipe = name;
+                }
+            }
             _ => {}
         }
     }
@@ -134,6 +141,7 @@ fn main() {
         log::error!("cannot create main window: {e}");
         std::process::exit(1);
     }
+    ipc_server::start(ipc_pipe.clone());
     // Hooks go in as soon as the main window exists (their wake-ups need a target),
     // so windows shown by the recovery below are seen as late Shown events.
     if let Err(e) = win::events::install() {
@@ -151,7 +159,7 @@ fn main() {
         }
     }
 
-    app::APP.with(|a| *a.borrow_mut() = Some(app::App::start(config_path)));
+    app::APP.with(|a| *a.borrow_mut() = Some(app::App::start(config_path, ipc_pipe)));
     if let Err(e) = win::keyboard::install() {
         log::error!("cannot install keyboard hook: {e}");
     }

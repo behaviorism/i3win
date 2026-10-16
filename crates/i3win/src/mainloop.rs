@@ -31,6 +31,12 @@ pub enum MainMsg {
     StatusUpdate(u64, Vec<i3win_core::i3bar::Block>),
     /// The status process of the given generation ended.
     StatusExited(u64),
+    /// An i3 IPC request from a connection thread; the answer goes back on `reply`.
+    Ipc {
+        msg_type: u32,
+        payload: String,
+        reply: std::sync::mpsc::Sender<String>,
+    },
     Shutdown,
     /// Debug-only crash-safety trigger; the main thread panics on it.
     #[cfg(debug_assertions)]

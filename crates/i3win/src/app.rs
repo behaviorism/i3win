@@ -10,10 +10,12 @@ use i3win_core::arrange::floating_frame_from_client;
 use i3win_core::config::{default_config_text, parse_config, Config};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::Block;
+use i3win_core::ipc::{self, IpcContext, Request, EV_TICK};
 use i3win_core::keys::KeyCombo;
 use i3win_core::tree::{NodeKind, WindowId};
 use i3win_core::wm::{Effect, Wm};
 
+use crate::ipc_server;
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
 use crate::reconcile::{self, Applied, WinOp};
@@ -96,10 +98,10 @@ fn event_id(ev: PlatformEvent) -> WindowId {
     }
 }
 
-fn parse_file(path: &Path) -> Result<Config, String> {
+fn parse_file(path: &Path) -> Result<(Config, String), String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    Ok(parse_config(&text))
+    Ok((parse_config(&text), text))
 }
 
 fn default_config() -> Config {
@@ -109,10 +111,11 @@ fn default_config() -> Config {
     )))
 }
 
-fn spawn(command: &str) {
+fn spawn(command: &str, pipe_name: &str) {
     let mut cmd = Command::new("cmd.exe");
     cmd.raw_arg(cmd_args(&format!("start \"\" {command}")))
-        .creation_flags(CREATE_NO_WINDOW);
+        .creation_flags(CREATE_NO_WINDOW)
+        .env("I3SOCK", pipe_name);
     if let Some(home) = std::env::var_os("USERPROFILE") {
         cmd.current_dir(home);
     }
@@ -137,15 +140,19 @@ pub struct App {
     last_combos: Vec<KeyCombo>,
     /// Effects queued outside the core (exec lines from the config), flushed first.
     pending: Vec<Effect>,
+    /// Last successfully read config text, served by GET_CONFIG.
+    config_text: String,
+    /// IPC pipe name, exported to exec'd children as I3SOCK.
+    pipe_name: String,
 }
 
 impl App {
-    pub fn start(config_path: PathBuf) -> App {
-        let config = match paths::load_or_create_config(&config_path) {
-            Ok(text) => parse_config(&text),
+    pub fn start(config_path: PathBuf, pipe_name: String) -> App {
+        let (config, config_text) = match paths::load_or_create_config(&config_path) {
+            Ok(text) => (parse_config(&text), text),
             Err(e) => {
                 log::error!("config: {e}; using the default config");
-                default_config()
+                (default_config(), String::new())
             }
         };
         for w in &config.warnings {
@@ -178,6 +185,8 @@ impl App {
             config_path,
             last_combos: Vec::new(),
             pending,
+            config_text,
+            pipe_name,
             status: None,
         };
         app.restart_status();
@@ -327,6 +336,11 @@ impl App {
                     self.wm.focus_node(n);
                 }
             }
+            MainMsg::Ipc {
+                msg_type,
+                payload,
+                reply,
+            } => self.on_ipc(msg_type, &payload, &reply),
             MainMsg::RunCommand(c) => {
                 self.wm.run_command(&c);
             }
@@ -344,6 +358,27 @@ impl App {
             }
         }
         true
+    }
+
+    fn on_ipc(&mut self, msg_type: u32, payload: &str, reply: &std::sync::mpsc::Sender<String>) {
+        let path = self.config_path.display().to_string();
+        let ctx = IpcContext {
+            config_path: &path,
+            config_text: &self.config_text,
+        };
+        match ipc::handle(&mut self.wm, &ctx, msg_type, payload) {
+            Request::Reply(s) => {
+                let _ = reply.send(s);
+            }
+            Request::Tick(p) => {
+                let _ = reply.send(r#"{"success":true}"#.to_string());
+                ipc_server::broadcast(EV_TICK, "tick", &ipc::tick_event(false, &p));
+            }
+            // The connection thread handles SUBSCRIBE itself.
+            Request::Subscribe(_) => {
+                let _ = reply.send(r#"{"success":false,"error":"unexpected subscribe"}"#.into());
+            }
+        }
     }
 
     /// Ends a batch of main messages: one full flush if requested (it redraws the
@@ -374,12 +409,15 @@ impl App {
             }
             for e in effects {
                 match e {
-                    Effect::Exec(c) => spawn(&c),
+                    Effect::Exec(c) => spawn(&c, &self.pipe_name),
                     Effect::Close(w) => window::close(w),
                     Effect::Focus(w) => focus.push(w),
                     Effect::Exit => mainloop::post(MainMsg::Shutdown),
                     Effect::Reload => self.reload(),
-                    Effect::Ipc(_) => {}
+                    Effect::Ipc(ev) => {
+                        let (i, n, p) = ipc::event_json(&self.wm, &ev);
+                        ipc_server::broadcast(i, n, &p);
+                    }
                 }
             }
         }
@@ -464,7 +502,8 @@ impl App {
 
     fn reload(&mut self) {
         match parse_file(&self.config_path) {
-            Ok(config) => {
+            Ok((config, text)) => {
+                self.config_text = text;
                 for w in &config.warnings {
                     log::warn!("config: {w}");
                 }
@@ -480,6 +519,7 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        ipc_server::broadcast_shutdown();
         events::uninstall();
         keyboard::uninstall();
         hidden::restore_all_hidden();
