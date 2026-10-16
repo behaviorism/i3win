@@ -40,9 +40,10 @@ pub fn parse_criteria(inner: &str) -> Result<Criteria, String> {
             let mut closed = false;
             while let Some(ch) = chars.next() {
                 match ch {
-                    '\\' if chars.peek() == Some(&'"') => {
-                        value.push('"');
-                        chars.next();
+                    '\\' if matches!(chars.peek(), Some('"' | '\\')) => {
+                        if let Some(e) = chars.next() {
+                            value.push(e);
+                        }
                     }
                     '"' => {
                         closed = true;
@@ -106,6 +107,11 @@ mod tests {
     fn escaped_quote() {
         let c = parse_criteria(r#"title="say \"hi\"""#).unwrap();
         assert!(c.matches("", "", r#"say "hi""#));
+    }
+    #[test]
+    fn escaped_backslash_ends_quoted_value() {
+        let c = parse_criteria(r#"title="a\\\\" class=x"#).unwrap();
+        assert!(c.matches("x", "", r"a\"));
     }
     #[test]
     fn errors() {

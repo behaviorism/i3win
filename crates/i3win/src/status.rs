@@ -34,6 +34,46 @@ pub struct StatusProcess {
     generation: u64,
 }
 
+/// Longest status line kept; the rest of a longer line is dropped.
+const MAX_LINE: usize = 64 * 1024;
+
+/// cmd.exe arguments running `command`. With `/S`, cmd strips only the outer
+/// quotes, so a command containing quoted paths survives intact.
+pub fn cmd_args(command: &str) -> String {
+    format!("/S /C \"{command}\"")
+}
+
+/// Reads one line into `buf` (without clearing it), keeping at most `cap` bytes
+/// and discarding the rest of an over-long line. Returns the bytes consumed;
+/// 0 means end of input.
+fn read_line_capped<R: BufRead>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<usize> {
+    let mut total = 0;
+    loop {
+        let (used, done) = {
+            let chunk = r.fill_buf()?;
+            if chunk.is_empty() {
+                return Ok(total);
+            }
+            let (end, done) = match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (chunk.len(), false),
+            };
+            let room = cap.saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..end.min(room)]);
+            (end, done)
+        };
+        r.consume(used);
+        total += used;
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
 /// The block shown when the status command is gone or could not start.
 pub fn exit_block() -> Block {
     Block {
@@ -47,7 +87,7 @@ pub fn exit_block() -> Block {
 impl StatusProcess {
     pub fn spawn(command: &str) -> std::io::Result<StatusProcess> {
         let mut cmd = Command::new("cmd.exe");
-        cmd.raw_arg(format!("/C {command}"))
+        cmd.raw_arg(cmd_args(command))
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -87,7 +127,7 @@ impl StatusProcess {
                 let mut buf = Vec::new();
                 loop {
                     buf.clear();
-                    match reader.read_until(b'\n', &mut buf) {
+                    match read_line_capped(&mut reader, &mut buf, MAX_LINE) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }

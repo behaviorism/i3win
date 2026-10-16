@@ -76,14 +76,14 @@ pub struct CommandGroup {
 
 type Tok = (String, bool);
 
-/// Splits on `sep` outside of double quotes (`\"` escapes inside quotes).
+/// Splits on `sep` outside of double quotes (`\"` and `\` escape inside quotes).
 fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut in_quote = false;
     let mut chars = s.char_indices().peekable();
     while let Some((i, ch)) = chars.next() {
-        if in_quote && ch == '\\' && matches!(chars.peek(), Some(&(_, '"'))) {
+        if in_quote && ch == '\\' && matches!(chars.peek(), Some(&(_, '"' | '\\'))) {
             chars.next();
         } else if ch == '"' {
             in_quote = !in_quote;
@@ -119,9 +119,10 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 let mut closed = false;
                 while let Some(c) = chars.next() {
                     match c {
-                        '\\' if chars.peek() == Some(&'"') => {
-                            text.push('"');
-                            chars.next();
+                        '\\' if matches!(chars.peek(), Some('"' | '\\')) => {
+                            if let Some(e) = chars.next() {
+                                text.push(e);
+                            }
                         }
                         '"' => {
                             closed = true;
@@ -155,7 +156,7 @@ pub fn parse_commands(input: &str) -> Result<Vec<CommandGroup>, String> {
             let mut end = None;
             let mut chars = after.char_indices().peekable();
             while let Some((i, ch)) = chars.next() {
-                if in_quote && ch == '\\' && matches!(chars.peek(), Some(&(_, '"'))) {
+                if in_quote && ch == '\\' && matches!(chars.peek(), Some(&(_, '"' | '\\'))) {
                     chars.next();
                 } else if ch == '"' {
                     in_quote = !in_quote;
@@ -433,6 +434,27 @@ mod tests {
         assert_eq!(
             one(r#"exec "notepad a.txt""#),
             Command::Exec("notepad a.txt".into())
+        );
+    }
+    #[test]
+    fn exec_quoted_path_ending_in_backslash() {
+        assert_eq!(one(r#"exec "C:\dir\\""#), Command::Exec(r"C:\dir\".into()));
+    }
+    #[test]
+    fn escaped_quoted_names_round_trip() {
+        for name in [r#"my "ws""#, r"a\b", r"x\", r#"q\"z"#, "plain"] {
+            let escaped = name.replace('\\', r"\\").replace('"', r#"\""#);
+            assert_eq!(
+                one(&format!("workspace \"{escaped}\"")),
+                Command::Workspace(WorkspaceTarget::Name(name.into()))
+            );
+        }
+    }
+    #[test]
+    fn single_backslash_before_other_char_stays_literal() {
+        assert_eq!(
+            one(r#"workspace "C:\Program Files""#),
+            Command::Workspace(WorkspaceTarget::Name(r"C:\Program Files".into()))
         );
     }
     #[test]

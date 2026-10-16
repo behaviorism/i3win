@@ -277,6 +277,17 @@ mod tests {
         assert_eq!(click_command(r#"my "ws""#), r#"workspace "my \"ws\"""#);
     }
     #[test]
+    fn click_command_round_trips_through_the_parser() {
+        use i3win_core::command::{parse_commands, Command, WorkspaceTarget};
+        for name in [r#"my "ws""#, r"a\b", r"x\", "plain"] {
+            let groups = parse_commands(&click_command(name)).unwrap();
+            assert_eq!(
+                groups[0].commands,
+                vec![Command::Workspace(WorkspaceTarget::Name(name.into()))]
+            );
+        }
+    }
+    #[test]
     fn odd_inputs_do_not_panic() {
         let c = BarConfig::default().colors;
         let mut b = blk("x");

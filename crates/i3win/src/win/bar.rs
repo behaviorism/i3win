@@ -42,6 +42,8 @@ struct BarWindow {
     hwnd: HWND,
     rect: Rect,
     data: BarData,
+    /// Whether the window is currently shown.
+    shown: bool,
 }
 
 pub struct Bars {
@@ -190,50 +192,49 @@ impl Bars {
                 scale,
                 blocks: blocks.to_vec(),
             };
-            let hwnd = match self.windows.get_mut(name) {
-                Some(bw) => {
-                    if bw.data != data {
-                        set_data(bw.hwnd, &data);
-                        bw.data = data;
-                    }
-                    bw.hwnd
-                }
-                None => {
-                    let Some(hwnd) = create_window(r, &data) else {
-                        continue;
-                    };
-                    self.windows.insert(
-                        name.clone(),
-                        BarWindow {
-                            hwnd,
-                            rect: r,
-                            data,
-                        },
-                    );
-                    hwnd
-                }
-            };
+            let mut created = false;
             if let Some(bw) = self.windows.get_mut(name) {
+                if bw.data != data {
+                    set_data(bw.hwnd, &data);
+                    bw.data = data;
+                }
+            } else {
+                let Some(hwnd) = create_window(r, &data) else {
+                    continue;
+                };
+                created = true;
+                self.windows.insert(
+                    name.clone(),
+                    BarWindow {
+                        hwnd,
+                        rect: r,
+                        data,
+                        shown: false,
+                    },
+                );
+            }
+            if let Some(bw) = self.windows.get_mut(name) {
+                let want_shown = !arr.fullscreen_outputs.contains(name);
+                // Re-asserting topmost every flush would hop over menus and tooltips.
+                let raise = created || bw.rect != r || (want_shown && !bw.shown);
                 // SAFETY: plain Win32 calls on our own window.
                 unsafe {
-                    let _ = SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        r.x,
-                        r.y,
-                        r.w.max(1),
-                        r.h.max(1),
-                        SWP_NOACTIVATE,
-                    );
-                    bw.rect = r;
-                    let _ = ShowWindow(
-                        hwnd,
-                        if arr.fullscreen_outputs.contains(name) {
-                            SW_HIDE
-                        } else {
-                            SW_SHOWNA
-                        },
-                    );
+                    if raise {
+                        let _ = SetWindowPos(
+                            bw.hwnd,
+                            HWND_TOPMOST,
+                            r.x,
+                            r.y,
+                            r.w.max(1),
+                            r.h.max(1),
+                            SWP_NOACTIVATE,
+                        );
+                        bw.rect = r;
+                    }
+                    if want_shown != bw.shown {
+                        let _ = ShowWindow(bw.hwnd, if want_shown { SW_SHOWNA } else { SW_HIDE });
+                        bw.shown = want_shown;
+                    }
                 }
             }
         }
@@ -262,6 +263,21 @@ impl Bars {
             }
         }
     }
+}
+
+thread_local! {
+    /// Wheel delta not yet worth a full notch (touchpads send small deltas).
+    static WHEEL_ACC: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds `delta` to the accumulator and returns whole notches: positive is wheel
+/// up (previous workspace), negative is down. The remainder stays in `acc`.
+fn wheel_steps(acc: &mut i32, delta: i32) -> i32 {
+    const WHEEL_DELTA: i32 = 120;
+    *acc += delta;
+    let steps = *acc / WHEEL_DELTA;
+    *acc -= steps * WHEEL_DELTA;
+    steps
 }
 
 fn to_rect(r: Rect) -> RECT {
@@ -367,11 +383,20 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
-            let delta = ((wp.0 >> 16) & 0xffff) as i16;
-            if delta > 0 {
-                mainloop::post(MainMsg::RunCommand("workspace prev".into()));
-            } else if delta < 0 {
-                mainloop::post(MainMsg::RunCommand("workspace next".into()));
+            let delta = ((wp.0 >> 16) & 0xffff) as i16 as i32;
+            let steps = WHEEL_ACC.with(|a| {
+                let mut acc = a.get();
+                let n = wheel_steps(&mut acc, delta);
+                a.set(acc);
+                n
+            });
+            let cmd = if steps > 0 {
+                "workspace prev"
+            } else {
+                "workspace next"
+            };
+            for _ in 0..steps.unsigned_abs() {
+                mainloop::post(MainMsg::RunCommand(cmd.into()));
             }
             LRESULT(0)
         }
@@ -389,6 +414,22 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wheel_accumulates_small_deltas() {
+        let mut acc = 0;
+        assert_eq!(wheel_steps(&mut acc, 40), 0);
+        assert_eq!(wheel_steps(&mut acc, 40), 0);
+        assert_eq!(wheel_steps(&mut acc, 40), 1);
+        assert_eq!(acc, 0);
+    }
+    #[test]
+    fn wheel_down_and_multi_notch() {
+        let mut acc = 0;
+        assert_eq!(wheel_steps(&mut acc, -120), -1);
+        assert_eq!(wheel_steps(&mut acc, 240), 2);
+        assert_eq!(wheel_steps(&mut acc, 100), 0);
+        assert_eq!(acc, 100);
+    }
     #[test]
     fn top_and_bottom_strips() {
         let o = Rect::new(100, 50, 800, 600);

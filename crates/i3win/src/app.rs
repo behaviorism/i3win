@@ -17,7 +17,7 @@ use i3win_core::wm::{Effect, Wm};
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
 use crate::reconcile::{self, Applied, WinOp};
-use crate::status::{exit_block, StatusProcess};
+use crate::status::{cmd_args, exit_block, StatusProcess};
 use crate::win::bar::Bars;
 use crate::win::deco::Decos;
 use crate::win::events::{self, PlatformEvent};
@@ -111,7 +111,7 @@ fn default_config() -> Config {
 
 fn spawn(command: &str) {
     let mut cmd = Command::new("cmd.exe");
-    cmd.raw_arg(format!("/C start \"\" {command}"))
+    cmd.raw_arg(cmd_args(&format!("start \"\" {command}")))
         .creation_flags(CREATE_NO_WINDOW);
     if let Some(home) = std::env::var_os("USERPROFILE") {
         cmd.current_dir(home);
@@ -129,6 +129,8 @@ pub struct App {
     bars: Bars,
     /// Latest status blocks (empty until the status process feeds them).
     blocks: Vec<Block>,
+    /// Blocks changed since the bars were last redrawn.
+    bars_dirty: bool,
     status: Option<StatusProcess>,
     store: HiddenStore,
     config_path: PathBuf,
@@ -171,6 +173,7 @@ impl App {
             decos: Decos::new(),
             bars: Bars::new(),
             blocks: Vec::new(),
+            bars_dirty: false,
             store: HiddenStore::open(paths::hidden_path()),
             config_path,
             last_combos: Vec::new(),
@@ -211,6 +214,7 @@ impl App {
 
     /// Redraws only the bars with the current blocks.
     fn refresh_bars(&mut self) {
+        self.bars_dirty = false;
         let arr = self.wm.arrange();
         self.bars.update(&self.wm, &arr, &self.blocks);
     }
@@ -300,7 +304,7 @@ impl App {
             MainMsg::StatusUpdate(g, blocks) => {
                 if self.status_gen() == Some(g) {
                     self.blocks = blocks;
-                    self.refresh_bars();
+                    self.bars_dirty = true;
                 }
                 return false;
             }
@@ -310,7 +314,7 @@ impl App {
                         p.kill();
                     }
                     self.blocks = vec![exit_block()];
-                    self.refresh_bars();
+                    self.bars_dirty = true;
                 }
                 return false;
             }
@@ -340,6 +344,16 @@ impl App {
             }
         }
         true
+    }
+
+    /// Ends a batch of main messages: one full flush if requested (it redraws the
+    /// bars too), otherwise at most one bar refresh for coalesced status updates.
+    pub fn finish_main_msgs(&mut self, need_flush: bool) {
+        if need_flush {
+            self.flush();
+        } else if self.bars_dirty {
+            self.refresh_bars();
+        }
     }
 
     /// Re-reads monitor geometry and re-places every window.
@@ -419,6 +433,7 @@ impl App {
                 .map_or(1.0, |(_, s)| *s)
         });
         self.bars.update(&self.wm, &arr, &self.blocks);
+        self.bars_dirty = false;
         // Focus last: focusing a still-hidden window fails.
         let leaf = self
             .wm

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use i3win_core::tree::NodeId;
@@ -39,6 +39,13 @@ pub enum MainMsg {
 
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static QUEUE: Mutex<VecDeque<MainMsg>> = Mutex::new(VecDeque::new());
+/// True while a WM_APP_MAIN wake-up is posted and not yet being handled.
+static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Returns true when the caller must post a wake-up (none is pending yet).
+fn claim_wake(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
 
 /// Raw handle of the main window, or 0 before it exists.
 pub fn main_hwnd() -> isize {
@@ -52,9 +59,11 @@ pub fn post(msg: MainMsg) {
         q.push_back(msg);
     }
     let h = MAIN_HWND.load(Ordering::SeqCst);
-    if h != 0 {
+    if h != 0 && claim_wake(&WAKE_PENDING) {
         unsafe {
-            let _ = PostMessageW(HWND(h as *mut _), WM_APP_MAIN, WPARAM(0), LPARAM(0));
+            if PostMessageW(HWND(h as *mut _), WM_APP_MAIN, WPARAM(0), LPARAM(0)).is_err() {
+                WAKE_PENDING.store(false, Ordering::Release);
+            }
         }
     }
 }
@@ -110,6 +119,8 @@ fn repost(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_MAIN => {
+            // Clear before draining: a post after the drain starts a new wake-up.
+            WAKE_PENDING.store(false, Ordering::Release);
             let mut rest = Vec::new();
             for m in drain_main_msgs() {
                 match m {
@@ -124,9 +135,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     for m in slot.take().into_iter().flatten() {
                         need_flush |= app.on_main_msg(m);
                     }
-                    if need_flush {
-                        app.flush();
-                    }
+                    app.finish_main_msgs(need_flush);
                 });
                 if !done {
                     // App busy: put the messages back; `post` re-posts the wake-up.
@@ -217,6 +226,7 @@ pub fn create_main_window() -> Result<HWND> {
         )?;
         MAIN_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
         // Deliver anything queued before the window existed.
+        WAKE_PENDING.store(true, Ordering::Release);
         let _ = PostMessageW(hwnd, WM_APP_MAIN, WPARAM(0), LPARAM(0));
         Ok(hwnd)
     }
@@ -237,5 +247,30 @@ pub fn run() -> i32 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wake_is_claimed_once_until_cleared() {
+        let f = AtomicBool::new(false);
+        assert!(claim_wake(&f));
+        assert!(!claim_wake(&f));
+        f.store(false, Ordering::Release);
+        assert!(claim_wake(&f));
+    }
+
+    #[test]
+    fn thousand_posts_without_window_are_all_queued() {
+        assert_eq!(main_hwnd(), 0);
+        let _ = drain_main_msgs();
+        for i in 0..1000 {
+            post(MainMsg::RunCommand(i.to_string()));
+        }
+        assert_eq!(drain_main_msgs().len(), 1000);
+        assert!(!WAKE_PENDING.load(Ordering::Acquire));
     }
 }
