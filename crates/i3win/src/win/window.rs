@@ -20,9 +20,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
-    HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
-    SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
+    PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindowAsync, GWL_EXSTYLE, GWL_STYLE,
+    GW_OWNER, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
 };
 
 const WS_CHILD: u32 = 0x4000_0000;
@@ -247,7 +247,7 @@ pub fn place(id: WindowId, target: Rect, raise: bool) {
     // SAFETY: plain Win32 call on a possibly stale handle.
     unsafe {
         if IsZoomed(h).as_bool() {
-            let _ = ShowWindow(h, SW_RESTORE);
+            let _ = ShowWindowAsync(h, SW_RESTORE);
         }
     }
     let r = match (raw_window_rect(id), frame_rect(id)) {
@@ -261,11 +261,15 @@ pub fn place(id: WindowId, target: Rect, raise: bool) {
     let after = if raise { HWND_TOP } else { HWND::default() };
     // SAFETY: plain Win32 call.
     let res = unsafe { SetWindowPos(h, after, r.x, r.y, r.w, r.h, flags) };
-    if let Err(e) = res {
-        let first = WARNED.with(|w| w.borrow_mut().insert(id));
-        if first {
-            log::warn!("SetWindowPos failed for window {:#x}: {e}", id.0);
+    match res {
+        Err(e) => {
+            if WARNED.with(|w| w.borrow_mut().insert(id)) {
+                log::warn!("SetWindowPos failed for window {:#x}: {e}", id.0);
+            }
         }
+        Ok(()) => WARNED.with(|w| {
+            w.borrow_mut().remove(&id);
+        }),
     }
 }
 
@@ -275,7 +279,7 @@ pub fn hide(id: WindowId) -> bool {
     // SAFETY: plain Win32 calls.
     unsafe {
         let was = IsWindowVisible(h).as_bool();
-        let _ = ShowWindow(h, SW_HIDE);
+        let _ = ShowWindowAsync(h, SW_HIDE);
         was
     }
 }
@@ -283,7 +287,7 @@ pub fn hide(id: WindowId) -> bool {
 pub fn show(id: WindowId) {
     // SAFETY: plain Win32 call.
     unsafe {
-        let _ = ShowWindow(hwnd(id), SW_SHOWNA);
+        let _ = ShowWindowAsync(hwnd(id), SW_SHOWNA);
     }
 }
 
@@ -299,7 +303,7 @@ pub fn focus(id: WindowId) {
     // SAFETY: plain Win32 call.
     unsafe {
         if IsIconic(h).as_bool() {
-            let _ = ShowWindow(h, SW_RESTORE);
+            let _ = ShowWindowAsync(h, SW_RESTORE);
         }
     }
     send_dummy_key();
@@ -429,5 +433,20 @@ mod tests {
             "firefox"
         );
         assert_eq!(exe_stem("Code.exe"), "Code");
+    }
+    #[test]
+    fn compensate_saturates() {
+        let win = Rect::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        let frame = Rect::new(i32::MAX, i32::MAX, 1, 1);
+        let _ = compensate(
+            Rect::new(i32::MAX, i32::MAX, i32::MAX, i32::MAX),
+            win,
+            frame,
+        );
+    }
+    #[test]
+    fn exe_stem_slash_and_no_ext() {
+        assert_eq!(exe_stem("C:/x/y/app.exe"), "app");
+        assert_eq!(exe_stem(r"C:\x\noext"), "noext");
     }
 }
