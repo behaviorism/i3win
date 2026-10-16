@@ -62,6 +62,18 @@ fn workspace_num(name: &str) -> Option<i32> {
     digits.parse().ok()
 }
 
+fn is_window_command(cmd: &Command) -> bool {
+    !matches!(
+        cmd,
+        Command::Exec(_)
+            | Command::Reload
+            | Command::Restart
+            | Command::Exit
+            | Command::Mode(_)
+            | Command::Nop
+    )
+}
+
 impl Wm {
     pub fn new(config: Config, outputs: Vec<OutputInfo>) -> Wm {
         let mut wm = Wm {
@@ -94,6 +106,13 @@ impl Wm {
             wm.tree.attach(root, node, None);
             output_nodes.push(node);
         }
+        let output_names: Vec<String> = output_nodes
+            .iter()
+            .filter_map(|&n| match &wm.tree.get(n).kind {
+                NodeKind::Output { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
         for node in output_nodes {
             let oname = match &wm.tree.get(node).kind {
                 NodeKind::Output { name, .. } => name.clone(),
@@ -107,7 +126,12 @@ impl Wm {
                 .map(|(ws, _)| ws.clone());
             let name = assigned.unwrap_or_else(|| {
                 let mut n = 1;
-                while wm.find_workspace(&n.to_string()).is_some() {
+                while wm.find_workspace(&n.to_string()).is_some()
+                    || wm.config.workspace_outputs.iter().any(|(ws, outs)| {
+                        *ws == n.to_string()
+                            && outs.iter().any(|o| *o != oname && output_names.contains(o))
+                    })
+                {
                     n += 1;
                 }
                 n.to_string()
@@ -433,10 +457,14 @@ impl Wm {
                     .collect()
             });
             for cmd in &g.commands {
-                let targets = match &matched {
+                let mut targets = match &matched {
                     Some(t) => t.clone(),
                     None => vec![self.focused()],
                 };
+                // Non-window commands run once, not once per matched window.
+                if !is_window_command(cmd) {
+                    targets.truncate(1);
+                }
                 let mut error = None;
                 for t in targets {
                     if !self.tree.contains(t) {
@@ -699,5 +727,73 @@ mod tests {
             let _ = wm.run_command(c);
         }
         assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
+    }
+
+    #[test]
+    fn workspace_output_assignment_not_stolen() {
+        let cfg = crate::config::parse_config(
+            "workspace 1 output B
+",
+        );
+        let wm = Wm::new(cfg, vec![out("A", 0, 1000), out("B", 1000, 1000)]);
+        let names: Vec<_> = wm
+            .outputs()
+            .iter()
+            .map(|&o| wm.workspace_name(wm.visible_workspace(o)).to_string())
+            .collect();
+        assert_eq!(names, vec!["2", "1"]);
+    }
+    #[test]
+    fn non_window_commands_run_once_per_command() {
+        let mut wm = test_wm();
+        let mut a = win(1);
+        a.class = "c".into();
+        let mut b = win(2);
+        b.class = "c".into();
+        wm.manage(a);
+        wm.manage(b);
+        wm.take_effects();
+        wm.run_command("[class=\"c\"] exec foo");
+        let n = wm
+            .take_effects()
+            .iter()
+            .filter(|e| **e == Effect::Exec("foo".into()))
+            .count();
+        assert_eq!(n, 1);
+    }
+    #[test]
+    fn workspaces_sorted_on_insert() {
+        let mut wm = test_wm();
+        let o = wm.outputs()[0];
+        wm.create_workspace(o, "foo");
+        wm.create_workspace(o, "10");
+        wm.create_workspace(o, "2");
+        let names: Vec<_> = wm
+            .tree
+            .get(o)
+            .children
+            .iter()
+            .map(|&w| wm.workspace_name(w).to_string())
+            .collect();
+        assert_eq!(names, vec!["1", "2", "10", "foo"]);
+    }
+    #[test]
+    fn unmanage_last_window_on_hidden_workspace_removes_it() {
+        let cfg = crate::config::parse_config(
+            "assign [class=\"c2\"] 2
+",
+        );
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(2));
+        wm.take_effects();
+        wm.unmanage(WindowId(2));
+        assert!(wm.find_workspace("2").is_none());
+        assert!(wm
+            .take_effects()
+            .contains(&Effect::Ipc(IpcEvent::Workspace {
+                change: "empty".into(),
+                current: Some("2".into()),
+                old: None
+            })));
     }
 }
