@@ -18,8 +18,6 @@ pub const WM_APP_MAIN: u32 = WM_APP + 3;
 
 #[derive(Debug)]
 pub enum MainMsg {
-    // Constructed by the bar in Plan 3.
-    #[allow(dead_code)]
     FocusNode(NodeId),
     Shutdown,
 }

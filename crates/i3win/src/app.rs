@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use i3win_core::arrange::floating_frame_from_client;
 use i3win_core::config::{default_config_text, parse_config, Config};
+use i3win_core::geom::Rect;
 use i3win_core::keys::KeyCombo;
 use i3win_core::tree::{NodeKind, WindowId};
 use i3win_core::wm::{Effect, Wm};
@@ -15,6 +16,7 @@ use i3win_core::wm::{Effect, Wm};
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
 use crate::reconcile::{self, Applied, WinOp};
+use crate::win::deco::Decos;
 use crate::win::events::{self, PlatformEvent};
 use crate::win::hidden::{self, HiddenStore, HideTracker};
 use crate::win::window::{self, Manage};
@@ -97,6 +99,7 @@ pub struct App {
     pub wm: Wm,
     applied: Applied,
     tracker: HideTracker,
+    decos: Decos,
     store: HiddenStore,
     config_path: PathBuf,
     last_combos: Vec<KeyCombo>,
@@ -135,6 +138,7 @@ impl App {
             wm,
             applied: Applied::default(),
             tracker: HideTracker::new(),
+            decos: Decos::new(),
             store: HiddenStore::open(paths::hidden_path()),
             config_path,
             last_combos: Vec::new(),
@@ -217,8 +221,11 @@ impl App {
         match msg {
             // Shutdown is handled by the window procedure itself.
             MainMsg::Shutdown => {}
-            // Bar clicks arrive with Plan 3.
-            MainMsg::FocusNode(_) => {}
+            MainMsg::FocusNode(n) => {
+                if self.wm.tree.contains(n) {
+                    self.wm.focus_node(n);
+                }
+            }
         }
     }
 
@@ -271,6 +278,22 @@ impl App {
                 WinOp::Place { id, rect, raise } => window::place(id, rect, raise),
             }
         }
+        let outputs: Vec<(Rect, f32)> = self
+            .wm
+            .outputs()
+            .into_iter()
+            .filter_map(|o| match &self.wm.tree.get(o).kind {
+                NodeKind::Output { rect, scale, .. } => Some((*rect, *scale)),
+                _ => None,
+            })
+            .collect();
+        self.decos.reconcile(&arr, &self.wm.config, |r| {
+            let (cx, cy) = r.center();
+            outputs
+                .iter()
+                .find(|(o, _)| cx >= o.x && cx < o.right() && cy >= o.y && cy < o.bottom())
+                .map_or(1.0, |(_, s)| *s)
+        });
         // Focus last: focusing a still-hidden window fails.
         for w in focus {
             window::focus(w);
@@ -302,6 +325,7 @@ impl App {
         events::uninstall();
         keyboard::uninstall();
         hidden::restore_all_hidden();
+        self.decos.destroy_all();
         self.store.clear_file();
     }
 }
