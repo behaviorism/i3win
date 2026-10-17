@@ -1,5 +1,5 @@
 use crate::command::{parse_commands, BorderArg, Command, TitleIconArg, Toggle, WorkspaceTarget};
-use crate::config::{Border, Config};
+use crate::config::{Border, Config, FocusOnActivation, PopupDuringFullscreen};
 use crate::criteria::select_matches;
 use crate::geom::{sanitize_floating, Rect};
 use crate::keys::KeyCombo;
@@ -383,6 +383,29 @@ impl Wm {
             .map(|(_, t)| t.clone());
         let ws = self.resolve_assign(assigned.as_ref());
         self.focused_container = None;
+        // A fullscreen window on the focused workspace decides whether the
+        // newcomer may take focus (popup_during_fullscreen).
+        let mut popup_blocked = false;
+        if ws == self.focused_workspace() {
+            let fs = self
+                .tree
+                .windows_under(ws)
+                .into_iter()
+                .find(|&n| self.tree.get(n).fullscreen);
+            if let Some(fs) = fs {
+                match self.config.popup_during_fullscreen {
+                    PopupDuringFullscreen::Smart => {
+                        let same_class = matches!(&self.tree.get(fs).kind,
+                            NodeKind::Window(d) if d.info.class == info.class);
+                        popup_blocked = !(info.wants_float && same_class);
+                    }
+                    PopupDuringFullscreen::Ignore => popup_blocked = true,
+                    PopupDuringFullscreen::LeaveFullscreen => {
+                        let _ = self.set_fullscreen(fs, &Toggle::Disable);
+                    }
+                }
+            }
+        }
         let id = info.id;
         let wants_float = info.wants_float;
         let rect = info.rect;
@@ -414,9 +437,19 @@ impl Wm {
             self.insert_tiled(ws, node);
         }
         self.emit_window("new", id);
+        let no_focus = self.tree.windows_under(ws).len() > 1
+            && self
+                .config
+                .no_focus
+                .iter()
+                .any(|c| c.matches_node(self, node));
         if ws == self.focused_workspace() {
-            self.tree.set_focused(node);
-            self.push_focus(id);
+            // A new node is queued last in every focus list, so skipping the
+            // focus calls leaves the current focus untouched.
+            if !popup_blocked && !no_focus {
+                self.tree.set_focused(node);
+                self.push_focus(id);
+            }
         } else {
             self.tree.set_focused_within(node, ws);
         }
@@ -504,9 +537,21 @@ impl Wm {
                 d.urgent = false;
             }
             self.emit_window("focus", id);
+        } else if self.config.focus_on_window_activation == FocusOnActivation::Focus {
+            self.show_workspace(ws);
+            self.focused_container = None;
+            self.tree.set_focused(node);
+            if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
+                d.urgent = false;
+            }
+            self.push_focus(id);
         } else {
             let was_urgent = matches!(&self.tree.get(node).kind, NodeKind::Window(d) if d.urgent);
-            if !was_urgent {
+            let mark = !matches!(
+                self.config.focus_on_window_activation,
+                FocusOnActivation::None
+            );
+            if mark && !was_urgent {
                 self.urgent_counter += 1;
                 let seq = self.urgent_counter;
                 if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
@@ -1242,5 +1287,99 @@ mod tests {
         wm.take_effects();
         wm.set_outputs(vec![out("O1", 0, 1200)]);
         assert!(wm.take_effects().contains(&Effect::Ipc(IpcEvent::Output)));
+    }
+
+    fn wm_with(cfg: &str) -> Wm {
+        Wm::new(crate::config::parse_config(cfg), vec![out("O1", 0, 1000)])
+    }
+
+    #[test]
+    fn activation_focus_switches_workspace() {
+        let mut wm = wm_with(
+            "focus_on_window_activation focus
+",
+        );
+        wm.manage(win(1));
+        wm.run_command("workspace 2");
+        wm.manage(win(2));
+        wm.on_focus_changed(WindowId(1));
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+    }
+
+    #[test]
+    fn activation_none_still_allows_visible_focus() {
+        let mut wm = wm_with(
+            "focus_on_window_activation none
+",
+        );
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.on_focus_changed(WindowId(1));
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        wm.run_command("workspace 2");
+        wm.manage(win(3));
+        wm.on_focus_changed(WindowId(1));
+        assert_eq!(wm.focused_window(), Some(WindowId(3)));
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        assert!(matches!(&wm.tree.get(n1).kind, NodeKind::Window(d) if !d.urgent));
+    }
+
+    #[test]
+    fn popup_during_fullscreen_smart() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("fullscreen enable");
+        wm.manage(win(2)); // different class, tiled
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        let mut dlg = win(3);
+        dlg.class = "c1".into();
+        dlg.wants_float = true;
+        wm.manage(dlg);
+        assert_eq!(wm.focused_window(), Some(WindowId(3)));
+    }
+
+    #[test]
+    fn popup_leave_fullscreen() {
+        let mut wm = wm_with(
+            "popup_during_fullscreen leave_fullscreen
+",
+        );
+        wm.manage(win(1));
+        wm.run_command("fullscreen enable");
+        wm.manage(win(2));
+        assert!(wm.arrange().fullscreen_outputs.is_empty());
+        assert_eq!(wm.focused_window(), Some(WindowId(2)));
+    }
+
+    #[test]
+    fn popup_ignore_never_takes_focus() {
+        let mut wm = wm_with(
+            "popup_during_fullscreen ignore
+",
+        );
+        wm.manage(win(1));
+        wm.run_command("fullscreen enable");
+        let mut dlg = win(2);
+        dlg.class = "c1".into();
+        dlg.wants_float = true;
+        wm.manage(dlg);
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+    }
+
+    #[test]
+    fn no_focus_criteria() {
+        let mut wm = wm_with(
+            "no_focus [class=\"^c2$\"]
+",
+        );
+        wm.manage(win(1));
+        wm.manage(win(2)); // class c2: matched, must not take focus
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        wm.run_command("workspace 4");
+        let mut lone = win(4);
+        lone.class = "c2".into();
+        wm.manage(lone); // matched, but alone on its workspace: takes focus
+        assert_eq!(wm.focused_window(), Some(WindowId(4)));
     }
 }
