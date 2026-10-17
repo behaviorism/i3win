@@ -17,7 +17,7 @@ use i3win_core::wm::{Effect, Wm};
 use i3win_core::DropTarget;
 
 use crate::drag::{self, Drag, DragKind, NativeDrag, PercentSnapshot, ReleaseWatch};
-use crate::hover::{self, HoverInput, HoverState};
+use crate::hover::{self, FreezeVerdict, HoverInput, HoverState};
 use crate::ipc_server;
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
@@ -176,6 +176,65 @@ fn mouse_snapshot(wm: &Wm, arr: &Arrangement, foreground_managed: bool) -> mouse
     }
 }
 
+/// A native (Windows-driven) move/size loop of a tiled window, from its START.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MoveStart {
+    /// DWM frame at START.
+    frame: Rect,
+    at_ms: u64,
+    /// The foreground at START.
+    start_fg: Option<WindowId>,
+    /// The cursor was on the resize border at START (else the loop is a move).
+    on_border: bool,
+    /// The freeze was lifted by timeout; the START rect is kept for a late END.
+    thawed: bool,
+}
+
+/// Judges every open native loop: thaws (keeping START) the ones frozen too long and
+/// forgets the ones the foreground left. Returns the windows to unfreeze.
+fn thaw_step(
+    move_start: &mut HashMap<WindowId, MoveStart>,
+    now_ms: u64,
+    fg: Option<WindowId>,
+) -> Vec<WindowId> {
+    let mut unfreeze = Vec::new();
+    move_start.retain(|id, m| {
+        match hover::freeze_verdict(*id, m.at_ms, now_ms, m.start_fg, fg, m.thawed) {
+            FreezeVerdict::Keep => true,
+            FreezeVerdict::Thaw => {
+                m.thawed = true;
+                unfreeze.push(*id);
+                true
+            }
+            FreezeVerdict::Drop => {
+                // A thawed loop was already unfrozen.
+                if !m.thawed {
+                    unfreeze.push(*id);
+                }
+                false
+            }
+        }
+    });
+    unfreeze
+}
+
+/// Ends a window's native move/size bookkeeping, whatever the window is now
+/// (it may have turned floating during the loop): unfreezes it and returns its START.
+fn end_move_size(
+    move_start: &mut HashMap<WindowId, MoveStart>,
+    frozen: &mut HashSet<WindowId>,
+    id: WindowId,
+) -> Option<MoveStart> {
+    frozen.remove(&id);
+    move_start.remove(&id)
+}
+
+/// Whether the foreground counts as managed for mouse drags and hover: a managed
+/// window or one of our own (the main window focus is parked on, a bar, a deco).
+fn foreground_counts_as_managed(fg: WindowId, managed: bool, ours: bool, main: isize) -> bool {
+    managed || ours || (main != 0 && fg.0 == main)
+}
+
 /// A mouse drag in progress.
 struct DragSession {
     drag: Drag,
@@ -233,16 +292,15 @@ pub struct App {
     /// IPC pipe name, exported to exec'd children as I3SOCK.
     pipe_name: String,
     drag: Option<DragSession>,
-    /// DWM frame of a tiled window at the start of its native move/size loop.
-    move_start: HashMap<WindowId, (Rect, u64, Option<WindowId>)>,
+    /// Native move/size loops of tiled windows, from START until END.
+    move_start: HashMap<WindowId, MoveStart>,
     hover: HoverState,
     /// The latest pointer position seen by the hover logic.
     hover_pos: Option<(i32, i32)>,
     /// The next flush's focus change came from a binding or command (warp the pointer).
     warp_pending: bool,
-    /// Focused node and its output as of the last flush.
+    /// Focused node as of the last flush.
     last_focus: Option<NodeId>,
-    last_output: Option<NodeId>,
     overlay: Overlay,
     /// Time base for drag throttling.
     epoch: Instant,
@@ -303,7 +361,6 @@ impl App {
             hover_pos: None,
             warp_pending: false,
             last_focus: None,
-            last_output: None,
             overlay: Overlay::default(),
             epoch: Instant::now(),
         };
@@ -474,16 +531,21 @@ impl App {
             .wm
             .tree
             .window_id(self.wm.tree.focused_descendant(self.wm.tree.root()));
+        let fg = window::foreground();
         let input = HoverInput {
             under,
             focused,
-            foreground_managed: window::foreground().is_some_and(|fg| self.is_managed(fg)),
-            button_down: [Button::Left, Button::Right, Button::Middle]
-                .into_iter()
-                .any(|b| !button_up(b)),
+            foreground_managed: fg.is_some_and(|fg| self.foreground_managed(fg)),
+            // A press the hook swallowed never shows in the async state.
+            button_down: mouse::holds_swallowed_press()
+                || [Button::Left, Button::Right, Button::Middle]
+                    .into_iter()
+                    .any(|b| !button_up(b)),
             dragging: self.drag.is_some(),
             over_bar,
             over_tab_row,
+            // Thread state of the foreground app (no message is sent to it).
+            menu_active: fg.is_some_and(window::gui_menu_active),
             now_ms: self.now_ms(),
             pos: (x, y),
         };
@@ -513,30 +575,25 @@ impl App {
     }
 
     /// Thaws windows whose native move/size loop never reported its end: the
-    /// foreground moved elsewhere, or the freeze is 10 s old. Returns whether any thawed.
+    /// foreground moved elsewhere (forgotten), or the freeze is 10 s old (START kept
+    /// for a late END). Returns whether any thawed.
     fn thaw_expired(&mut self) -> bool {
         if self.move_start.is_empty() {
             return false;
         }
         let (now, fg) = (self.now_ms(), window::foreground());
-        let expired: Vec<WindowId> = self
-            .move_start
-            .iter()
-            .filter(|(id, (_, at, sfg))| hover::freeze_expired(**id, *at, now, *sfg, fg))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &expired {
-            self.move_start.remove(id);
+        let unfreeze = thaw_step(&mut self.move_start, now, fg);
+        for id in &unfreeze {
             self.applied.frozen.remove(id);
             reconcile::invalidate(&mut self.applied, *id);
         }
-        !expired.is_empty()
+        !unfreeze.is_empty()
     }
 
     /// The freeze timer fired: lifts stale freezes.
     pub fn on_freeze_timer(&mut self) {
         let thawed = self.thaw_expired();
-        if !self.move_start.is_empty() {
+        if self.move_start.values().any(|m| !m.thawed) {
             mainloop::arm_freeze_timer();
         }
         if thawed {
@@ -640,6 +697,9 @@ impl App {
         self.overlay.hide();
         if s.from_titlebar {
             deco::end_title_drag();
+        } else {
+            // The hook stops posting this drag (its held release stays swallowed).
+            mouse::cancel_drag();
         }
         drag::cancel_drag(&mut self.wm, &s.drag, &s.percents);
         true
@@ -685,6 +745,16 @@ impl App {
         self.wm.tree.window_node(id).is_some()
     }
 
+    /// See `foreground_counts_as_managed`.
+    fn foreground_managed(&self, fg: WindowId) -> bool {
+        foreground_counts_as_managed(
+            fg,
+            self.is_managed(fg),
+            self.bars.owns(fg) || self.decos.lookup(fg).is_some(),
+            mainloop::main_hwnd(),
+        )
+    }
+
     /// Handles one platform event. Does not flush; the caller flushes once per batch.
     pub fn on_event(&mut self, ev: PlatformEvent) {
         let id = event_id(ev);
@@ -718,15 +788,20 @@ impl App {
         }
         if let PlatformEvent::Foreground(fg) = ev {
             // Between flushes too: a menu or unmanaged window in front blocks drags at once.
-            mouse::set_foreground_managed(self.is_managed(fg));
+            mouse::set_foreground_managed(self.foreground_managed(fg));
         }
     }
 
     fn on_move_size_end(&mut self, id: WindowId) {
+        let start = end_move_size(&mut self.move_start, &mut self.applied.frozen, id);
         let Some(node) = self.wm.tree.window_node(id) else {
             return;
         };
         if self.wm.tree.is_floating(node) {
+            if start.is_some() {
+                // Turned floating during the loop: re-place it once.
+                reconcile::invalidate(&mut self.applied, id);
+            }
             let scale = self
                 .wm
                 .tree
@@ -747,7 +822,7 @@ impl App {
                 self.wm.on_floating_moved(id, frame);
             }
         } else {
-            self.on_tiled_move_size_end(id, node);
+            self.on_tiled_move_size_end(id, node, start);
         }
     }
 
@@ -760,9 +835,16 @@ impl App {
         if self.wm.tree.is_floating(node) {
             return;
         }
-        if let Some(r) = window::frame_rect(id) {
-            self.move_start
-                .insert(id, (r, self.now_ms(), window::foreground()));
+        if let Some(frame) = window::frame_rect(id) {
+            let on_border = window::cursor_pos().is_some_and(|c| drag::start_on_border(frame, c));
+            let m = MoveStart {
+                frame,
+                at_ms: self.now_ms(),
+                start_fg: window::foreground(),
+                on_border,
+                thawed: false,
+            };
+            self.move_start.insert(id, m);
             self.applied.frozen.insert(id);
             mainloop::arm_freeze_timer();
         }
@@ -770,16 +852,15 @@ impl App {
 
     /// A native loop of a tiled window ends: a border resize adjusts the tree, a
     /// title-bar move drops (when allowed); anything else snaps back on the flush.
-    fn on_tiled_move_size_end(&mut self, id: WindowId, node: NodeId) {
-        self.applied.frozen.remove(&id);
+    /// A loop that did not start on the border, or ends maximized, is a move.
+    fn on_tiled_move_size_end(&mut self, id: WindowId, node: NodeId, start: Option<MoveStart>) {
         // Snap back unless the tree changes below (a changed tree re-places anyway).
         reconcile::invalidate(&mut self.applied, id);
-        let (Some((start, _, _)), Some(end)) =
-            (self.move_start.remove(&id), window::frame_rect(id))
-        else {
+        let (Some(start), Some(end)) = (start, window::frame_rect(id)) else {
             return;
         };
-        match drag::classify_native(start, end) {
+        let from_border = start.on_border && !window::is_zoomed(id);
+        match drag::classify_native(start.frame, end, from_border) {
             NativeDrag::Resized(edges) => {
                 for (dir, delta) in edges {
                     self.wm.resize_edge(node, dir, delta);
@@ -844,14 +925,9 @@ impl App {
                 payload,
                 reply,
             } => return self.on_ipc(msg_type, &payload, &reply),
-            // The wheel over a tab row: like RunCommand but never warps the pointer.
-            MainMsg::WheelFocus(c) => {
+            // A mouse command (tab-row wheel, bar click/wheel): never warps the pointer.
+            MainMsg::MouseCommand(c) => {
                 self.refresh_pointer();
-                self.wm.run_command(&c);
-            }
-            MainMsg::RunCommand(c) => {
-                self.refresh_pointer();
-                self.warp_pending = true;
                 self.wm.run_command(&c);
             }
             MainMsg::StatusClick { bar, click } => {
@@ -1016,7 +1092,7 @@ impl App {
             self.park_foreground();
         }
         self.warp_pointer(&arr, leaf);
-        let fg_managed = window::foreground().is_some_and(|fg| self.is_managed(fg));
+        let fg_managed = window::foreground().is_some_and(|fg| self.foreground_managed(fg));
         mouse::set_snapshot(mouse_snapshot(&self.wm, &arr, fg_managed));
         let combos = self.wm.active_combos();
         if combos != self.last_combos {
@@ -1038,11 +1114,13 @@ impl App {
                         _ => None,
                     })
                 });
+            let pointer = window::cursor_pos();
             let target = hover::warp_target(
-                self.last_output,
-                output,
                 self.wm.config.mouse_warping,
                 self.last_focus != Some(node),
+                pointer,
+                pointer.and_then(|(x, y)| self.output_at(x, y)),
+                output,
                 rect,
             );
             if let Some((x, y)) = target {
@@ -1053,7 +1131,14 @@ impl App {
             }
         }
         self.last_focus = Some(node);
-        self.last_output = output;
+    }
+
+    /// The output containing screen point (x, y).
+    fn output_at(&self, x: i32, y: i32) -> Option<NodeId> {
+        self.wm.outputs().into_iter().find(|&o| {
+            matches!(&self.wm.tree.get(o).kind, NodeKind::Output { rect, .. }
+                if x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom())
+        })
     }
 
     /// With nothing to focus, keep typing out of windows we have hidden.
@@ -1164,6 +1249,56 @@ mod tests {
         assert_eq!(s.hits[0].id, WindowId(2));
         assert_eq!(s.modifier, Some(Modifiers::ALT));
         assert!(!s.want_moves);
+    }
+    fn move_start(at_ms: u64) -> MoveStart {
+        MoveStart {
+            frame: Rect::new(0, 0, 500, 500),
+            at_ms,
+            start_fg: None,
+            on_border: true,
+            thawed: false,
+        }
+    }
+    #[test]
+    fn timeout_thaw_keeps_start_for_a_late_end() {
+        let w = WindowId(1);
+        let mut m = HashMap::from([(w, move_start(0))]);
+        assert!(thaw_step(&mut m, 5_000, Some(w)).is_empty());
+        assert_eq!(thaw_step(&mut m, 10_000, Some(w)), vec![w]);
+        // Unfrozen, but the START rect stays for the END of a long native drag.
+        assert!(m[&w].thawed);
+        assert_eq!(m[&w].frame, Rect::new(0, 0, 500, 500));
+        assert!(thaw_step(&mut m, 60_000, Some(w)).is_empty());
+        assert!(m.contains_key(&w));
+        // The foreground moved elsewhere: the loop is over; nothing left to unfreeze.
+        assert!(thaw_step(&mut m, 61_000, Some(WindowId(9))).is_empty());
+        assert!(m.is_empty());
+    }
+    #[test]
+    fn abandoned_loop_is_unfrozen_and_forgotten() {
+        let w = WindowId(1);
+        let mut m = HashMap::from([(w, move_start(0))]);
+        assert_eq!(thaw_step(&mut m, 100, Some(WindowId(9))), vec![w]);
+        assert!(m.is_empty());
+    }
+    #[test]
+    fn move_size_end_always_unfreezes() {
+        // E.g. the window turned floating during the loop: END must still clean up.
+        let w = WindowId(1);
+        let mut m = HashMap::from([(w, move_start(0))]);
+        let mut frozen = HashSet::from([w]);
+        assert_eq!(end_move_size(&mut m, &mut frozen, w), Some(move_start(0)));
+        assert!(m.is_empty() && frozen.is_empty());
+        assert_eq!(end_move_size(&mut m, &mut frozen, w), None);
+    }
+    #[test]
+    fn own_windows_count_as_managed_foreground() {
+        let fg = WindowId(42);
+        assert!(foreground_counts_as_managed(fg, true, false, 7));
+        assert!(foreground_counts_as_managed(fg, false, true, 7)); // bar or deco
+        assert!(foreground_counts_as_managed(fg, false, false, 42)); // parked main window
+        assert!(!foreground_counts_as_managed(fg, false, false, 7));
+        assert!(!foreground_counts_as_managed(WindowId(0), false, false, 0));
     }
     #[test]
     fn hidden_expected_is_ignored() {

@@ -202,6 +202,12 @@ impl KeyMatcher {
     pub fn resync(&mut self, is_down: impl Fn(u16) -> bool) {
         self.down_mods.retain(|vk| is_down(*vk));
     }
+
+    /// `resync`, then the modifiers still held.
+    pub fn resynced_mods(&mut self, is_down: impl Fn(u16) -> bool) -> Modifiers {
+        self.resync(is_down);
+        self.mods()
+    }
 }
 
 thread_local! {
@@ -363,10 +369,25 @@ pub fn set_modifier_watch(mods: Option<Modifiers>) -> bool {
     })
 }
 
-/// Modifiers currently held per the hook's tracking (empty if the matcher is busy).
-/// Called from the mouse hook: no allocation, no Win32 calls.
-pub fn held_mods() -> Modifiers {
-    MATCHER.with(|m| m.try_borrow().map(|m| m.mods()).unwrap_or_default())
+/// Modifiers currently held (empty if the matcher is busy), after dropping tracked
+/// modifiers the OS no longer reports down: a key-up lost to the secure desktop
+/// (Ctrl+Alt+Del, UAC, Win+L) must not keep every click a modifier-click. Modifiers
+/// are never swallowed, so their async state is reliable. Called from the mouse hook:
+/// no allocation, no cross-process calls (`GetAsyncKeyState` only).
+pub fn held_mods_resynced() -> Modifiers {
+    let (mods, flip) = MATCHER.with(|m| match m.try_borrow_mut() {
+        Ok(mut m) => {
+            // SAFETY: plain Win32 call.
+            let mods = m.resynced_mods(|v| unsafe { GetAsyncKeyState(v as i32) } < 0);
+            (mods, m.resync_watch())
+        }
+        Err(_) => (Modifiers::default(), None),
+    });
+    // A dropped stuck modifier must also release a revealed Hide bar.
+    if let Some(held) = flip {
+        post_mods(held);
+    }
+    mods
 }
 
 pub fn drain() -> Vec<(Option<KeyCombo>, bool, bool)> {

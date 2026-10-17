@@ -523,8 +523,14 @@ fn on_button(hwnd: HWND, data: &BarData, button: u8, release: bool, x: i32, y: i
         BarAction::Nothing => return,
     };
     for _ in 0..count {
-        mainloop::post(MainMsg::RunCommand(cmd.clone()));
+        mainloop::post(bar_command(cmd.clone()));
     }
+}
+
+/// A bar click or wheel runs its command without warping the pointer: the pointer
+/// is on the bar the user is using, possibly on another output than the focus.
+fn bar_command(cmd: String) -> MainMsg {
+    MainMsg::MouseCommand(cmd)
 }
 
 /// The point packed in a mouse message's `lParam` (client or screen coordinates).
@@ -607,6 +613,13 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bar_commands_never_warp() {
+        assert!(matches!(
+            bar_command("workspace 2".into()),
+            MainMsg::MouseCommand(c) if c == "workspace 2"
+        ));
+    }
     #[test]
     fn wheel_accumulates_small_deltas() {
         let mut acc = 0;

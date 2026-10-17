@@ -300,13 +300,18 @@ impl Wm {
         self.remove_if_empty_hidden(src);
     }
 
-    /// Moves `dragged` to the end of `dest` without following it.
+    /// Moves `dragged` to the end of `dest`. Focus stays on it when `dest` is
+    /// visible (another output); a hidden `dest` is not followed.
     fn move_dragged(&mut self, dragged: NodeId, dest: NodeId) -> bool {
         if self.tree.workspace_of(dragged) == Some(dest) {
             return false;
         }
-        self.move_node_to_workspace(dragged, dest, true).is_ok()
-            && self.tree.workspace_of(dragged) == Some(dest)
+        let moved = self.move_node_to_workspace(dragged, dest, true).is_ok()
+            && self.tree.workspace_of(dragged) == Some(dest);
+        if moved && self.is_visible(dest) {
+            self.focus_node(dragged);
+        }
+        moved
     }
 
     /// Rect to preview for a target (the zone's half/whole target rect, or
@@ -600,6 +605,9 @@ mod tests {
         assert!(area.x >= 1000);
         assert!(wm.drop_window(n2, &DropTarget::Output(b)));
         assert_eq!(wm.tree.describe(wm.visible_workspace(b)), "H[w2]");
+        // The destination is visible: focus stays on the dragged window.
+        assert_eq!(wm.focused_window(), Some(WindowId(2)));
+        assert_eq!(wm.focused_workspace(), wm.visible_workspace(b));
         assert!(!wm.drop_window(n2, &DropTarget::Output(b)));
         let r = wm.node_rect(n1).unwrap();
         let left = wm

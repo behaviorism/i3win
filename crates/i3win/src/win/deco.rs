@@ -539,7 +539,7 @@ unsafe extern "system" fn deco_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if let Some(Deco::TabBar { tabs, .. }) = ptr.as_ref().map(|d| &d.deco) {
                 let delta = i32::from((wp.0 >> 16) as u16 as i16);
                 if let Some(n) = wheel_target(tabs, delta) {
-                    mainloop::post(MainMsg::WheelFocus(format!("[con_id={}] focus", n.0)));
+                    mainloop::post(MainMsg::MouseCommand(format!("[con_id={}] focus", n.0)));
                 }
             }
             LRESULT(0)

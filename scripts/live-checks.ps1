@@ -283,18 +283,22 @@ Remove-Item $blocksConf -ErrorAction SilentlyContinue
 
 # ---- Plan 8: mouse (runs i3win with a temp config: user's config + floating_modifier Mod1 + focus_follows_mouse yes)
 # MOUSEEVENTF: LEFTDOWN 2, LEFTUP 4, RIGHTDOWN 8, RIGHTUP 0x10. Tolerance +-12 px (DWM frame differences).
+# Held button/key are tracked so `finally` sends only the matching up events.
+$script:heldUp = $null; $script:heldAlt = $false
 function Mouse-Drag($x1, $y1, $x2, $y2, [uint32]$down, [uint32]$up, [bool]$alt = $true) {
-  if ($alt) { [U]::Key($ALT, $false); Start-Sleep -Milliseconds 80 }
+  if ($alt) { [U]::Key($ALT, $false); $script:heldAlt = $true; Start-Sleep -Milliseconds 80 }
   [void][U]::SetCursorPos($x1, $y1); Start-Sleep -Milliseconds 100
-  [U]::Mouse($down); Start-Sleep -Milliseconds 100
+  [U]::Mouse($down); $script:heldUp = $up; Start-Sleep -Milliseconds 100
   for ($s = 1; $s -le 10; $s++) {
     [void][U]::SetCursorPos([int]($x1 + ($x2 - $x1) * $s / 10), [int]($y1 + ($y2 - $y1) * $s / 10)); Start-Sleep -Milliseconds 50
   }
   Start-Sleep -Milliseconds 100
-  [U]::Mouse($up); Start-Sleep -Milliseconds 100
-  if ($alt) { [U]::Key($ALT, $true) }
+  [U]::Mouse($up); $script:heldUp = $null; Start-Sleep -Milliseconds 100
+  if ($alt) { [U]::Key($ALT, $true); $script:heldAlt = $false }
   Start-Sleep -Milliseconds 500
 }
+# Focuses a known notepad through IPC instead of trusting the current foreground.
+function Focus-Window($h) { $null = Msg "[id=$([int64]$h)] focus"; Start-Sleep -Milliseconds 400 }
 function Near($a, $b, $tol = 12) { [Math]::Abs($a - $b) -le $tol }
 $mp = @()
 try {
@@ -320,6 +324,8 @@ try {
   Check 'plan8 two notepads tiled side by side' (($rl.R -le $rr.L + 16) -and ($rl.R -gt $rl.L)) "left=$rl right=$rr"
 
   # Alt + right-drag near left window's right edge resizes it
+  Focus-Window $left
+  $rl = [U]::Rect($left)
   $widthBefore = $rl.R - $rl.L
   $y = [int](($rl.T + $rl.B) / 2)
   Mouse-Drag ($rl.R - 8) $y ($rl.R + 92) $y 8 0x10
@@ -327,24 +333,28 @@ try {
   Check 'plan8 Alt+right-drag resizes left tile ~100px wider' (Near ($rl2.R - $rl2.L) ($widthBefore + 100)) "before=$widthBefore after=$($rl2.R - $rl2.L)"
 
   # Alt + left-drag right tile onto the left tile's left quarter swaps them
+  Focus-Window $right
   $rr = [U]::Rect($right); $rl2 = [U]::Rect($left)
   $wa = [U]::WorkArea()
   Mouse-Drag ([int](($rr.L + $rr.R) / 2)) ([int](($rr.T + $rr.B) / 2)) ($rl2.L + [int](($rl2.R - $rl2.L) / 4)) ([int](($rl2.T + $rl2.B) / 2)) 2 4
-  $rr3 = [U]::Rect($right)
+  $rr3 = [U]::Rect($right); $rl3 = [U]::Rect($left)
   Check 'plan8 Alt+left-drag swaps tiles (right notepad now at left edge)' (Near $rr3.L $wa.L 16) "right=$rr3 workarea=$wa"
+  Check 'plan8 Alt+left-drag swaps tiles (left notepad now right of it)' ($rl3.L -ge $rr3.R - 16) "left=$rl3 right=$rr3"
 
   # floating window moves with Alt + left-drag
-  $null = Msg floating enable; Start-Sleep -Milliseconds 500
-  $f = Fg
+  Focus-Window $left
+  $null = Msg "[id=$([int64]$left)] floating enable"; Start-Sleep -Milliseconds 500
+  $f = $left
   $rf = [U]::Rect($f)
-  Check 'plan8 floating enable on focused notepad' ($mh -contains $f) "fg cls=$([U]::Cls($f))"
+  Check 'plan8 floating enable on a known notepad' ((Fg) -eq $f) "fg=$(Fg) cls=$([U]::Cls((Fg))) expected=$f"
   Mouse-Drag ([int](($rf.L + $rf.R) / 2)) ([int](($rf.T + $rf.B) / 2)) ([int](($rf.L + $rf.R) / 2) + 100) ([int](($rf.T + $rf.B) / 2)) 2 4
   $rf2 = [U]::Rect($f)
   Check 'plan8 Alt+left-drag moves floating window ~100px' ((Near ($rf2.L - $rf.L) 100) -and (Near $rf2.T $rf.T)) "before=$rf after=$rf2"
-  $null = Msg floating disable; Start-Sleep -Milliseconds 600
+  $null = Msg "[id=$([int64]$f)] floating disable"; Start-Sleep -Milliseconds 600
 
-  # hover focus: move onto the non-foreground notepad
-  $other = $mh | Where-Object { $_ -ne (Fg) } | Select-Object -First 1
+  # hover focus: focus one notepad, then move onto the other
+  Focus-Window $left
+  $other = $right
   $ro = [U]::Rect($other)
   [void][U]::SetCursorPos([int](($ro.L + $ro.R) / 2), [int](($ro.T + $ro.B) / 2) + 20)
   Start-Sleep -Milliseconds 100
@@ -354,7 +364,8 @@ try {
 } catch {
   Check 'plan8 section ran without exception' $false "$_"
 } finally {
-  [U]::Mouse(0x10); [U]::Mouse(4); [U]::Key($ALT, $true)
+  if ($null -ne $script:heldUp) { [U]::Mouse($script:heldUp); $script:heldUp = $null }
+  if ($script:heldAlt) { [U]::Key($ALT, $true); $script:heldAlt = $false }
   $mp | Stop-Process -Force -ErrorAction SilentlyContinue
   Get-Process i3win, i3win-status -ErrorAction SilentlyContinue | Stop-Process -Force
   Remove-Item "$scratch\i3win-live-mouse.conf" -ErrorAction SilentlyContinue

@@ -74,9 +74,9 @@ pub fn arm_hover_timer() {
 #[derive(Debug)]
 pub enum MainMsg {
     FocusNode(NodeId),
-    RunCommand(String),
-    /// A command from the wheel over a tab row (no pointer warp).
-    WheelFocus(String),
+    /// A command from the mouse (wheel over a tab row, bar click or wheel). Never
+    /// warps the pointer: it is already where the user is working.
+    MouseCommand(String),
     /// A click on a status block of bar `bar`.
     StatusClick {
         bar: String,
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(main_hwnd(), 0);
         let _ = drain_main_msgs();
         for i in 0..1000 {
-            post(MainMsg::RunCommand(i.to_string()));
+            post(MainMsg::MouseCommand(i.to_string()));
         }
         assert_eq!(drain_main_msgs().len(), 1000);
         assert!(!WAKE_PENDING.load(Ordering::Acquire));

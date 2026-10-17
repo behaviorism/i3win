@@ -18,12 +18,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindow,
-    GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, IsZoomed, PostMessageW, SetCursorPos, SetForegroundWindow, SetWindowPos,
-    ShowWindowAsync, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_TOP,
-    SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
-    SW_HIDE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
+    EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+    GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SetCursorPos, SetForegroundWindow,
+    SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GWL_STYLE,
+    GW_OWNER, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
 };
 
 const WS_CHILD: u32 = 0x4000_0000;
@@ -407,6 +407,36 @@ pub fn window_at_point(x: i32, y: i32) -> Option<WindowId> {
         let root = GetAncestor(h, GA_ROOT);
         let root = if root.0.is_null() { h } else { root };
         Some(WindowId(root.0 as isize))
+    }
+}
+
+/// Whether the window is maximized (a snap to the top edge maximizes).
+pub fn is_zoomed(id: WindowId) -> bool {
+    // SAFETY: plain Win32 call.
+    unsafe { IsZoomed(hwnd(id)).as_bool() }
+}
+
+/// Whether the GUI thread of `id` is in a menu, popup, move/size loop or holds the
+/// capture (see `hover::menu_active`). Reads thread state only: no message is sent.
+pub fn gui_menu_active(id: WindowId) -> bool {
+    // SAFETY: plain Win32 calls; `info` is a valid, sized out buffer.
+    unsafe {
+        let thread = GetWindowThreadProcessId(hwnd(id), None);
+        if thread == 0 {
+            return false;
+        }
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(thread, &mut info).is_err() {
+            return false;
+        }
+        crate::hover::menu_active(
+            info.flags.0,
+            !info.hwndCapture.0.is_null(),
+            !info.hwndMenuOwner.0.is_null(),
+        )
     }
 }
 

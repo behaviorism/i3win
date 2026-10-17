@@ -26,15 +26,24 @@ pub struct HoverInput {
     pub dragging: bool,
     pub over_bar: bool,
     pub over_tab_row: bool,
+    /// The foreground thread is in a menu, a popup (combo dropdown), a move/size
+    /// loop or holds the capture: moving focus would close or break it.
+    pub menu_active: bool,
     pub now_ms: u64,
     pub pos: (i32, i32),
 }
 
 /// Returns the window to focus now, if any. Never while a button is down, during a
-/// drag, with an unmanaged foreground, over a bar or a tab row; a new `under`
+/// drag, with an unmanaged foreground or one in a menu, over a bar or a tab row; a new `under`
 /// (other than the focused one) becomes the candidate and fires after resting 50 ms.
 pub fn hover_step(s: &mut HoverState, i: &HoverInput) -> Option<WindowId> {
-    if i.button_down || i.dragging || !i.foreground_managed || i.over_bar || i.over_tab_row {
+    if i.button_down
+        || i.dragging
+        || !i.foreground_managed
+        || i.menu_active
+        || i.over_bar
+        || i.over_tab_row
+    {
         s.candidate = None;
         return None;
     }
@@ -67,40 +76,68 @@ pub fn hover_step(s: &mut HoverState, i: &HoverInput) -> Option<WindowId> {
     }
 }
 
-/// Where to put the pointer after a focus change: `Output` only when the output
-/// changed, `Container` on every focus change, `None` never. The center of the
-/// focused rect.
-pub fn warp_target(
-    prev_output: Option<NodeId>,
-    new_output: Option<NodeId>,
-    mode: MouseWarping,
-    focus_changed: bool,
-    focused_rect: Option<Rect>,
-) -> Option<(i32, i32)> {
-    let wanted = match mode {
-        MouseWarping::None => false,
-        MouseWarping::Output => prev_output != new_output,
-        MouseWarping::Container => focus_changed,
-    };
-    if wanted {
-        focused_rect.map(|r| r.center())
-    } else {
-        None
-    }
+/// `GetGUIThreadInfo` flags of a thread in a menu, popup menu, system menu or
+/// move/size loop (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE | GUI_INMOVESIZE).
+const MENU_FLAGS: u32 = 0x4 | 0x10 | 0x8 | 0x2;
+
+/// Whether the foreground thread's GUI state forbids a hover focus change: a menu
+/// mode flag, a capture window or a menu owner.
+pub fn menu_active(flags: u32, has_capture: bool, has_menu_owner: bool) -> bool {
+    flags & MENU_FLAGS != 0 || has_capture || has_menu_owner
 }
 
-/// Whether a window frozen by a native move/size loop must be thawed: no END
-/// arrived and the foreground moved to a window that is neither the frozen one nor
-/// the foreground at START, or the freeze is too old.
-pub fn freeze_expired(
+/// Where to put the pointer after a focus change, never when it is already where
+/// it belongs: `Output` when the pointer is on another output than the newly
+/// focused one, `Container` when it is outside the focused rect, `None` never.
+/// The center of the focused rect.
+pub fn warp_target(
+    mode: MouseWarping,
+    focus_changed: bool,
+    pointer: Option<(i32, i32)>,
+    pointer_output: Option<NodeId>,
+    new_output: Option<NodeId>,
+    focused_rect: Option<Rect>,
+) -> Option<(i32, i32)> {
+    let rect = focused_rect?;
+    let wanted = focus_changed
+        && match mode {
+            MouseWarping::None => false,
+            MouseWarping::Output => pointer_output != new_output,
+            MouseWarping::Container => !pointer.is_some_and(|(x, y)| {
+                x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+            }),
+        };
+    wanted.then(|| rect.center())
+}
+
+/// What to do with a native move/size loop that has not reported its END.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeVerdict {
+    Keep,
+    /// The freeze is too old: lift it, but keep the START rect so a late END still
+    /// applies the user's move/resize.
+    Thaw,
+    /// The foreground moved to a window that is neither the frozen one nor the
+    /// foreground at START: the loop is over, forget it.
+    Drop,
+}
+
+/// Judges a loop started at `started_ms`; `thawed` = already thawed by timeout.
+pub fn freeze_verdict(
     frozen: WindowId,
     started_ms: u64,
     now_ms: u64,
     start_foreground: Option<WindowId>,
     foreground: Option<WindowId>,
-) -> bool {
-    now_ms.saturating_sub(started_ms) >= FREEZE_TIMEOUT_MS
-        || foreground.is_some_and(|f| f != frozen && Some(f) != start_foreground)
+    thawed: bool,
+) -> FreezeVerdict {
+    if foreground.is_some_and(|f| f != frozen && Some(f) != start_foreground) {
+        FreezeVerdict::Drop
+    } else if !thawed && now_ms.saturating_sub(started_ms) >= FREEZE_TIMEOUT_MS {
+        FreezeVerdict::Thaw
+    } else {
+        FreezeVerdict::Keep
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +153,7 @@ mod tests {
             dragging: false,
             over_bar: false,
             over_tab_row: false,
+            menu_active: false,
             now_ms: now,
             pos: (10, 10),
         }
@@ -154,6 +192,7 @@ mod tests {
             |i: &mut HoverInput| i.over_bar = true,
             |i: &mut HoverInput| i.over_tab_row = true,
             |i: &mut HoverInput| i.dragging = true,
+            |i: &mut HoverInput| i.menu_active = true,
         ] {
             let mut s = HoverState::default();
             hover_step(&mut s, &inp(Some(2), 0));
@@ -178,70 +217,58 @@ mod tests {
         assert!(s.candidate.is_some());
     }
     #[test]
-    fn warp_rules() {
-        let r = Some(Rect::new(0, 0, 100, 50));
-        assert_eq!(
-            warp_target(
-                Some(NodeId(1)),
-                Some(NodeId(2)),
-                MouseWarping::Output,
-                true,
-                r
-            ),
-            Some((50, 25))
-        );
-        assert_eq!(
-            warp_target(
-                Some(NodeId(1)),
-                Some(NodeId(1)),
-                MouseWarping::Output,
-                true,
-                r
-            ),
-            None
-        );
-        assert_eq!(
-            warp_target(
-                Some(NodeId(1)),
-                Some(NodeId(1)),
-                MouseWarping::Container,
-                true,
-                r
-            ),
-            Some((50, 25))
-        );
-        assert_eq!(
-            warp_target(
-                Some(NodeId(1)),
-                Some(NodeId(1)),
-                MouseWarping::Container,
-                false,
-                r
-            ),
-            None
-        );
-        assert_eq!(
-            warp_target(
-                Some(NodeId(1)),
-                Some(NodeId(2)),
-                MouseWarping::None,
-                true,
-                r
-            ),
-            None
-        );
+    fn menu_state_blocks_hover() {
+        assert!(!menu_active(0, false, false));
+        assert!(!menu_active(0x1, false, false)); // GUI_CARETBLINKING only
+        for f in [0x2, 0x4, 0x8, 0x10] {
+            assert!(menu_active(f, false, false));
+        }
+        assert!(menu_active(0, true, false));
+        assert!(menu_active(0, false, true));
     }
     #[test]
-    fn freeze_expiry() {
+    fn warp_rules() {
+        use MouseWarping::{Container, Output};
+        let r = Some(Rect::new(0, 0, 100, 50));
+        let (a, b) = (Some(NodeId(1)), Some(NodeId(2)));
+        let inside = Some((10, 10));
+        let outside = Some((500, 10));
+        // Output: only when the pointer is on another output than the new focus.
+        assert_eq!(warp_target(Output, true, outside, a, b, r), Some((50, 25)));
+        assert_eq!(warp_target(Output, true, outside, b, b, r), None);
+        assert_eq!(warp_target(Output, false, outside, a, b, r), None);
+        // Container: only when the pointer is outside the focused rect.
+        assert_eq!(
+            warp_target(Container, true, outside, a, a, r),
+            Some((50, 25))
+        );
+        assert_eq!(warp_target(Container, true, inside, a, a, r), None);
+        assert_eq!(warp_target(Container, true, None, a, a, r), Some((50, 25)));
+        assert_eq!(warp_target(Container, false, outside, a, a, r), None);
+        assert_eq!(
+            warp_target(MouseWarping::None, true, outside, a, b, r),
+            None
+        );
+        assert_eq!(warp_target(Output, true, outside, a, b, None), None);
+    }
+    #[test]
+    fn freeze_verdicts() {
+        use FreezeVerdict::*;
         let w = WindowId(1);
         let o = Some(WindowId(2));
-        assert!(!freeze_expired(w, 0, 5_000, None, Some(w)));
-        assert!(!freeze_expired(w, 0, 5_000, None, None));
-        assert!(freeze_expired(w, 0, 5_000, None, o));
-        assert!(freeze_expired(w, 0, 10_000, None, Some(w)));
-        assert!(freeze_expired(w, 1_000, 11_000, None, None));
+        assert_eq!(freeze_verdict(w, 0, 5_000, None, Some(w), false), Keep);
+        assert_eq!(freeze_verdict(w, 0, 5_000, None, None, false), Keep);
+        assert_eq!(freeze_verdict(w, 0, 5_000, None, o, false), Drop);
+        assert_eq!(freeze_verdict(w, 0, 10_000, None, Some(w), false), Thaw);
+        assert_eq!(freeze_verdict(w, 1_000, 11_000, None, None, false), Thaw);
+        // Thawed once: kept (for a late END) until the foreground moves away.
+        assert_eq!(freeze_verdict(w, 0, 60_000, None, Some(w), true), Keep);
+        assert_eq!(freeze_verdict(w, 0, 60_000, None, o, true), Drop);
         // The foreground at START (the dragged window not foreground yet) is not a change.
-        assert!(!freeze_expired(w, 0, 5_000, o, o));
-        assert!(freeze_expired(w, 0, 5_000, o, Some(WindowId(3))));
+        assert_eq!(freeze_verdict(w, 0, 5_000, o, o, false), Keep);
+        assert_eq!(
+            freeze_verdict(w, 0, 5_000, o, Some(WindowId(3)), false),
+            Drop
+        );
     }
 }

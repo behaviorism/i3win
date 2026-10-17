@@ -106,8 +106,15 @@ pub enum MouseAction {
 #[derive(Default)]
 pub struct MouseMatcher {
     snapshot: Snapshot,
-    /// The button of the drag this matcher started, until that button's release.
-    dragging: Option<Button>,
+    /// The button whose press this matcher swallowed, until that button's release
+    /// (which is swallowed too, so the application never sees an unpaired button).
+    swallowed: Option<Button>,
+    /// The swallowed press's drag still runs in the App: moves and its release are
+    /// posted. False after an App-side cancel (Escape).
+    drag_live: bool,
+    /// Release of a drag whose button-up was missed, found at the next press of that
+    /// button; the hook queues it before that press's own event.
+    missed_release: Option<MouseEvent>,
 }
 
 impl MouseMatcher {
@@ -125,17 +132,26 @@ impl MouseMatcher {
         mods: Modifiers,
     ) -> (MouseAction, Option<MouseEvent>) {
         if !down {
-            if self.dragging == Some(button) {
-                self.dragging = None;
+            if self.swallowed == Some(button) {
+                self.swallowed = None;
+                let live = std::mem::take(&mut self.drag_live);
                 return (
                     MouseAction::Swallow,
-                    Some(MouseEvent::Release { button, x, y }),
+                    live.then_some(MouseEvent::Release { button, x, y }),
                 );
             }
             return (MouseAction::Pass, None);
         }
+        if self.swallowed == Some(button) {
+            // A second press of the swallowed button: its release was missed. End
+            // that drag (the App gets its Release first) and judge this press afresh.
+            self.swallowed = None;
+            if std::mem::take(&mut self.drag_live) {
+                self.missed_release = Some(MouseEvent::Release { button, x, y });
+            }
+        }
         // One drag at a time; Middle never starts one; nothing over an unmanaged foreground.
-        if self.dragging.is_some() || button == Button::Middle || !self.snapshot.foreground_managed
+        if self.swallowed.is_some() || button == Button::Middle || !self.snapshot.foreground_managed
         {
             return (MouseAction::Pass, None);
         }
@@ -148,7 +164,8 @@ impl MouseMatcher {
         }
         match self.snapshot.hits.iter().find(|h| h.contains(x, y)) {
             Some(hit) => {
-                self.dragging = Some(button);
+                self.swallowed = Some(button);
+                self.drag_live = true;
                 (
                     MouseAction::Swallow,
                     Some(MouseEvent::Press {
@@ -164,14 +181,24 @@ impl MouseMatcher {
         }
     }
 
+    /// The Release of a drag whose button-up was missed, found by the last press.
+    pub fn take_missed_release(&mut self) -> Option<MouseEvent> {
+        self.missed_release.take()
+    }
+
     /// `Some(Move)` iff a drag is in progress or the snapshot wants moves.
     pub fn on_move(&mut self, x: i32, y: i32) -> Option<MouseEvent> {
-        (self.dragging.is_some() || self.snapshot.want_moves).then_some(MouseEvent::Move { x, y })
+        (self.drag_live || self.snapshot.want_moves).then_some(MouseEvent::Move { x, y })
+    }
+
+    /// A press this matcher swallowed is still held (its release not seen yet).
+    pub fn holds_swallowed(&self) -> bool {
+        self.swallowed.is_some()
     }
 
     #[cfg(test)]
     pub fn is_dragging(&self) -> bool {
-        self.dragging.is_some()
+        self.drag_live
     }
 
     /// Updates only the foreground flag of the snapshot (Foreground events).
@@ -180,10 +207,16 @@ impl MouseMatcher {
     }
 
     /// Ends a drag whose button-up was missed (the App saw the button no longer down):
-    /// clears `dragging` and returns the Release at (x, y); `None` without a drag.
+    /// clears the drag and returns the Release at (x, y); `None` without a drag.
     pub fn force_release(&mut self, x: i32, y: i32) -> Option<MouseEvent> {
-        let button = self.dragging.take()?;
-        Some(MouseEvent::Release { button, x, y })
+        let button = self.swallowed.take()?;
+        std::mem::take(&mut self.drag_live).then_some(MouseEvent::Release { button, x, y })
+    }
+
+    /// The App cancelled the drag (Escape): stop posting its moves and release, but
+    /// keep swallowing the held button's release, the pair of the swallowed press.
+    pub fn cancel_drag(&mut self) {
+        self.drag_live = false;
     }
 }
 
@@ -281,14 +314,22 @@ unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
         } else if let Some((button, down)) = button_of(msg).filter(|_| !own) {
             // Modifiers only matter for a press.
             let mods = if down {
-                keyboard::held_mods()
+                keyboard::held_mods_resynced()
             } else {
                 Modifiers::default()
             };
-            let (action, ev) = MATCHER.with(|m| match m.try_borrow_mut() {
-                Ok(mut m) => m.on_button(button, down, x, y, mods),
-                Err(_) => (MouseAction::Pass, None),
+            let (action, ev, missed) = MATCHER.with(|m| match m.try_borrow_mut() {
+                Ok(mut m) => {
+                    let (action, ev) = m.on_button(button, down, x, y, mods);
+                    (action, ev, m.take_missed_release())
+                }
+                Err(_) => (MouseAction::Pass, None, None),
             });
+            if let Some(r) = missed {
+                if queue(r) {
+                    wake();
+                }
+            }
             if let Some(ev) = ev {
                 if queue(ev) {
                     wake();
@@ -346,6 +387,21 @@ pub fn set_drag_active(active: bool) {
 /// Whether the App has a drag in progress. Allocation-free (keyboard hook).
 pub fn is_dragging() -> bool {
     DRAG_ACTIVE.with(|d| d.get())
+}
+
+/// Main thread: the App cancelled a hook drag; see `MouseMatcher::cancel_drag`.
+pub fn cancel_drag() {
+    MATCHER.with(|m| {
+        if let Ok(mut m) = m.try_borrow_mut() {
+            m.cancel_drag();
+        }
+    });
+}
+
+/// Whether a press the hook swallowed is still held: the async button state never
+/// shows it down, so hover must ask here. Allocation-free.
+pub fn holds_swallowed_press() -> bool {
+    MATCHER.with(|m| m.try_borrow().is_ok_and(|m| m.holds_swallowed()))
 }
 
 /// Main thread (deco windows, keyboard hook): queues an event into the same path
@@ -572,6 +628,88 @@ mod tests {
         assert_eq!(q[2], ev);
         assert!(!push_bounded(&mut q, 3, None, ev));
         assert_eq!((q.len(), q.capacity()), (3, 3));
+    }
+    #[test]
+    fn stuck_alt_resynced_up_lets_press_pass() {
+        use crate::win::keyboard::KeyMatcher;
+        let mut k = KeyMatcher::new();
+        k.on_key(0xA4, true, false, 0, false);
+        // Alt's key-up went to the secure desktop: the tracked state is stale.
+        assert_eq!(k.mods(), Modifiers::ALT);
+        let mut m = MouseMatcher::default();
+        m.set_snapshot(snap());
+        let mods = k.resynced_mods(|_| false);
+        assert_eq!(mods, Modifiers::default());
+        assert!(matches!(
+            m.on_button(Button::Left, true, 150, 150, mods),
+            (MouseAction::Pass, None)
+        ));
+        // Alt really held: the async state confirms it and the press is swallowed.
+        k.on_key(0xA4, true, false, 0, false);
+        let mods = k.resynced_mods(|vk| vk == 0xA4);
+        assert!(matches!(
+            m.on_button(Button::Left, true, 150, 150, mods).0,
+            MouseAction::Swallow
+        ));
+    }
+    #[test]
+    fn missed_release_is_found_at_next_press() {
+        let mut m = MouseMatcher::default();
+        m.set_snapshot(snap());
+        m.on_button(Button::Left, true, 150, 150, Modifiers::ALT);
+        assert_eq!(m.take_missed_release(), None);
+        // The hook never saw the release; a plain press of the same button follows.
+        let (a, ev) = m.on_button(Button::Left, true, 300, 300, Modifiers::default());
+        assert!(matches!(a, MouseAction::Pass));
+        assert_eq!(ev, None);
+        assert_eq!(
+            m.take_missed_release(),
+            Some(MouseEvent::Release {
+                button: Button::Left,
+                x: 300,
+                y: 300
+            })
+        );
+        assert!(!m.is_dragging());
+        assert!(!m.holds_swallowed());
+        // That press passed, so its release passes too: the pair stays intact.
+        assert!(matches!(
+            m.on_button(Button::Left, false, 300, 300, Modifiers::default()),
+            (MouseAction::Pass, None)
+        ));
+        // A modifier press after the missed release starts a new drag at once.
+        m.on_button(Button::Right, true, 150, 150, Modifiers::ALT);
+        let (a, ev) = m.on_button(Button::Right, true, 160, 160, Modifiers::ALT);
+        assert!(matches!(a, MouseAction::Swallow));
+        assert!(matches!(ev, Some(MouseEvent::Press { .. })));
+        assert!(m.take_missed_release().is_some());
+        assert!(m.is_dragging());
+    }
+    #[test]
+    fn cancel_keeps_the_release_swallowed() {
+        let mut m = MouseMatcher::default();
+        m.set_snapshot(snap());
+        m.on_button(Button::Left, true, 150, 150, Modifiers::ALT);
+        assert!(m.holds_swallowed());
+        m.cancel_drag();
+        assert!(!m.is_dragging());
+        assert_eq!(m.on_move(160, 160), None);
+        assert!(m.holds_swallowed());
+        // The release pairs with the swallowed press: swallowed, but no Release event.
+        assert!(matches!(
+            m.on_button(Button::Left, false, 160, 160, Modifiers::default()),
+            (MouseAction::Swallow, None)
+        ));
+        assert!(!m.holds_swallowed());
+        // Missed release after a cancel: the next press is judged afresh, no Release.
+        m.on_button(Button::Left, true, 150, 150, Modifiers::ALT);
+        m.cancel_drag();
+        assert!(matches!(
+            m.on_button(Button::Left, true, 150, 150, Modifiers::default()),
+            (MouseAction::Pass, None)
+        ));
+        assert_eq!(m.take_missed_release(), None);
+        assert!(!m.holds_swallowed());
     }
     #[test]
     fn moves_posted_only_when_wanted() {

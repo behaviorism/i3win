@@ -35,11 +35,30 @@ pub enum NativeDrag {
 /// Slack (px) before a frame change counts as a resize.
 const NATIVE_SLOP_PX: i32 = 4;
 
-/// Compares DWM frame bounds at START and END. A width or height change over the
-/// slop is a resize with each edge that moved over the slop (positive = outward);
-/// anything else is a move.
-pub fn classify_native(start: Rect, end: Rect) -> NativeDrag {
-    if (end.w - start.w).abs() <= NATIVE_SLOP_PX && (end.h - start.h).abs() <= NATIVE_SLOP_PX {
+/// How close (physical px) to a frame edge, on either side, a press counts as a
+/// press on the resize border.
+const RESIZE_BORDER_PX: i32 = 8;
+
+/// Whether the cursor at a native loop's START sits on the frame's resize border
+/// (within 8 px of an edge, inside or outside the DWM frame bounds).
+pub fn start_on_border(frame: Rect, cursor: (i32, i32)) -> bool {
+    let (x, y) = cursor;
+    let b = RESIZE_BORDER_PX;
+    let in_outer =
+        x >= frame.x - b && x < frame.right() + b && y >= frame.y - b && y < frame.bottom() + b;
+    let in_inner =
+        x >= frame.x + b && x < frame.right() - b && y >= frame.y + b && y < frame.bottom() - b;
+    in_outer && !in_inner
+}
+
+/// Compares DWM frame bounds at START and END. A loop that began on the resize
+/// border (`from_border`) with a width or height change over the slop is a resize
+/// with each edge that moved over the slop (positive = outward); anything else is a
+/// move (a title-bar drag ending in Windows Snap changes the size, yet is a move).
+pub fn classify_native(start: Rect, end: Rect, from_border: bool) -> NativeDrag {
+    if !from_border
+        || (end.w - start.w).abs() <= NATIVE_SLOP_PX && (end.h - start.h).abs() <= NATIVE_SLOP_PX
+    {
         return NativeDrag::Moved;
     }
     let edges = [
@@ -318,21 +337,47 @@ mod tests {
     fn native_resize_edges_from_rects() {
         let s = Rect::new(0, 0, 500, 500);
         assert_eq!(
-            classify_native(s, Rect::new(0, 0, 503, 500)),
+            classify_native(s, Rect::new(0, 0, 503, 500), true),
             NativeDrag::Moved
         );
         assert_eq!(
-            classify_native(s, Rect::new(10, 20, 500, 500)),
+            classify_native(s, Rect::new(10, 20, 500, 500), true),
             NativeDrag::Moved
         );
         assert_eq!(
-            classify_native(s, Rect::new(0, 0, 600, 500)),
+            classify_native(s, Rect::new(0, 0, 600, 500), true),
             NativeDrag::Resized(vec![(Direction::Right, 100)])
         );
         assert_eq!(
-            classify_native(s, Rect::new(-50, 0, 550, 480)),
+            classify_native(s, Rect::new(-50, 0, 550, 480), true),
             NativeDrag::Resized(vec![(Direction::Left, 50), (Direction::Down, -20)])
         );
+    }
+    #[test]
+    fn snap_after_title_drag_is_a_move() {
+        let s = Rect::new(0, 0, 500, 500);
+        // Snapped to the left half: the size changed, but the loop began on the title bar.
+        assert_eq!(
+            classify_native(s, Rect::new(0, 0, 960, 1040), false),
+            NativeDrag::Moved
+        );
+    }
+    #[test]
+    fn border_press_detection() {
+        let f = Rect::new(100, 100, 400, 300);
+        // Outside the DWM frame, in the invisible resize border.
+        assert!(start_on_border(f, (95, 200)));
+        assert!(start_on_border(f, (503, 200)));
+        assert!(start_on_border(f, (300, 405)));
+        // Inside, near an edge (the top resize strip lies within the caption).
+        assert!(start_on_border(f, (300, 102)));
+        assert!(start_on_border(f, (497, 397)));
+        // The title bar proper and the client area.
+        assert!(!start_on_border(f, (300, 115)));
+        assert!(!start_on_border(f, (300, 250)));
+        // Far outside.
+        assert!(!start_on_border(f, (80, 200)));
+        assert!(!start_on_border(f, (300, 420)));
     }
     #[test]
     fn floating_move_and_resize() {
