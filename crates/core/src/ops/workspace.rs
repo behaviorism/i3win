@@ -307,10 +307,26 @@ impl Wm {
         if matches!(self.tree.get(target).kind, NodeKind::Workspace { .. }) {
             return Ok(());
         }
-        let Some(src) = self.tree.workspace_of(target) else {
+        if self.tree.workspace_of(target).is_none() {
+            return Ok(());
+        }
+        let Some(dest) = self.resolve_workspace(t) else {
             return Ok(());
         };
-        let Some(dest) = self.resolve_workspace(t) else {
+        self.move_to_workspace_node(target, dest)
+    }
+
+    pub fn move_to_output(&mut self, target: NodeId, t: &OutputTarget) -> Result<(), String> {
+        let o = self.resolve_output(t).ok_or("no such output")?;
+        let dest = self.visible_workspace(o);
+        self.move_to_workspace_node(target, dest)
+    }
+
+    fn move_to_workspace_node(&mut self, target: NodeId, dest: NodeId) -> Result<(), String> {
+        if matches!(self.tree.get(target).kind, NodeKind::Workspace { .. }) {
+            return Ok(());
+        }
+        let Some(src) = self.tree.workspace_of(target) else {
             return Ok(());
         };
         if dest == src {
@@ -546,6 +562,22 @@ mod tests {
     use crate::testutil::*;
     use crate::tree::{NodeKind, WindowId};
     use crate::wm::{IpcEvent, Wm};
+
+    #[test]
+    fn move_container_to_output() {
+        let mut wm = Wm::new(
+            Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        );
+        wm.manage(win(1));
+        wm.manage(win(2));
+        assert!(wm.run_command("move container to output right")[0].success);
+        let b_ws = wm.visible_workspace(wm.outputs()[1]);
+        assert_eq!(wm.tree.describe(b_ws), "H[w2]");
+        assert_eq!(wm.focused_output(), wm.outputs()[0]);
+        assert!(wm.run_command("move container to output B")[0].success);
+        assert!(!wm.run_command("move container to output nope")[0].success);
+    }
 
     #[test]
     fn switch_creates_and_removes_empty() {

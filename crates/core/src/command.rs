@@ -39,6 +39,13 @@ pub enum LayoutArg {
     Default,
     ToggleSplit,
     ToggleAll,
+    ToggleList(Vec<LayoutChoice>),
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LayoutChoice {
+    Set(Layout),
+    /// splith or splitv.
+    Split,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum BorderArg {
@@ -106,6 +113,7 @@ pub enum Command {
     /// `move position mouse|cursor|pointer`.
     MoveToPointer,
     MoveToWorkspace(WorkspaceTarget),
+    MoveToOutput(OutputTarget),
     MoveWorkspaceToOutput(OutputTarget),
     Workspace {
         target: WorkspaceTarget,
@@ -500,6 +508,10 @@ fn parse_move(args: &[Tok]) -> Result<Command, String> {
     if a(i) == Some("to") {
         i += 1;
     }
+    if a(i) == Some("output") {
+        let t = args.get(i + 1).ok_or("move to output: missing output")?;
+        return Ok(Command::MoveToOutput(output_target(t)));
+    }
     if a(i) == Some("scratchpad") && a(i + 1).is_none() {
         return Ok(Command::MoveScratchpad);
     }
@@ -682,6 +694,18 @@ fn parse_one(seg: &str) -> Result<Command, String> {
             (Some("default"), _) => Ok(Command::Layout(LayoutArg::Default)),
             (Some("toggle"), Some("split")) => Ok(Command::Layout(LayoutArg::ToggleSplit)),
             (Some("toggle"), None | Some("all")) => Ok(Command::Layout(LayoutArg::ToggleAll)),
+            (Some("toggle"), Some(_)) => {
+                let list = args[1..]
+                    .iter()
+                    .map(|(t, _)| match t.as_str() {
+                        "stacking" | "stacked" => Ok(LayoutChoice::Set(Layout::Stacked)),
+                        "tabbed" => Ok(LayoutChoice::Set(Layout::Tabbed)),
+                        "split" | "splith" | "splitv" => Ok(LayoutChoice::Split),
+                        _ => Err(format!("bad layout argument: {}", join(args))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Command::Layout(LayoutArg::ToggleList(list)))
+            }
             _ => Err(format!("bad layout argument: {}", join(args))),
         },
         "fullscreen" => Ok(Command::Fullscreen(toggle_arg(args, "fullscreen")?)),

@@ -1,4 +1,4 @@
-use crate::command::{LayoutArg, Len, SplitArg};
+use crate::command::{LayoutArg, LayoutChoice, Len, SplitArg};
 use crate::geom::{Orientation, MIN_FLOAT_SIZE};
 use crate::ops::floating::clamp_floating_rect;
 use crate::tree::{Layout, NodeId, NodeKind};
@@ -86,6 +86,27 @@ impl Wm {
                     Layout::SplitV
                 } else {
                     Layout::SplitH
+                }
+            }
+            LayoutArg::ToggleList(list) => {
+                let is_split = matches!(cur, Layout::SplitH | Layout::SplitV);
+                let pos = list.iter().position(|c| match c {
+                    LayoutChoice::Set(l) => *l == cur,
+                    LayoutChoice::Split => is_split,
+                });
+                let next = match pos {
+                    Some(i) => list[(i + 1) % list.len()],
+                    None => match list.first() {
+                        Some(c) => *c,
+                        None => return Ok(()),
+                    },
+                };
+                match next {
+                    LayoutChoice::Set(l) => l,
+                    // Staying in a split keeps its orientation; otherwise
+                    // fall back to the default horizontal split.
+                    LayoutChoice::Split if is_split => cur,
+                    LayoutChoice::Split => Layout::SplitH,
                 }
             }
             LayoutArg::ToggleAll => match cur {
@@ -291,6 +312,21 @@ mod tests {
     use crate::testutil::*;
     use crate::tree::{NodeKind, WindowId};
     use crate::wm::Wm;
+
+    #[test]
+    fn layout_toggle_list() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("layout toggle tabbed stacking split");
+        assert_eq!(ws_desc(&wm), "T[w1 w2]");
+        wm.run_command("layout toggle tabbed stacking split");
+        assert_eq!(ws_desc(&wm), "S[w1 w2]");
+        wm.run_command("layout toggle tabbed stacking split");
+        assert_eq!(ws_desc(&wm), "H[w1 w2]");
+        wm.run_command("layout toggle tabbed stacking split");
+        assert_eq!(ws_desc(&wm), "T[w1 w2]");
+    }
 
     #[test]
     fn split_wraps_when_siblings_exist() {

@@ -689,6 +689,7 @@ impl Wm {
             Command::FocusMatched => self.focus_target(target),
             Command::FocusOutput(t) => return self.focus_output(t),
             Command::MoveToWorkspace(t) => return self.move_to_workspace(target, t),
+            Command::MoveToOutput(t) => return self.move_to_output(target, t),
             Command::MoveWorkspaceToOutput(t) => return self.move_workspace_to_output(t),
             Command::Workspace {
                 target,
