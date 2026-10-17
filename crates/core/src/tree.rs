@@ -1,4 +1,4 @@
-use crate::config::GapsOverride;
+use crate::config::{Border, GapsOverride};
 use crate::geom::{Orientation, Rect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -92,6 +92,12 @@ pub struct Node {
     pub fullscreen: bool,
     /// Runtime per-workspace gaps override (Workspace nodes only).
     pub gaps: GapsOverride,
+    /// Per-window override of default_border/default_floating_border.
+    pub border: Option<Border>,
+    pub title_format: Option<String>,
+    /// Some(padding_px) when title_window_icon is on.
+    pub title_icon: Option<i32>,
+    pub marks: Vec<String>,
 }
 
 pub struct Tree {
@@ -146,6 +152,10 @@ impl Tree {
             percent: 1.0,
             fullscreen: false,
             gaps: GapsOverride::default(),
+            border: None,
+            title_format: None,
+            title_icon: None,
+            marks: Vec::new(),
         }));
         id
     }

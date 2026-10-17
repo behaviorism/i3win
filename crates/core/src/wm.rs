@@ -1,5 +1,5 @@
-use crate::command::{parse_commands, Command, WorkspaceTarget};
-use crate::config::Config;
+use crate::command::{parse_commands, BorderArg, Command, TitleIconArg, WorkspaceTarget};
+use crate::config::{Border, Config};
 use crate::geom::{sanitize_floating, Rect};
 use crate::keys::KeyCombo;
 use crate::tree::{Layout, NodeId, NodeKind, Tree, WindowData, WindowId, WindowInfo};
@@ -62,6 +62,8 @@ pub struct Wm {
     /// implicitly invalidates it.
     pub(crate) focused_container: Option<(NodeId, NodeId)>,
     pub(crate) effects: Vec<Effect>,
+    /// Computer name (for `%machine` in title_format); set by the platform.
+    pub machine: String,
 }
 
 fn workspace_num(name: &str) -> Option<i32> {
@@ -93,6 +95,7 @@ impl Wm {
             prev_workspace: None,
             focused_container: None,
             effects: Vec::new(),
+            machine: String::new(),
         };
         let outputs = if outputs.is_empty() {
             vec![OutputInfo {
@@ -588,8 +591,62 @@ impl Wm {
             } => return self.resize(target, *grow, *axis, *px, *ppt),
             Command::Fullscreen(t) => return self.set_fullscreen(target, t),
             Command::Floating(t) => return self.set_floating(target, t),
+            Command::Border(a) => self.set_border(target, a),
+            Command::TitleFormat(f) => {
+                for n in self.tree.windows_under(target) {
+                    self.tree.get_mut(n).title_format = Some(f.clone());
+                }
+            }
+            Command::TitleWindowIcon(a) => {
+                for n in self.tree.windows_under(target) {
+                    let node = self.tree.get_mut(n);
+                    node.title_icon = match a {
+                        TitleIconArg::On => Some(node.title_icon.unwrap_or(0)),
+                        TitleIconArg::Off => None,
+                        TitleIconArg::Toggle => match node.title_icon {
+                            Some(_) => None,
+                            None => Some(0),
+                        },
+                        TitleIconArg::Padding(p) => Some((*p).max(0)),
+                    };
+                }
+            }
         }
         Ok(())
+    }
+
+    fn set_border(&mut self, target: NodeId, arg: &BorderArg) {
+        for n in self.tree.windows_under(target) {
+            let default = if self.tree.is_floating(n) {
+                self.config.default_floating_border
+            } else {
+                self.config.default_border
+            };
+            let node = self.tree.get_mut(n);
+            let current = node.border.unwrap_or(default);
+            let normal = |w: Option<i32>| {
+                Border::Normal(w.unwrap_or(match current {
+                    Border::Normal(b) => b,
+                    _ => 2,
+                }))
+            };
+            let pixel = |w: Option<i32>| {
+                Border::Pixel(w.unwrap_or(match current {
+                    Border::Pixel(b) => b,
+                    _ => 1,
+                }))
+            };
+            node.border = Some(match arg {
+                BorderArg::Normal(w) => normal(*w),
+                BorderArg::Pixel(w) => pixel(*w),
+                BorderArg::None => Border::None,
+                BorderArg::Toggle(w) => match current {
+                    Border::Normal(_) => pixel(*w),
+                    Border::Pixel(_) => Border::None,
+                    Border::None => normal(*w),
+                },
+            });
+        }
     }
 
     pub fn binding_pressed(&mut self, combo: KeyCombo) -> bool {

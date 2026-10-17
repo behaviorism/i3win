@@ -166,6 +166,7 @@ impl App {
             .map(Effect::Exec)
             .collect();
         let mut wm = Wm::new(config, monitors::enumerate());
+        wm.machine = std::env::var("COMPUTERNAME").unwrap_or_default();
         // Topmost window last so it ends up with focus.
         for id in window::enumerate_top_level().into_iter().rev() {
             Self::try_manage_in(&mut wm, id);

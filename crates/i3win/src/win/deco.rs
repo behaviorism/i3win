@@ -2,17 +2,18 @@
 //!
 //! The window procedure never touches `APP`: it paints from the `DecoData`
 //! stored in `GWLP_USERDATA` and only posts `MainMsg::FocusNode` on clicks.
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use i3win_core::arrange::{Arrangement, Deco, Tab};
 use i3win_core::config::{ClientColors, Config, Font};
 use i3win_core::geom::Rect;
-use i3win_core::tree::NodeId;
+use i3win_core::tree::{NodeId, WindowId};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::Graphics::Gdi::{InvalidateRect, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -218,6 +219,50 @@ impl Decos {
     }
 }
 
+thread_local! {
+    /// WM_GETICON(ICON_SMALL2) results by window, filled by `icon_callback`.
+    static ICON_CACHE: RefCell<HashMap<isize, isize>> = RefCell::new(HashMap::new());
+    /// Windows we already asked for an ICON_SMALL2.
+    static ICON_REQUESTED: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
+}
+
+unsafe extern "system" fn icon_callback(hwnd: HWND, _msg: u32, deco: usize, result: LRESULT) {
+    if result.0 != 0 {
+        ICON_CACHE.with(|c| c.borrow_mut().insert(hwnd.0 as isize, result.0));
+        let _ = InvalidateRect(HWND(deco as *mut _), None, false);
+    }
+}
+
+/// The small icon of `id`: the cached ICON_SMALL2, else the class's small or big icon.
+/// Requests ICON_SMALL2 asynchronously once per window.
+fn window_icon(id: WindowId, deco: HWND) -> Option<HICON> {
+    let hwnd = HWND(id.0 as *mut _);
+    if let Some(h) = ICON_CACHE.with(|c| c.borrow().get(&id.0).copied()) {
+        return Some(HICON(h as *mut _));
+    }
+    if ICON_REQUESTED.with(|r| r.borrow_mut().insert(id.0)) {
+        // SAFETY: the callback only touches thread-locals and invalidates our deco window.
+        unsafe {
+            let _ = SendMessageCallbackW(
+                hwnd,
+                WM_GETICON,
+                WPARAM(2), // ICON_SMALL2
+                LPARAM(0),
+                Some(icon_callback),
+                deco.0 as usize,
+            );
+        }
+    }
+    // SAFETY: plain class-long reads on a foreign window; failure yields 0.
+    let raw = unsafe {
+        match GetClassLongPtrW(hwnd, GCLP_HICONSM) {
+            0 => GetClassLongPtrW(hwnd, GCLP_HICON),
+            v => v,
+        }
+    };
+    (raw != 0).then_some(HICON(raw as *mut _))
+}
+
 fn paint(hwnd: HWND, data: &DecoData) {
     let font = gdi::font(&data.font.family, data.font.size_pt, data.scale);
     let inset = (4.0 * data.scale).round() as i32;
@@ -226,15 +271,42 @@ fn paint(hwnd: HWND, data: &DecoData) {
             title_rect,
             title,
             state,
+            icon,
             ..
         } => {
             let cc = gdi::colors_for(*state, &data.colors);
+            // The border lines are whatever the client window does not cover:
+            // each side is as wide as `borders` says, hidden sides are covered
+            // by the client itself.
             gdi::fill(hdc, client, cc.child_border);
             if let Some(t) = title_rect {
                 let area = Rect::new(0, 0, client.w, t.h);
                 gdi::fill(hdc, area, cc.background);
                 gdi::outline(hdc, area, cc.border);
-                let text = area.inset(inset, 0, inset, 0);
+                let mut text = area.inset(inset, 0, inset, 0);
+                if let Some((id, padding)) = icon {
+                    let size = (t.h - 4).max(0);
+                    if let Some(h) = window_icon(*id, hwnd).filter(|_| size > 0) {
+                        let y = (t.h - size) / 2;
+                        // SAFETY: drawing a live icon handle into our paint DC.
+                        unsafe {
+                            let _ = DrawIconEx(
+                                hdc,
+                                text.x,
+                                y,
+                                h,
+                                size,
+                                size,
+                                0,
+                                HBRUSH::default(),
+                                DI_NORMAL,
+                            );
+                        }
+                        let pad = (*padding as f32 * data.scale).round() as i32;
+                        let used = size + pad;
+                        text = text.inset(used, 0, 0, 0);
+                    }
+                }
                 gdi::draw_text(hdc, text, title, cc.text, font);
             }
         }

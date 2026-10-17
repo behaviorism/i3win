@@ -35,6 +35,20 @@ pub enum LayoutArg {
     ToggleAll,
 }
 #[derive(Clone, Debug, PartialEq)]
+pub enum BorderArg {
+    Normal(Option<i32>),
+    Pixel(Option<i32>),
+    None,
+    Toggle(Option<i32>),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum TitleIconArg {
+    On,
+    Off,
+    Toggle,
+    Padding(i32),
+}
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Exec(String),
     Focus(Direction),
@@ -62,6 +76,9 @@ pub enum Command {
         px: Option<i32>,
         ppt: Option<i32>,
     },
+    Border(BorderArg),
+    TitleFormat(String),
+    TitleWindowIcon(TitleIconArg),
     Mode(String),
     Reload,
     Restart,
@@ -401,6 +418,43 @@ fn parse_one(seg: &str) -> Result<Command, String> {
         "fullscreen" => Ok(Command::Fullscreen(toggle_arg(args, "fullscreen")?)),
         "floating" => Ok(Command::Floating(toggle_arg(args, "floating")?)),
         "kill" => Ok(Command::Kill),
+        "border" => {
+            let n = match a(1) {
+                Some(v) => Some(parse_int(v.strip_suffix("px").unwrap_or(v))?),
+                None => None,
+            };
+            match a(0) {
+                Some("normal") => Ok(Command::Border(BorderArg::Normal(n))),
+                Some("pixel") => Ok(Command::Border(BorderArg::Pixel(n))),
+                Some("none") => Ok(Command::Border(BorderArg::None)),
+                Some("toggle") => Ok(Command::Border(BorderArg::Toggle(n))),
+                o => Err(format!("bad border argument: {}", o.unwrap_or(""))),
+            }
+        }
+        "title_format" => {
+            if args.is_empty() {
+                return Err("title_format: missing format".into());
+            }
+            Ok(Command::TitleFormat(join(args)))
+        }
+        "title_window_icon" => match a(0) {
+            Some("on" | "yes" | "enable" | "true") => {
+                Ok(Command::TitleWindowIcon(TitleIconArg::On))
+            }
+            Some("off" | "no" | "disable" | "false") => {
+                Ok(Command::TitleWindowIcon(TitleIconArg::Off))
+            }
+            Some("toggle") => Ok(Command::TitleWindowIcon(TitleIconArg::Toggle)),
+            Some("padding") => {
+                let v = a(1).ok_or("title_window_icon padding: missing value")?;
+                let n = parse_int(v.strip_suffix("px").unwrap_or(v))?;
+                Ok(Command::TitleWindowIcon(TitleIconArg::Padding(n)))
+            }
+            o => Err(format!(
+                "bad title_window_icon argument: {}",
+                o.unwrap_or("")
+            )),
+        },
         "resize" => parse_resize(args),
         "mode" => match args.first() {
             Some(t) if t.0.is_empty() => Err("mode: missing name".into()),

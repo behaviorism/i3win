@@ -1,5 +1,8 @@
-use crate::config::{BarPosition, Border, Config, Font, Gaps};
+use crate::config::{
+    BarPosition, Border, Config, Font, Gaps, HideEdgeBorders, SmartBorders, SmartGaps,
+};
 use crate::geom::Rect;
+use crate::title::format_title;
 use crate::tree::{Layout, NodeId, NodeKind, Tree, WindowId};
 use crate::wm::Wm;
 
@@ -25,11 +28,14 @@ pub enum Deco {
         key: NodeId,
         rect: Rect,
         title_rect: Option<Rect>,
-        border: i32,
+        /// left, top, right, bottom. With a normal (title) border top is 0 and the title bar sits there.
+        borders: [i32; 4],
         title: String,
         state: DecoState,
         floating: bool,
         above: WindowId,
+        /// Window whose icon to draw, and the padding in px.
+        icon: Option<(WindowId, i32)>,
     },
     TabBar {
         key: NodeId,
@@ -82,12 +88,24 @@ pub fn bar_height(config: &Config, scale: f32) -> Option<i32> {
     })
 }
 
+/// Which border lines the current workspace hides on tiled windows.
+#[derive(Clone, Copy, Default)]
+struct EdgeRules {
+    vertical: bool,
+    horizontal: bool,
+    all: bool,
+}
+
 struct Ctx<'a> {
     tree: &'a Tree,
+    config: &'a Config,
+    machine: &'a str,
     focused: NodeId,
     th: i32,
     g: i32,
-    border: Border,
+    /// Tiling area at frame level (after bar, outer gaps and half inner gap).
+    area: Rect,
+    edges: EdgeRules,
     out: Arrangement,
 }
 
@@ -114,6 +132,22 @@ impl Ctx<'_> {
         }
     }
 
+    fn window_title(&self, node: NodeId) -> String {
+        let n = self.tree.get(node);
+        match &n.kind {
+            NodeKind::Window(d) => format_title(
+                n.title_format.as_deref(),
+                &d.info.title,
+                &d.info.class,
+                &d.info.instance,
+                self.machine,
+                &n.marks,
+                self.config.show_marks,
+            ),
+            _ => String::new(),
+        }
+    }
+
     fn hide_under(&mut self, c: NodeId) {
         for w in self.tree.windows_under(c) {
             if let Some(id) = self.tree.window_id(w) {
@@ -130,7 +164,7 @@ impl Ctx<'_> {
             NodeKind::Window(_) => {
                 let g = self.g;
                 let frame = rect.inset(g / 2, g / 2, g - g / 2, g - g / 2);
-                let border = self.border;
+                let border = n.border.unwrap_or(self.config.default_border);
                 self.emit_window(node, frame, border, in_tabs, false);
             }
             NodeKind::Workspace { .. } | NodeKind::Container => {
@@ -182,7 +216,11 @@ impl Ctx<'_> {
                                 Rect::new(rect.x.saturating_add(before), rect.y, tw, th)
                             };
                             tabs.push(Tab {
-                                title: tree.describe(c),
+                                title: if matches!(tree.get(c).kind, NodeKind::Window(_)) {
+                                    self.window_title(c)
+                                } else {
+                                    tree.describe(c)
+                                },
                                 state: self.state(c),
                                 rect: r,
                                 node: c,
@@ -222,43 +260,54 @@ impl Ctx<'_> {
             return;
         };
         let th = self.th;
-        let (client, title_rect, b) = match border {
-            Border::Normal(b) => {
-                let b = px(b);
-                if in_tabs {
-                    (frame.inset(b, 0, b, b), None, b)
-                } else {
-                    let title = Rect::new(frame.x, frame.y, frame.w, th);
-                    (frame.inset(b, th, b, b), Some(title), b)
-                }
-            }
-            Border::Pixel(b) => {
-                let b = px(b);
-                (frame.inset(b, b, b, b), None, b)
-            }
-            Border::None => (frame, None, 0),
+        let width = match border {
+            Border::Normal(b) | Border::Pixel(b) => px(b),
+            Border::None => 0,
         };
+        let titled = matches!(border, Border::Normal(_)) && !in_tabs;
+        // The title bar (or the tab header above) takes the top: no top line.
+        let mut sides = [width, width, width, width];
+        if matches!(border, Border::Normal(_)) {
+            sides[1] = 0;
+        }
+        if !floating {
+            let e = self.edges;
+            let a = self.area;
+            if e.all || (e.vertical && frame.x == a.x) {
+                sides[0] = 0;
+            }
+            if e.all || (e.vertical && frame.right() == a.right()) {
+                sides[2] = 0;
+            }
+            if e.all || (e.horizontal && frame.y == a.y) {
+                sides[1] = 0;
+            }
+            if e.all || (e.horizontal && frame.bottom() == a.bottom()) {
+                sides[3] = 0;
+            }
+        }
+        let top = if titled { th } else { sides[1] };
+        let client = frame.inset(sides[0], top, sides[2], sides[3]);
+        let title_rect = titled.then(|| Rect::new(frame.x, frame.y, frame.w, th));
         self.out.windows.push(WindowPlacement {
             id,
             rect: client,
             floating,
             fullscreen: false,
         });
-        if border != Border::None {
-            let title = match &self.tree.get(node).kind {
-                NodeKind::Window(d) => d.info.title.clone(),
-                _ => String::new(),
-            };
+        if border != Border::None && (titled || sides.iter().any(|&s| s > 0)) {
+            let title = self.window_title(node);
             let state = self.state(node);
             self.out.decos.push(Deco::Frame {
                 key: node,
                 rect: frame,
                 title_rect,
-                border: b,
+                borders: sides,
                 title,
                 state,
                 floating,
                 above: id,
+                icon: self.tree.get(node).title_icon.map(|p| (id, p)),
             });
         }
     }
@@ -276,13 +325,29 @@ pub fn effective_gaps(tree: &Tree, config: &Config, ws: NodeId) -> Gaps {
     gaps.with(&node.gaps)
 }
 
-pub fn arrange(tree: &Tree, config: &Config, focused: NodeId) -> Arrangement {
+/// Number of tiled windows shown in `id`'s subtree (only the active tab counts).
+fn visible_tiled(tree: &Tree, id: NodeId) -> usize {
+    let n = tree.get(id);
+    if matches!(n.kind, NodeKind::Window(_)) {
+        return 1;
+    }
+    if matches!(n.layout, Layout::Tabbed | Layout::Stacked) {
+        let active = n.focus.iter().copied().find(|c| n.children.contains(c));
+        return active.map_or(0, |a| visible_tiled(tree, a));
+    }
+    n.children.iter().map(|&c| visible_tiled(tree, c)).sum()
+}
+
+pub fn arrange(tree: &Tree, config: &Config, focused: NodeId, machine: &str) -> Arrangement {
     let mut ctx = Ctx {
         tree,
+        config,
+        machine,
         focused,
         th: 0,
         g: px(config.gaps.inner),
-        border: config.default_border,
+        area: Rect::default(),
+        edges: EdgeRules::default(),
         out: Arrangement::default(),
     };
     for &o in &tree.get(tree.root()).children {
@@ -312,6 +377,40 @@ fn arrange_workspace(
 ) {
     let tree = ctx.tree;
     ctx.th = title_height(&config.font, scale);
+
+    let single = visible_tiled(tree, ws) == 1;
+    let mut gaps = effective_gaps(tree, config, ws);
+    match config.smart_gaps {
+        SmartGaps::On if single => gaps = Gaps::default(),
+        SmartGaps::InverseOuter if !single => {
+            gaps = Gaps {
+                top: 0,
+                right: 0,
+                bottom: 0,
+                left: 0,
+                ..gaps
+            }
+        }
+        _ => {}
+    }
+    let g = px(gaps.inner);
+    ctx.g = g;
+    let smart_all = |mode: HideEdgeBorders| match mode {
+        HideEdgeBorders::Smart => single,
+        HideEdgeBorders::SmartNoGaps => single && g == 0,
+        _ => false,
+    };
+    let smart_cfg = match config.smart_borders {
+        SmartBorders::Off => HideEdgeBorders::None,
+        SmartBorders::On => HideEdgeBorders::Smart,
+        SmartBorders::NoGaps => HideEdgeBorders::SmartNoGaps,
+    };
+    let he = config.hide_edge_borders;
+    ctx.edges = EdgeRules {
+        vertical: matches!(he, HideEdgeBorders::Vertical | HideEdgeBorders::Both),
+        horizontal: matches!(he, HideEdgeBorders::Horizontal | HideEdgeBorders::Both),
+        all: smart_all(he) || smart_all(smart_cfg),
+    };
 
     // Fullscreen: one window covers the whole output, everything else hides.
     let all = tree.windows_under(ws);
@@ -345,9 +444,6 @@ fn arrange_workspace(
             area.inset(0, 0, 0, bh)
         };
     }
-    let gaps = effective_gaps(tree, config, ws);
-    let g = px(gaps.inner);
-    ctx.g = g;
     let lead = |outer: i32| px(outer) + g - g / 2;
     let trail = |outer: i32| px(outer) + g / 2;
     let inset = area.inset(
@@ -356,6 +452,7 @@ fn arrange_workspace(
         trail(gaps.right),
         trail(gaps.bottom),
     );
+    ctx.area = inset.inset(g / 2, g / 2, g - g / 2, g - g / 2);
     ctx.place(ws, inset, false);
 
     place_floating(ctx, config, ws, None);
@@ -372,7 +469,8 @@ fn place_floating(ctx: &mut Ctx, config: &Config, ws: NodeId, skip: Option<NodeI
             continue;
         };
         let frame = d.floating_rect.unwrap_or(d.info.rect);
-        ctx.emit_window(f, frame, config.default_floating_border, false, true);
+        let border = tree.get(f).border.unwrap_or(config.default_floating_border);
+        ctx.emit_window(f, frame, border, false, true);
     }
 }
 
@@ -406,14 +504,14 @@ impl Wm {
     }
 
     pub fn arrange(&self) -> Arrangement {
-        arrange(&self.tree, &self.config, self.focused())
+        arrange(&self.tree, &self.config, self.focused(), &self.machine)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BarConfig, Border, Font};
+    use crate::config::{parse_config, BarConfig, Border, Font};
     use crate::testutil::{out, test_wm, win};
 
     fn placement(a: &Arrangement, w: isize) -> Rect {
@@ -440,11 +538,12 @@ mod tests {
             key: wm.tree.window_node(WindowId(1)).unwrap(),
             rect: Rect::new(0, 0, 500, 500),
             title_rect: Some(Rect::new(0, 0, 500, 20)),
-            border: 2,
+            borders: [2, 0, 2, 2],
             title: "w1".into(),
             state: DecoState::Unfocused,
             floating: false,
-            above: WindowId(1)
+            above: WindowId(1),
+            icon: None,
         }));
     }
     #[test]
@@ -648,5 +747,129 @@ mod tests {
         assert!(a.hidden.contains(&WindowId(2)));
         assert!(!a.hidden.contains(&WindowId(3)));
         assert!(a.windows[pos(3).unwrap()].floating);
+    }
+    #[test]
+    fn border_command_and_toggle() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("border pixel 3");
+        let Deco::Frame {
+            borders,
+            title_rect,
+            ..
+        } = &wm.arrange().decos[0]
+        else {
+            panic!()
+        };
+        assert_eq!(*borders, [3, 3, 3, 3]);
+        assert!(title_rect.is_none());
+        wm.run_command("border toggle");
+        assert!(wm.arrange().decos.is_empty()); // pixel -> none
+        wm.run_command("border toggle");
+        assert!(matches!(
+            &wm.arrange().decos[0],
+            Deco::Frame {
+                title_rect: Some(_),
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn title_format_applies_to_frame_title() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("title_format \"<%class> %title\"");
+        let Deco::Frame { title, .. } = &wm.arrange().decos[0] else {
+            panic!()
+        };
+        assert_eq!(title, "<c1> w1");
+    }
+    #[test]
+    fn title_format_applies_to_tab_titles() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("layout tabbed");
+        wm.run_command("title_format \"%instance\"");
+        let a = wm.arrange();
+        let tabs = a
+            .decos
+            .iter()
+            .find_map(|d| match d {
+                Deco::TabBar { tabs, .. } => Some(tabs),
+                _ => None,
+            })
+            .unwrap();
+        assert!(tabs.iter().any(|t| t.title == "i2"));
+        assert!(tabs.iter().any(|t| t.title == "w1"));
+    }
+    #[test]
+    fn hidden_edge_borders_shift_client_rect_exactly() {
+        let mut cfg = parse_config(
+            "hide_edge_borders both
+default_border pixel 2
+",
+        );
+        cfg.bar = None;
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let a = wm.arrange();
+        let w1 = a.windows.iter().find(|p| p.id == WindowId(1)).unwrap().rect;
+        let w2 = a.windows.iter().find(|p| p.id == WindowId(2)).unwrap().rect;
+        assert_eq!((w1.x, w1.y, w1.h), (0, 0, 500)); // outer sides hidden
+        assert_eq!(w1.right() + 2 + 2, w2.x); // inner sides keep 2 px each
+        assert_eq!(w2.right(), 1000);
+    }
+    #[test]
+    fn smart_borders_only_with_single_window() {
+        let mut cfg = parse_config(
+            "smart_borders on
+",
+        );
+        cfg.bar = None;
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        let Deco::Frame { borders, .. } = &wm.arrange().decos[0] else {
+            panic!()
+        };
+        assert_eq!(*borders, [0, 0, 0, 0]);
+        wm.manage(win(2));
+        let Deco::Frame {
+            borders,
+            title_rect,
+            ..
+        } = &wm.arrange().decos[0]
+        else {
+            panic!()
+        };
+        assert_eq!(*borders, [2, 0, 2, 2]);
+        assert!(title_rect.is_some());
+    }
+    #[test]
+    fn smart_gaps_single_window_has_no_gaps() {
+        let mut cfg = parse_config(
+            "gaps inner 10
+gaps outer 5
+smart_gaps on
+default_border none
+",
+        );
+        cfg.bar = None;
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        assert_eq!(wm.arrange().windows[0].rect, Rect::new(0, 0, 1000, 500));
+        wm.manage(win(2));
+        assert_ne!(wm.arrange().windows[0].rect.x, 0);
+    }
+    #[test]
+    fn title_window_icon_sets_deco_icon() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("title_window_icon padding 4px");
+        let Deco::Frame { icon, .. } = &wm.arrange().decos[0] else {
+            panic!()
+        };
+        assert_eq!(*icon, Some((WindowId(1), 4)));
     }
 }
