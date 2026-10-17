@@ -159,6 +159,10 @@ impl Wm {
         })
     }
 
+    pub fn has_effects(&self) -> bool {
+        !self.effects.is_empty()
+    }
+
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
     }

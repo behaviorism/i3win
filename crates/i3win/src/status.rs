@@ -229,9 +229,6 @@ mod tests {
     use super::*;
     use crate::mainloop::{drain_main_msgs, MainMsg};
 
-    /// Tests share the global message queue; run them one at a time.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn exit_block_text() {
         let b = exit_block();
@@ -242,7 +239,9 @@ mod tests {
 
     #[test]
     fn spawn_and_read_plain_output() {
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::mainloop::QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut p = StatusProcess::spawn("echo hello").unwrap();
         let gen = p.generation();
         let t = std::time::Instant::now();
@@ -265,7 +264,9 @@ mod tests {
 
     #[test]
     fn kill_terminates_grandchild_holding_the_pipe() {
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::mainloop::QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut p = StatusProcess::spawn("ping -n 30 127.0.0.1").unwrap();
         let gen = p.generation();
         let wait_for = |pred: &dyn Fn(&MainMsg) -> bool| {

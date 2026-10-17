@@ -3,6 +3,7 @@
 use i3win_core::ipc::{decode_header, encode, EVENT_BIT, HEADER_LEN};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read, Write};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq)]
 pub struct Args {
@@ -59,6 +60,44 @@ pub fn any_failed(reply: &str) -> bool {
     }
 }
 
+/// True if a failed open should be retried: the pipe is busy (231) or not yet
+/// created (2).
+fn should_retry(raw: Option<i32>) -> bool {
+    matches!(raw, Some(231) | Some(2))
+}
+
+/// Opens the pipe, retrying every 50 ms for up to 1 s on busy/not-found.
+fn open_pipe(name: &str) -> std::io::Result<std::fs::File> {
+    let end = Instant::now() + Duration::from_secs(1);
+    loop {
+        match OpenOptions::new().read(true).write(true).open(name) {
+            Ok(f) => return Ok(f),
+            Err(e) if should_retry(e.raw_os_error()) && Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// True if a SUBSCRIBE reply is an object with `"success": false`.
+fn subscribe_failed(reply: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(reply),
+        Ok(v) if v.get("success") == Some(&serde_json::Value::Bool(false))
+    )
+}
+
+/// Writes one line to stdout; a closed pipe ends the process quietly.
+fn out_line(line: &str) {
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = writeln!(out, "{line}") {
+        if e.kind() == ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+    }
+}
+
 /// Reads one frame; Ok(None) on clean EOF before a header.
 fn read_message(r: &mut impl Read) -> Result<Option<(u32, String)>, String> {
     let mut header = [0u8; HEADER_LEN];
@@ -80,29 +119,34 @@ fn run(args: Args) -> Result<i32, String> {
         .clone()
         .or_else(|| std::env::var("I3SOCK").ok())
         .unwrap_or_else(|| r"\\.\pipe\i3win-ipc".to_string());
-    let mut pipe = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&name)
-        .map_err(|e| format!("cannot connect to {name}: {e}"))?;
+    let mut pipe = open_pipe(&name).map_err(|e| format!("cannot connect to {name}: {e}"))?;
     pipe.write_all(&encode(args.msg_type, &args.payload))
         .map_err(|e| format!("write failed: {e}"))?;
     let (_, reply) = read_message(&mut pipe)?.ok_or("connection closed before reply")?;
     if !args.quiet {
-        println!("{reply}");
+        out_line(&reply);
+    }
+    let subscribing = args.msg_type == i3win_core::ipc::SUBSCRIBE;
+    if subscribing && subscribe_failed(&reply) {
+        if args.quiet {
+            out_line(&reply);
+        }
+        return Ok(2);
     }
     if args.monitor {
         while let Some((ty, payload)) = read_message(&mut pipe)? {
             if ty & EVENT_BIT != 0 {
-                println!("{payload}");
+                out_line(&payload);
             }
         }
     }
-    Ok(if args.msg_type == 0 && any_failed(&reply) {
-        2
-    } else {
-        0
-    })
+    Ok(
+        if args.msg_type == i3win_core::ipc::RUN_COMMAND && any_failed(&reply) {
+            2
+        } else {
+            0
+        },
+    )
 }
 
 fn main() {
@@ -134,7 +178,7 @@ mod tests {
         assert_eq!(
             parse_args(&a(&["workspace", "2"])).unwrap(),
             Args {
-                msg_type: 0,
+                msg_type: i3win_core::ipc::RUN_COMMAND,
                 socket: None,
                 quiet: false,
                 monitor: false,
@@ -145,7 +189,7 @@ mod tests {
     #[test]
     fn type_and_socket() {
         let p = parse_args(&a(&["-t", "get_tree", "-s", r"\.\pipe\x"])).unwrap();
-        assert_eq!(p.msg_type, 4);
+        assert_eq!(p.msg_type, i3win_core::ipc::GET_TREE);
         assert_eq!(p.socket.as_deref(), Some(r"\.\pipe\x"));
     }
     #[test]
@@ -156,6 +200,19 @@ mod tests {
                 .unwrap()
                 .monitor
         );
+    }
+    #[test]
+    fn retry_decision() {
+        assert!(should_retry(Some(231)));
+        assert!(should_retry(Some(2)));
+        assert!(!should_retry(Some(5)));
+        assert!(!should_retry(None));
+    }
+    #[test]
+    fn subscribe_failure_detection() {
+        assert!(subscribe_failed(r#"{"success":false,"error":"x"}"#));
+        assert!(!subscribe_failed(r#"{"success":true}"#));
+        assert!(!subscribe_failed("garbage"));
     }
     #[test]
     fn bad_type() {

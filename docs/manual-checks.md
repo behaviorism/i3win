@@ -38,3 +38,20 @@ Build with `cargo build --workspace` (builds i3win-status.exe too).
 15. `status_command cmd /c dir /s C:\` -> Alt+2/Alt+1 still react instantly, typing elsewhere doesn't lag, newly opened windows still tile.
 16. Touchpad two-finger scroll over the bar -> one workspace per gesture step, not a run through all of them.
 17. `exec "C:\Program Files\Windows NT\Accessories\wordpad.exe"` bound to a key launches WordPad (quoted path survives).
+
+## Plan 4: IPC and i3win-msg
+
+Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 escape inner quotes in JSON args: '[\"window\"]'.
+
+1. With i3win running: `target\debug\i3win-msg.exe workspace 4` prints `[{"success":true}]` and switches; `i3win-msg frob` prints a failure and `$LASTEXITCODE` is 2.
+2. `i3win-msg -t get_workspaces`, `-t get_outputs`, `-t get_tree`, `-t get_version`, `-t get_binding_modes`, `-t get_config`, `-t get_bar_config`, `-t get_bar_config bar-0`, `-t get_marks` each print valid JSON (pipe to `ConvertFrom-Json` without error).
+3. Second console: `i3win-msg -t subscribe -m '[\"window\",\"workspace\"]'`. Opening Notepad prints window "new" then "focus"; Alt+2 prints workspace "init"/"focus"; closing Notepad prints "close" with container.window set.
+4. With the subscriber running, `i3win-msg -t send_tick hello` -> the monitor prints `{"first":false,"payload":"hello"}`; a fresh `-t subscribe -m '[\"tick\"]'` first prints `{"first":true,"payload":""}`.
+5. Monitor subscribed to shutdown running, Alt+Shift+e -> it prints `{"change":"exit"}` then ends; every window is visible again.
+6. Garbage: `$p=New-Object IO.Pipes.NamedPipeClientStream('.','i3win-ipc','InOut'); $p.Connect(2000); $p.Write([byte[]](1..14),0,14); $p.Dispose()` -> log shows a bad-header line; `i3win-msg -t get_version` still answers. Repeat with a header claiming 0xFFFFFFFF bytes -> rejected, server still answers.
+7. Send only "i3-ipc" then dispose -> server still answers.
+8. `i3win-msg 'workspace "3: ünï \"q\" x"'` then `-t get_workspaces` shows the name unchanged; the bar shows the same name.
+9. Bind `exec cmd /k echo %I3SOCK%` -> the console shows \.\pipe\i3win-ipc. Start i3win with `--ipc-pipe \.\pipe\mine`: plain `i3win-msg -t get_version` fails, the exec'd console's works (I3SOCK), and `i3win-msg -s \.\pipe\mine -t get_version` works.
+10. Polling: run `while(1){i3win-msg -t get_tree > $null; sleep -m 200}` for 30 s -> no title-bar flicker, no lag.
+11. Stalled subscriber: start a monitor, enter QuickEdit selection in its console for 60 s while switching workspaces -> WM stays responsive.
+12. IPC smoke test (empty desktop, no i3win running): `cargo test -p i3win --test smoke -- --ignored --test-threads=1`.

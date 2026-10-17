@@ -340,7 +340,7 @@ impl App {
                 msg_type,
                 payload,
                 reply,
-            } => self.on_ipc(msg_type, &payload, &reply),
+            } => return self.on_ipc(msg_type, &payload, &reply),
             MainMsg::RunCommand(c) => {
                 self.wm.run_command(&c);
             }
@@ -360,7 +360,13 @@ impl App {
         true
     }
 
-    fn on_ipc(&mut self, msg_type: u32, payload: &str, reply: &std::sync::mpsc::Sender<String>) {
+    /// Returns true when a full flush is needed.
+    fn on_ipc(
+        &mut self,
+        msg_type: u32,
+        payload: &str,
+        reply: &std::sync::mpsc::Sender<String>,
+    ) -> bool {
         let path = self.config_path.display().to_string();
         let ctx = IpcContext {
             config_path: &path,
@@ -379,6 +385,7 @@ impl App {
                 let _ = reply.send(r#"{"success":false,"error":"unexpected subscribe"}"#.into());
             }
         }
+        ipc_needs_flush(msg_type, self.wm.has_effects() || !self.pending.is_empty())
     }
 
     /// Ends a batch of main messages: one full flush if requested (it redraws the
@@ -532,8 +539,23 @@ impl App {
     }
 }
 
+/// Only commands (or leftover effects) need a full flush; queries must not
+/// re-stack windows.
+fn ipc_needs_flush(msg_type: u32, has_effects: bool) -> bool {
+    msg_type == i3win_core::ipc::RUN_COMMAND || has_effects
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ipc_flush_decision() {
+        use super::ipc_needs_flush;
+        assert!(ipc_needs_flush(i3win_core::ipc::RUN_COMMAND, false));
+        assert!(ipc_needs_flush(i3win_core::ipc::GET_TREE, true));
+        assert!(!ipc_needs_flush(i3win_core::ipc::GET_TREE, false));
+        assert!(!ipc_needs_flush(i3win_core::ipc::SEND_TICK, false));
+    }
+
     use super::*;
     #[test]
     fn hidden_expected_is_ignored() {

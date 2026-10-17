@@ -123,8 +123,15 @@ fn run(children: &mut Vec<Child>) {
 fn two_notepads_tile_side_by_side() {
     let mut children = Vec::new();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut children)));
+    // Give a graceful `exit` up to 2 s, then kill whatever is still running.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     for c in children.iter_mut() {
-        let _ = c.kill();
+        while matches!(c.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if matches!(c.try_wait(), Ok(None)) {
+            let _ = c.kill();
+        }
     }
     if let Err(e) = result {
         std::panic::resume_unwind(e);
@@ -199,9 +206,18 @@ fn ipc_run(children: &mut Vec<Child>) {
         serde_json::json!({"success": true})
     );
     request(&mut a, RUN_COMMAND, "workspace 6");
-    let (ty, ev) = read_frame(&mut b);
-    assert_eq!(ty, 0x8000_0000);
-    assert_eq!(ev["change"], "focus");
+    let mut found = false;
+    for _ in 0..5 {
+        let (ty, ev) = read_frame(&mut b);
+        if ty == 0x8000_0000 && ev["change"] == "focus" {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "no workspace focus event after `workspace 6`");
+
+    // Ask the WM to exit so every window it hid is shown again.
+    let _ = request(&mut a, RUN_COMMAND, "exit");
 }
 
 #[test]

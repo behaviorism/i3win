@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,7 +27,10 @@ use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
 use crate::mainloop::{self, MainMsg};
 
-type Subscriber = (u64, HashSet<String>, Sender<Vec<u8>>);
+type Subscriber = (u64, HashSet<String>, SyncSender<Vec<u8>>);
+
+/// Frames queued per connection before a slow client is dropped.
+const WRITE_QUEUE: usize = 256;
 
 static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
@@ -39,13 +42,19 @@ fn lock_subs() -> std::sync::MutexGuard<'static, Vec<Subscriber>> {
 }
 
 /// Sends `frame` to every subscriber whose set contains `event_name`; subscribers
-/// whose channel is closed are removed. Never blocks (unbounded channels).
+/// whose queue is full or closed are removed. Never blocks.
 fn send_to_matching(subs: &mut Vec<Subscriber>, event_name: &str, frame: &[u8]) {
-    subs.retain(|(_, set, tx)| !set.contains(event_name) || tx.send(frame.to_vec()).is_ok());
+    subs.retain(|(_, set, tx)| {
+        !set.contains(event_name)
+            || match tx.try_send(frame.to_vec()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            }
+    });
 }
 
 /// Adds a subscription; a repeated SUBSCRIBE on one connection merges its event set.
-fn register(subs: &mut Vec<Subscriber>, conn: u64, set: HashSet<String>, tx: &Sender<Vec<u8>>) {
+fn register(subs: &mut Vec<Subscriber>, conn: u64, set: HashSet<String>, tx: &SyncSender<Vec<u8>>) {
     match subs.iter_mut().find(|(id, _, _)| *id == conn) {
         Some((_, existing, _)) => existing.extend(set),
         None => subs.push((conn, set, tx.clone())),
@@ -255,7 +264,7 @@ fn accept_loop(pipe_name: &str) {
 
 fn spawn_connection(pipe: Arc<PipeHandle>) {
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
     let wpipe = Arc::clone(&pipe);
     let w = std::thread::Builder::new()
         .name(format!("ipc-w{conn}"))
@@ -287,7 +296,7 @@ fn spawn_connection(pipe: Arc<PipeHandle>) {
     }
 }
 
-fn read_loop(conn: u64, pipe: &PipeHandle, tx: &Sender<Vec<u8>>) {
+fn read_loop(conn: u64, pipe: &PipeHandle, tx: &SyncSender<Vec<u8>>) {
     let Ok(ev) = Event::new() else { return };
     loop {
         let mut header = [0u8; HEADER_LEN];
@@ -321,7 +330,7 @@ fn read_loop(conn: u64, pipe: &PipeHandle, tx: &Sender<Vec<u8>>) {
         let reply = rrx
             .recv_timeout(REPLY_TIMEOUT)
             .unwrap_or_else(|_| r#"{"success":false,"error":"timeout"}"#.to_string());
-        if tx.send(encode(msg_type, &reply)).is_err() {
+        if tx.try_send(encode(msg_type, &reply)).is_err() {
             break;
         }
     }
@@ -329,12 +338,15 @@ fn read_loop(conn: u64, pipe: &PipeHandle, tx: &Sender<Vec<u8>>) {
 
 /// Handles SUBSCRIBE; returns false when the connection is gone. The reply is queued
 /// before the subscriber is registered, so no event can precede it.
-fn handle_subscribe(conn: u64, tx: &Sender<Vec<u8>>, payload: &str) -> bool {
+fn handle_subscribe(conn: u64, tx: &SyncSender<Vec<u8>>, payload: &str) -> bool {
     let Ok(names) = serde_json::from_str::<Vec<String>>(payload) else {
         let reply = r#"{"success":false,"error":"invalid subscribe payload"}"#;
-        return tx.send(encode(SUBSCRIBE, reply)).is_ok();
+        return tx.try_send(encode(SUBSCRIBE, reply)).is_ok();
     };
-    if tx.send(encode(SUBSCRIBE, r#"{"success":true}"#)).is_err() {
+    if tx
+        .try_send(encode(SUBSCRIBE, r#"{"success":true}"#))
+        .is_err()
+    {
         return false;
     }
     let set: HashSet<String> = names.into_iter().collect();
@@ -342,7 +354,7 @@ fn handle_subscribe(conn: u64, tx: &Sender<Vec<u8>>, payload: &str) -> bool {
     register(&mut lock_subs(), conn, set, tx);
     if wants_tick {
         let frame = encode(EVENT_BIT | EV_TICK, &tick_event(true, ""));
-        return tx.send(frame).is_ok();
+        return tx.try_send(frame).is_ok();
     }
     true
 }
@@ -353,7 +365,7 @@ mod tests {
     use std::io::{Read, Write};
 
     fn sub(id: u64, names: &[&str]) -> (Subscriber, mpsc::Receiver<Vec<u8>>) {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(WRITE_QUEUE);
         let set = names.iter().map(|s| s.to_string()).collect();
         ((id, set, tx), rx)
     }
@@ -371,7 +383,7 @@ mod tests {
 
     #[test]
     fn repeated_subscribe_merges() {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(WRITE_QUEUE);
         let mut subs = Vec::new();
         register(&mut subs, 1, ["a".to_string()].into_iter().collect(), &tx);
         register(&mut subs, 1, ["b".to_string()].into_iter().collect(), &tx);
@@ -390,6 +402,17 @@ mod tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].0, 2);
         assert_eq!(rb.try_recv().unwrap(), b"x");
+    }
+
+    #[test]
+    fn full_queue_drops_subscriber() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut subs: Vec<Subscriber> = vec![(1, ["tick".to_string()].into_iter().collect(), tx)];
+        send_to_matching(&mut subs, "tick", b"1");
+        assert_eq!(subs.len(), 1);
+        send_to_matching(&mut subs, "tick", b"2");
+        assert!(subs.is_empty());
+        assert_eq!(rx.try_recv().unwrap(), b"1");
     }
 
     fn read_client_frame(f: &mut std::fs::File) -> io::Result<(u32, String)> {

@@ -123,6 +123,9 @@ fn main() {
         }
     }
 
+    // Before any thread or child exists, so status_command scripts inherit it too.
+    std::env::set_var("I3SOCK", &ipc_pipe);
+
     init_logging();
     install_crash_safety();
     #[cfg(debug_assertions)]
