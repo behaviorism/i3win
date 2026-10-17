@@ -116,6 +116,26 @@ impl Wm {
         all
     }
 
+    /// Re-attaches every sticky floating window of `from` to `to` (same rect).
+    fn move_sticky(&mut self, from: NodeId, to: NodeId) {
+        if from == self.scratch || to == self.scratch {
+            return;
+        }
+        let focused = self.focused();
+        for n in self.tree.get(from).floating.clone() {
+            if !self.tree.get(n).sticky {
+                continue;
+            }
+            self.tree.detach(n);
+            self.tree.attach_floating(to, n);
+            if n == focused {
+                let focus = &mut self.tree.get_mut(to).focus;
+                focus.retain(|&c| c != n);
+                focus.insert(0, n);
+            }
+        }
+    }
+
     pub fn show_workspace(&mut self, ws: NodeId) {
         let old_global = self.focused_workspace();
         let old_global_name = self.workspace_name(old_global).to_string();
@@ -123,6 +143,9 @@ impl Wm {
             return;
         };
         let old_vis = self.visible_workspace(out);
+        if old_vis != ws {
+            self.move_sticky(old_vis, ws);
+        }
         let f = self.tree.focused_descendant(ws);
         self.tree.set_focused(f);
         if old_vis != ws {
@@ -511,6 +534,31 @@ mod tests {
         let a = wm.outputs()[0];
         assert_eq!(wm.workspace_name(wm.visible_workspace(a)), "3");
     }
+    #[test]
+    fn sticky_floating_follows_workspace_switch() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("[id=2] floating enable, sticky enable");
+        wm.run_command("workspace 3");
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        assert_eq!(wm.workspace_name(wm.tree.workspace_of(n2).unwrap()), "3");
+        assert!(wm.arrange().windows.iter().any(|p| p.id == WindowId(2)));
+        wm.run_command("[id=2] sticky toggle");
+        wm.run_command("workspace 1");
+        assert_eq!(wm.workspace_name(wm.tree.workspace_of(n2).unwrap()), "3");
+    }
+
+    #[test]
+    fn sticky_tiled_window_stays() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("sticky enable");
+        wm.run_command("workspace 3");
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        assert_eq!(wm.workspace_name(wm.tree.workspace_of(n).unwrap()), "1");
+    }
+
     #[test]
     fn removed_output_moves_workspaces() {
         let mut wm = Wm::new(

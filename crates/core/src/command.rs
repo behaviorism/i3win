@@ -91,6 +91,7 @@ pub enum Command {
     Layout(LayoutArg),
     Fullscreen(Toggle),
     Floating(Toggle),
+    Sticky(Toggle),
     Kill,
     /// Width = Horizontal.
     Resize {
@@ -541,6 +542,7 @@ fn parse_one(seg: &str) -> Result<Command, String> {
         },
         "fullscreen" => Ok(Command::Fullscreen(toggle_arg(args, "fullscreen")?)),
         "floating" => Ok(Command::Floating(toggle_arg(args, "floating")?)),
+        "sticky" => Ok(Command::Sticky(toggle_arg(args, "sticky")?)),
         "kill" => Ok(Command::Kill),
         "border" => {
             let n = match a(1) {

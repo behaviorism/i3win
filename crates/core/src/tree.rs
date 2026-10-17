@@ -118,6 +118,8 @@ pub struct Node {
     pub title_icon: Option<i32>,
     pub marks: Vec<String>,
     pub scratchpad: ScratchState,
+    /// Floating windows with this flag follow workspace switches on their output.
+    pub sticky: bool,
 }
 
 pub struct Tree {
@@ -177,6 +179,7 @@ impl Tree {
             title_icon: None,
             marks: Vec::new(),
             scratchpad: ScratchState::None,
+            sticky: false,
         }));
         id
     }

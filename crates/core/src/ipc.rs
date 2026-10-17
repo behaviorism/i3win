@@ -284,6 +284,7 @@ fn node_json(wm: &Wm, arr: &Arrangement, id: NodeId) -> Value {
         "focus": n.focus.iter().map(|c| c.0).collect::<Vec<_>>(),
         "urgent": is_urgent(wm, id),
         "fullscreen_mode": u8::from(n.fullscreen),
+        "sticky": n.sticky,
         "nodes": n.children.iter().map(|&c| node_json(wm, arr, c)).collect::<Vec<_>>(),
         "floating_nodes": n.floating.iter().map(|&c| node_json(wm, arr, c)).collect::<Vec<_>>(),
     });

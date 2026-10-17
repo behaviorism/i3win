@@ -1,4 +1,4 @@
-use crate::command::{parse_commands, BorderArg, Command, TitleIconArg, WorkspaceTarget};
+use crate::command::{parse_commands, BorderArg, Command, TitleIconArg, Toggle, WorkspaceTarget};
 use crate::config::{Border, Config};
 use crate::criteria::select_matches;
 use crate::geom::{sanitize_floating, Rect};
@@ -657,6 +657,16 @@ impl Wm {
             } => return self.resize(target, *grow, *axis, *px, *ppt),
             Command::Fullscreen(t) => return self.set_fullscreen(target, t),
             Command::Floating(t) => return self.set_floating(target, t),
+            Command::Sticky(t) => {
+                for n in self.tree.windows_under(target) {
+                    let cur = self.tree.get(n).sticky;
+                    self.tree.get_mut(n).sticky = match t {
+                        Toggle::Toggle => !cur,
+                        Toggle::Enable => true,
+                        Toggle::Disable => false,
+                    };
+                }
+            }
             Command::Border(a) => self.set_border(target, a),
             Command::TitleFormat(f) => {
                 for n in self.tree.windows_under(target) {
