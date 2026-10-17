@@ -51,7 +51,7 @@ Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 e
 6. Garbage: `$p=New-Object IO.Pipes.NamedPipeClientStream('.','i3win-ipc','InOut'); $p.Connect(2000); $p.Write([byte[]](1..14),0,14); $p.Dispose()` -> log shows a bad-header line; `i3win-msg -t get_version` still answers. Repeat with a header claiming 0xFFFFFFFF bytes -> rejected, server still answers.
 7. Send only "i3-ipc" then dispose -> server still answers.
 8. `i3win-msg 'workspace "3: ünï \"q\" x"'` then `-t get_workspaces` shows the name unchanged; the bar shows the same name.
-9. Bind `exec cmd /k echo %I3SOCK%` -> the console shows \.\pipe\i3win-ipc. Start i3win with `--ipc-pipe \.\pipe\mine`: plain `i3win-msg -t get_version` fails, the exec'd console's works (I3SOCK), and `i3win-msg -s \.\pipe\mine -t get_version` works.
+9. Bind `exec cmd /k echo %I3SOCK%` -> the console shows `\\.\pipe\i3win-ipc`. Start i3win with `--ipc-pipe \\.\pipe\mine`: plain `i3win-msg -t get_version` fails, the exec'd console's works (I3SOCK), and `i3win-msg -s \\.\pipe\mine -t get_version` works.
 10. Polling: run `while(1){i3win-msg -t get_tree > $null; sleep -m 200}` for 30 s -> no title-bar flicker, no lag.
 11. Stalled subscriber: start a monitor, enter QuickEdit selection in its console for 60 s while switching workspaces -> WM stays responsive.
-12. IPC smoke test (empty desktop, no i3win running): `cargo test -p i3win --test smoke -- --ignored --test-threads=1`.
+12. IPC smoke test (empty desktop, no i3win running): `cargo test -p i3win --test smoke -- --ignored --test-threads=1`. Known issue: if an assertion in `ipc_roundtrip_and_events` fails, the test kills i3win without restoring windows it hid on other workspaces; start `i3win.exe` once and it restores them from `%LOCALAPPDATA%\i3win\hidden.txt`.
