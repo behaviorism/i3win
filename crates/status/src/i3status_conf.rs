@@ -191,6 +191,7 @@ struct OpenBlock {
 pub fn parse_i3status(text: &str) -> I3StatusConfig {
     let mut c = I3StatusConfig::default();
     let mut open: Option<OpenBlock> = None;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (idx, raw) in text.lines().enumerate() {
         let n = idx + 1;
         let line = strip_comment(raw).trim();
@@ -312,6 +313,13 @@ tztime local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_bom_is_stripped() {
+        let c = parse_i3status("\u{feff}general {\n  interval = 5\n}\n");
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        assert_eq!(get(&c.general, "interval"), Some(&Value::Num(5.0)));
+    }
 
     #[test]
     fn parses_general_order_blocks() {

@@ -1,4 +1,8 @@
 #[allow(dead_code)]
+mod discover;
+#[allow(dead_code)]
+mod i3blocks_conf;
+#[allow(dead_code)]
 mod i3status_conf;
 mod modules;
 
