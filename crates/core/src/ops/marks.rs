@@ -136,8 +136,14 @@ impl Wm {
         }
         let f = self.tree.focused_descendant(target);
         self.tree.set_focused_within(f, dest_ws);
-        // Focus stays on what was focused before (following it if it moved).
-        if self.tree.contains(prev_focus) && self.focused_container.is_none() {
+        // Focus stays on what was focused before, unless the focused window
+        // moved to a different hidden workspace (then the source keeps focus).
+        let prev_moved = self.tree.contains(prev_focus)
+            && (prev_focus == target || self.tree.is_ancestor(target, prev_focus));
+        let keep = self.tree.contains(prev_focus)
+            && (!prev_moved || src == Some(dest_ws) || self.is_visible(dest_ws));
+        if keep {
+            self.focused_container = None;
             self.tree.set_focused(prev_focus);
         } else if src_was_focused {
             if let Some(s) = src.filter(|&s| self.tree.contains(s)) {
@@ -284,9 +290,7 @@ mod tests {
         wm.run_command("mark gone; unmark gone");
         assert_eq!(marks_json(&wm), serde_json::json!(["keep"]));
         wm.run_command("move container to mark keep");
-        // The moved window was focused, so focus follows it to workspace 1.
-        assert_eq!(ws_desc(&wm), "H[w1 w2]");
-        assert_eq!(wm.focused_window(), Some(WindowId(2)));
+        assert_eq!(ws_desc(&wm), "H[]");
         wm.run_command("workspace 1");
         assert_eq!(ws_desc(&wm), "H[w1 w2]");
         check_invariants(&wm);
