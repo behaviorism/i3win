@@ -6,10 +6,14 @@ mod i3status_conf;
 mod mods;
 mod process;
 mod runner;
+mod signal;
 
 use command_block::{block_env, exit_code_block, expand_sh_vars, is_cmd_shell, shell_command};
 use discover::{detect_format, discover, Format};
-use i3status_conf::{get, module_props, parse_i3status, Value, DEFAULT_I3STATUS_CONF};
+use i3blocks_conf::Section;
+use i3status_conf::{
+    get, module_props, parse_i3status, ModuleRef, Props, Value, DEFAULT_I3STATUS_CONF,
+};
 use i3win_core::i3bar::{Block, Click};
 use runner::{
     config_error_block, module_interval, persist_click_line, persist_line_block, plain_line,
@@ -26,7 +30,7 @@ use windows::Win32::Foundation::HANDLE;
 const DEFAULT_INTERVAL: f64 = 5.0;
 const TICK: Duration = Duration::from_millis(100);
 
-enum Event {
+pub(crate) enum Event {
     Tick,
     /// (slot, run, line)
     Output(usize, u64, String),
@@ -35,26 +39,30 @@ enum Event {
     Click(Click),
     /// stdin closed: the bar went away.
     Quit,
-    /// Sent by `--signal N` delivery (Task 8).
-    #[allow(dead_code)]
+    /// `--signal N` delivery.
     Signal(u32),
-    /// Sent by `--refresh-all` delivery (Task 8).
-    #[allow(dead_code)]
+    /// `--refresh-all` delivery.
     RefreshAll,
 }
 
 #[derive(Debug, Default, PartialEq)]
 struct Args {
     config: Option<PathBuf>,
+    signal: Option<u32>,
+    refresh_all: bool,
 }
 
-/// `-c PATH`; other arguments are ignored here.
+/// `-c PATH`, `--signal N`, `--refresh-all`; other arguments are ignored.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
     let mut a = Args::default();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         if arg == "-c" {
             a.config = it.next().map(PathBuf::from);
+        } else if arg == "--signal" {
+            a.signal = it.next().and_then(|n| n.parse().ok());
+        } else if arg == "--refresh-all" {
+            a.refresh_all = true;
         }
     }
     a
@@ -126,13 +134,66 @@ fn setup_i3status(text: &str) -> Setup {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum SectionKind {
+    Command,
+    Module(ModuleRef),
+    Static,
+}
+
+const KNOWN_MODULES: [&str; 11] = [
+    "cpu_usage",
+    "memory",
+    "disk",
+    "battery",
+    "tztime",
+    "time",
+    "ethernet",
+    "wireless",
+    "volume",
+    "path_exists",
+    "read_file",
+];
+
+/// A section with a `command` runs it; otherwise a built-in module name
+/// (optionally followed by an instance) selects a module.
+pub fn classify_section(s: &Section) -> SectionKind {
+    if s.get("command").is_some_and(|c| !c.trim().is_empty()) {
+        return SectionKind::Command;
+    }
+    let (module, instance) = match s.name.split_once(' ') {
+        Some((m, i)) => (m, Some(i.trim().to_string()).filter(|i| !i.is_empty())),
+        None => (s.name.as_str(), None),
+    };
+    if KNOWN_MODULES.contains(&module) {
+        SectionKind::Module(ModuleRef {
+            module: module.to_string(),
+            instance,
+        })
+    } else {
+        SectionKind::Static
+    }
+}
+
+/// The section's i3blocks values (globals included) as module properties.
+pub fn section_props(s: &Section) -> Props {
+    s.props
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
+        .collect()
+}
+
 fn setup_i3blocks(text: &str) -> Setup {
     let cfg = i3blocks_conf::parse_i3blocks(text);
     let mut slots = error_slots(&cfg.errors);
     for s in cfg.sections {
-        slots.push(match s.get("command") {
-            Some(c) if !c.trim().is_empty() => Slot::Command(CommandSlot::from_section(s)),
-            _ => Slot::Static(command_block::static_block(&s)),
+        slots.push(match classify_section(&s) {
+            SectionKind::Command => Slot::Command(CommandSlot::from_section(s)),
+            SectionKind::Module(m) => {
+                let props = section_props(&s);
+                Slot::Module(mods::build_module(&m, &props, &props))
+            }
+            SectionKind::Static => Slot::Static(command_block::static_block(&s)),
         });
     }
     Setup {
@@ -421,6 +482,14 @@ fn emit(out: &mut impl Write, text: &str) -> bool {
 
 fn main() {
     let args = parse_args(std::env::args().skip(1));
+    if args.signal.is_some() || args.refresh_all {
+        let n = match args.signal {
+            Some(sig) => signal::send_signal(sig),
+            None => signal::send_refresh_all(),
+        };
+        eprintln!("{n}");
+        return;
+    }
     let (setup, script_dir) = load(&args);
     let job = process::create_kill_job().unwrap_or_else(|| {
         eprintln!("i3win-status: cannot create job object; children may outlive us");
@@ -457,6 +526,7 @@ fn main() {
             }
         });
     }
+    signal::listen(tx.clone());
     std::thread::spawn(move || read_clicks(tx));
 
     let mut first = true;
@@ -497,8 +567,48 @@ mod tests {
     fn args_config_path() {
         let a = parse_args(["-c".to_string(), r"C:\x.conf".to_string()]);
         assert_eq!(a.config, Some(PathBuf::from(r"C:\x.conf")));
-        assert_eq!(parse_args(["--refresh-all".to_string()]), Args::default());
+        assert!(parse_args(["--refresh-all".to_string()]).refresh_all);
+        assert_eq!(
+            parse_args(["--signal".to_string(), "5".to_string()]).signal,
+            Some(5)
+        );
         assert_eq!(parse_args(["-c".to_string()]), Args::default());
+    }
+
+    fn sec(name: &str, props: &[(&str, &str)]) -> Section {
+        Section {
+            name: name.to_string(),
+            props: props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn classify_sections() {
+        assert_eq!(
+            classify_section(&sec("weather", &[("command", "x")])),
+            SectionKind::Command
+        );
+        assert_eq!(
+            classify_section(&sec("disk C:", &[("format", "%free")])),
+            SectionKind::Module(ModuleRef {
+                module: "disk".into(),
+                instance: Some("C:".into())
+            })
+        );
+        assert_eq!(
+            classify_section(&sec("cpu_usage", &[])),
+            SectionKind::Module(ModuleRef {
+                module: "cpu_usage".into(),
+                instance: None
+            })
+        );
+        assert_eq!(
+            classify_section(&sec("hello", &[("full_text", "hi")])),
+            SectionKind::Static
+        );
     }
 
     #[test]

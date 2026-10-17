@@ -83,3 +83,9 @@ Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 e
 ## Plan 7: i3win-status
 
 1. Known difference: under `cmd` (the default shell) a missing command makes cmd.exe exit with code 1, so the block shows `Error: Command 'CMD' exited unexpectedly with code 1` rather than i3blocks' `not found or missing dependency` text.
+2. Put an `i3blocks.conf` in `%USERPROFILE%\.config\i3win\` with a `[weather]` block (`command=curl -s wttr.in?format=3`, `interval=600`), a `[cpu_usage]` block (built-in module) and a `[clicker]` block (`command=echo %button%`), then reload i3win -> all three blocks appear in the bar.
+3. Right-clicking the `clicker` block shows `3`.
+4. A block with `signal=N`: `i3win-status --signal N` refreshes it at once (stderr prints how many instances were signaled); `i3win-status --refresh-all` refreshes every non-persist block.
+5. A block with `command=exit 2` shows the urgent `Error: Command 'exit 2' exited unexpectedly with code 2`.
+6. With only an `i3status.conf` present, changes to `order` and `format` apply after an i3win reload.
+7. Delete both `i3blocks.conf` and `i3status.conf`, reload -> i3win-status recreates `i3status.conf` with the default modules.
