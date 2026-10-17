@@ -475,7 +475,12 @@ fn place_floating(ctx: &mut Ctx, config: &Config, ws: NodeId, skip: Option<NodeI
 }
 
 /// Inverse of the floating frame -> client inset used by `arrange`.
-pub fn floating_frame_from_client(config: &Config, scale: f32, client: Rect) -> Rect {
+pub fn floating_frame_from_client(
+    config: &Config,
+    border: Border,
+    scale: f32,
+    client: Rect,
+) -> Rect {
     let th = title_height(&config.font, scale);
     let grow = |l: i32, t: i32, r: i32, b: i32| {
         Rect::new(
@@ -485,7 +490,7 @@ pub fn floating_frame_from_client(config: &Config, scale: f32, client: Rect) -> 
             client.h.saturating_add(t + b),
         )
     };
-    match config.default_floating_border {
+    match border {
         Border::Normal(b) => {
             let b = px(b);
             grow(b, th, b, b)
@@ -710,7 +715,12 @@ mod tests {
         assert_eq!(placement(&a, 1), Rect::new(302, 120, 396, 278));
         assert!(a.windows[0].floating);
         assert_eq!(
-            floating_frame_from_client(&wm.config, 1.0, Rect::new(302, 120, 396, 278)),
+            floating_frame_from_client(
+                &wm.config,
+                wm.config.default_floating_border,
+                1.0,
+                Rect::new(302, 120, 396, 278)
+            ),
             Rect::new(300, 100, 400, 300)
         );
     }
@@ -871,5 +881,51 @@ default_border none
             panic!()
         };
         assert_eq!(*icon, Some((WindowId(1), 4)));
+    }
+    #[test]
+    fn floating_frame_roundtrip_with_per_window_border() {
+        for cmd in ["border none", "border pixel 3", "border normal 4"] {
+            let mut wm = test_wm();
+            wm.manage(win(1));
+            wm.run_command("floating enable");
+            wm.run_command(cmd);
+            let a = wm.arrange();
+            let client = a.windows[0].rect;
+            let node = wm.tree.window_node(WindowId(1)).unwrap();
+            let border = wm.tree.get(node).border.unwrap();
+            let frame = floating_frame_from_client(&wm.config, border, 1.0, client);
+            wm.on_floating_moved(WindowId(1), frame);
+            assert_eq!(wm.arrange().windows[0].rect, client, "{cmd}");
+        }
+    }
+    #[test]
+    fn hidden_edges_with_normal_border_keep_title_adjacent() {
+        let mut cfg = parse_config(
+            "hide_edge_borders both
+default_border normal 2
+",
+        );
+        cfg.bar = None;
+        cfg.font.size_pt = 9.0;
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let a = wm.arrange();
+        let w1 = a.windows.iter().find(|p| p.id == WindowId(1)).unwrap().rect;
+        let Some(Deco::Frame {
+            title_rect: Some(t),
+            borders,
+            ..
+        }) = a
+            .decos
+            .iter()
+            .find(|d| matches!(d, Deco::Frame { above, .. } if *above == WindowId(1)))
+        else {
+            panic!()
+        };
+        assert_eq!(*borders, [0, 0, 2, 0]);
+        assert_eq!(w1.y, t.bottom());
+        assert_eq!((w1.x, w1.bottom()), (0, 500));
+        assert_eq!(w1.right(), 498);
     }
 }

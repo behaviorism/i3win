@@ -293,7 +293,13 @@ impl App {
                 })
                 .unwrap_or(1.0);
             if let Some(r) = window::frame_rect(id) {
-                let frame = floating_frame_from_client(&self.wm.config, scale, r);
+                let border = self
+                    .wm
+                    .tree
+                    .get(node)
+                    .border
+                    .unwrap_or(self.wm.config.default_floating_border);
+                let frame = floating_frame_from_client(&self.wm.config, border, scale, r);
                 self.wm.on_floating_moved(id, frame);
             }
         } else {
