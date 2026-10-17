@@ -80,6 +80,7 @@ fn is_window_command(cmd: &Command) -> bool {
             | Command::Exit
             | Command::Mode(_)
             | Command::Nop
+            | Command::Gaps { .. }
             | Command::Workspace(_)
             | Command::FocusOutput(_)
             | Command::MoveWorkspaceToOutput(_)
@@ -569,6 +570,12 @@ impl Wm {
             Command::Reload | Command::Restart => self.effects.push(Effect::Reload),
             Command::Exit => self.effects.push(Effect::Exit),
             Command::Nop => {}
+            Command::Gaps {
+                which,
+                scope,
+                op,
+                px,
+            } => self.gaps_command(*which, *scope, *op, *px),
             Command::FocusMatched => self.focus_target(target),
             Command::FocusOutput(t) => return self.focus_output(t),
             Command::MoveToWorkspace(t) => return self.move_to_workspace(target, t),
@@ -695,6 +702,34 @@ mod tests {
     use crate::tree::{Layout, NodeKind, WindowId};
     use crate::wm::*;
 
+    #[test]
+    fn gaps_command_current_and_all() {
+        use crate::config::Gaps;
+        let mut wm = test_wm();
+        assert!(wm.run_command("gaps inner current set 12")[0].success);
+        let ws = wm.focused_workspace();
+        assert_eq!(wm.effective_gaps(ws).inner, 12);
+        wm.run_command("gaps outer current plus 4");
+        assert_eq!(
+            wm.effective_gaps(ws),
+            Gaps {
+                inner: 12,
+                top: 4,
+                right: 4,
+                bottom: 4,
+                left: 4
+            }
+        );
+        wm.run_command("gaps horizontal current minus 10");
+        assert_eq!(wm.effective_gaps(ws).left, 0);
+        wm.run_command("gaps inner all set 3");
+        assert_eq!(wm.effective_gaps(ws).inner, 3);
+        wm.run_command("gaps inner current toggle 8");
+        assert_eq!(wm.effective_gaps(ws).inner, 0);
+        wm.run_command("gaps inner current toggle 8");
+        assert_eq!(wm.effective_gaps(ws).inner, 8);
+        assert!(!wm.run_command("gaps sideways current set 1")[0].success);
+    }
     #[test]
     fn new_creates_numbered_workspaces_per_output() {
         let wm = Wm::new(

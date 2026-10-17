@@ -48,6 +48,29 @@ pub enum TitleIconArg {
     Toggle,
     Padding(i32),
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapsWhich {
+    Inner,
+    Outer,
+    Horizontal,
+    Vertical,
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapsScope {
+    Current,
+    All,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapsOp {
+    Set,
+    Plus,
+    Minus,
+    Toggle,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Exec(String),
@@ -79,6 +102,12 @@ pub enum Command {
     Border(BorderArg),
     TitleFormat(String),
     TitleWindowIcon(TitleIconArg),
+    Gaps {
+        which: GapsWhich,
+        scope: GapsScope,
+        op: GapsOp,
+        px: i32,
+    },
     Mode(String),
     Reload,
     Restart,
@@ -348,6 +377,41 @@ fn parse_move(args: &[Tok]) -> Result<Command, String> {
     )?))
 }
 
+fn parse_gaps(args: &[Tok]) -> Result<Command, String> {
+    let a = |i: usize| args.get(i).map(|t| t.0.as_str());
+    let which = match a(0) {
+        Some("inner") => GapsWhich::Inner,
+        Some("outer") => GapsWhich::Outer,
+        Some("horizontal") => GapsWhich::Horizontal,
+        Some("vertical") => GapsWhich::Vertical,
+        Some("top") => GapsWhich::Top,
+        Some("right") => GapsWhich::Right,
+        Some("bottom") => GapsWhich::Bottom,
+        Some("left") => GapsWhich::Left,
+        o => return Err(format!("bad gaps target: {}", o.unwrap_or(""))),
+    };
+    let scope = match a(1) {
+        Some("current") => GapsScope::Current,
+        Some("all") => GapsScope::All,
+        o => return Err(format!("bad gaps scope: {}", o.unwrap_or(""))),
+    };
+    let op = match a(2) {
+        Some("set") => GapsOp::Set,
+        Some("plus") => GapsOp::Plus,
+        Some("minus") => GapsOp::Minus,
+        Some("toggle") => GapsOp::Toggle,
+        o => return Err(format!("bad gaps operation: {}", o.unwrap_or(""))),
+    };
+    let v = a(3).ok_or("gaps: missing amount")?;
+    let px = parse_int(v.strip_suffix("px").unwrap_or(v))?;
+    Ok(Command::Gaps {
+        which,
+        scope,
+        op,
+        px,
+    })
+}
+
 fn parse_one(seg: &str) -> Result<Command, String> {
     let toks = tokenize(seg)?;
     let Some(first) = toks.first() else {
@@ -456,6 +520,7 @@ fn parse_one(seg: &str) -> Result<Command, String> {
             )),
         },
         "resize" => parse_resize(args),
+        "gaps" => parse_gaps(args),
         "mode" => match args.first() {
             Some(t) if t.0.is_empty() => Err("mode: missing name".into()),
             Some(t) => Ok(Command::Mode(t.0.clone())),
