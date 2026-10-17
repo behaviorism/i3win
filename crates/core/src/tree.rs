@@ -78,6 +78,23 @@ pub enum NodeKind {
     Window(WindowData),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScratchState {
+    None,
+    Fresh,
+    Changed,
+}
+
+impl ScratchState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScratchState::None => "none",
+            ScratchState::Fresh => "fresh",
+            ScratchState::Changed => "changed",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: NodeId,
@@ -100,6 +117,7 @@ pub struct Node {
     /// Some(padding_px) when title_window_icon is on.
     pub title_icon: Option<i32>,
     pub marks: Vec<String>,
+    pub scratchpad: ScratchState,
 }
 
 pub struct Tree {
@@ -158,6 +176,7 @@ impl Tree {
             title_format: None,
             title_icon: None,
             marks: Vec::new(),
+            scratchpad: ScratchState::None,
         }));
         id
     }

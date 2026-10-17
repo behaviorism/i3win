@@ -355,6 +355,10 @@ pub fn arrange(tree: &Tree, config: &Config, focused: NodeId, machine: &str) -> 
         let NodeKind::Output { name, rect, scale } = &on.kind else {
             continue;
         };
+        if name == crate::wm::SCRATCH_OUTPUT {
+            ctx.hide_under(o);
+            continue;
+        }
         let visible = on.focus.first().copied();
         for &ws in &on.children {
             if Some(ws) == visible {

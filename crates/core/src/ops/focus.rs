@@ -116,6 +116,12 @@ impl Wm {
         if !self.tree.contains(n) {
             return;
         }
+        if self.tree.workspace_of(n) == Some(self.scratch) {
+            if let Some(w) = self.tree.windows_under(n).first().copied() {
+                self.show_scratch_window(w);
+            }
+            return;
+        }
         let old_ws = self.focused_workspace();
         let old_name = self.workspace_name(old_ws).to_string();
         let mut noted = false;

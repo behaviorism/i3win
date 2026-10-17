@@ -67,7 +67,14 @@ pub struct Wm {
     pub machine: String,
     /// Incremented each time a window becomes urgent (orders `urgent=latest|oldest`).
     pub(crate) urgent_counter: u64,
+    /// The `__i3_scratch` workspace (child of the hidden `__i3` output).
+    pub(crate) scratch: NodeId,
+    /// Scratchpad windows, least recently hidden first.
+    pub(crate) scratch_order: Vec<NodeId>,
 }
+
+pub const SCRATCH_OUTPUT: &str = "__i3";
+pub const SCRATCH_WORKSPACE: &str = "__i3_scratch";
 
 fn workspace_num(name: &str) -> Option<i32> {
     let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -83,6 +90,7 @@ fn is_window_command(cmd: &Command) -> bool {
             | Command::Exit
             | Command::Mode(_)
             | Command::Nop
+            | Command::ScratchpadShow
             | Command::Unmark(None)
             | Command::Gaps { .. }
             | Command::Workspace(_)
@@ -102,6 +110,8 @@ impl Wm {
             effects: Vec::new(),
             machine: String::new(),
             urgent_counter: 0,
+            scratch: NodeId(0),
+            scratch_order: Vec::new(),
         };
         let outputs = if outputs.is_empty() {
             vec![OutputInfo {
@@ -141,8 +151,30 @@ impl Wm {
             let name = wm.initial_workspace_name(&oname, &output_names);
             wm.create_workspace(node, &name);
         }
+        let scratch_out = wm.tree.new_node(
+            NodeKind::Output {
+                name: SCRATCH_OUTPUT.into(),
+                rect: Rect::new(0, 0, 0, 0),
+                scale: 1.0,
+            },
+            Layout::SplitH,
+        );
+        wm.tree.attach(root, scratch_out, None);
+        let scratch_ws = wm.tree.new_node(
+            NodeKind::Workspace {
+                name: SCRATCH_WORKSPACE.into(),
+                num: None,
+            },
+            wm.config.workspace_layout,
+        );
+        wm.tree.attach(scratch_out, scratch_ws, None);
+        wm.scratch = scratch_ws;
         wm.effects.clear();
         wm
+    }
+
+    pub fn scratch_workspace(&self) -> NodeId {
+        self.scratch
     }
 
     /// Name for the first workspace of a new output, skipping names
@@ -234,7 +266,17 @@ impl Wm {
     }
 
     pub fn outputs(&self) -> Vec<NodeId> {
-        self.tree.get(self.tree.root()).children.clone()
+        self.tree
+            .get(self.tree.root())
+            .children
+            .iter()
+            .copied()
+            .filter(|&o| !self.is_scratch_output(o))
+            .collect()
+    }
+
+    pub(crate) fn is_scratch_output(&self, o: NodeId) -> bool {
+        matches!(&self.tree.get(o).kind, NodeKind::Output { name, .. } if name == SCRATCH_OUTPUT)
     }
 
     /// Focuses `node` without changing which workspace is visible: when the
@@ -442,6 +484,9 @@ impl Wm {
         let Some(ws) = self.tree.workspace_of(node) else {
             return;
         };
+        if ws == self.scratch {
+            return;
+        }
         if self.is_visible(ws) {
             self.focused_container = None;
             let old_ws = self.focused_workspace();
@@ -510,6 +555,14 @@ impl Wm {
         for g in groups {
             let matched: Option<Vec<NodeId>> = g.criteria.as_ref().map(|c| select_matches(self, c));
             for cmd in &g.commands {
+                if let (Command::ScratchpadShow, Some(m)) = (cmd, &matched) {
+                    let r = self.scratchpad_show_matched(m);
+                    results.push(CommandResult {
+                        success: r.is_ok(),
+                        error: r.err(),
+                    });
+                    continue;
+                }
                 let mut targets = match &matched {
                     Some(t) => t.clone(),
                     None => vec![self.focused()],
@@ -569,6 +622,8 @@ impl Wm {
             Command::Mark { add, toggle, name } => self.mark(target, *add, *toggle, name),
             Command::Unmark(name) => self.unmark(name.as_deref()),
             Command::MoveToMark(name) => return self.move_to_mark(target, name),
+            Command::MoveScratchpad => return self.move_to_scratchpad(target),
+            Command::ScratchpadShow => return self.scratchpad_show(),
             Command::Swap(t) => return self.swap_with(target, t),
             Command::Gaps {
                 which,

@@ -1,6 +1,6 @@
 use crate::command::{OutputTarget, WorkspaceTarget};
 use crate::geom::{sanitize_floating, Direction, Rect};
-use crate::tree::{Layout, NodeId, NodeKind};
+use crate::tree::{Layout, NodeId, NodeKind, ScratchState};
 use crate::wm::{IpcEvent, OutputInfo, Wm};
 
 fn sort_key(num: Option<i32>, name: &str) -> (bool, i32, String) {
@@ -217,7 +217,9 @@ impl Wm {
             .filter_map(|n| self.tree.window_id(n))
             .collect();
         for &n in &moved_nodes {
-            self.tree.get_mut(n).fullscreen = false;
+            let node = self.tree.get_mut(n);
+            node.fullscreen = false;
+            node.scratchpad = ScratchState::None;
         }
         self.tree.detach(target);
         if let Some(p) = old_parent {
@@ -362,6 +364,21 @@ impl Wm {
                     self.create_workspace(node, &ws_name);
                 }
             }
+        }
+        // Keep the scratch output last in the focus stack so it can never
+        // become the focused output.
+        let root = self.tree.root();
+        if let Some(so) = self
+            .tree
+            .get(root)
+            .children
+            .iter()
+            .copied()
+            .find(|&o| self.is_scratch_output(o))
+        {
+            let f = &mut self.tree.get_mut(root).focus;
+            f.retain(|&c| c != so);
+            f.push(so);
         }
         let gone: Vec<NodeId> = self
             .outputs()

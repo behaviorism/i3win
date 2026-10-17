@@ -1,6 +1,6 @@
 use crate::command::Toggle;
 use crate::geom::{sanitize_floating, Rect};
-use crate::tree::{NodeId, NodeKind};
+use crate::tree::{NodeId, NodeKind, ScratchState};
 use crate::wm::{IpcEvent, Wm};
 
 fn want(t: &Toggle, current: bool) -> bool {
@@ -25,6 +25,9 @@ impl Wm {
         let enable = want(t, floating);
         if enable == floating {
             return Ok(());
+        }
+        if !enable {
+            self.tree.get_mut(target).scratchpad = ScratchState::None;
         }
         let old_parent = self.tree.parent(target);
         self.tree.detach(target);

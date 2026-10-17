@@ -280,6 +280,7 @@ fn node_json(wm: &Wm, arr: &Arrangement, id: NodeId) -> Value {
         "rect": rect_json(rect),
         "focused": id == wm.focused(),
         "marks": n.marks,
+        "scratchpad_state": n.scratchpad.as_str(),
         "focus": n.focus.iter().map(|c| c.0).collect::<Vec<_>>(),
         "urgent": is_urgent(wm, id),
         "fullscreen_mode": u8::from(n.fullscreen),

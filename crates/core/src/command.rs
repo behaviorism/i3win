@@ -120,6 +120,8 @@ pub enum Command {
     },
     Unmark(Option<String>),
     MoveToMark(String),
+    MoveScratchpad,
+    ScratchpadShow,
     Swap(SwapTarget),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -383,6 +385,9 @@ fn parse_move(args: &[Tok]) -> Result<Command, String> {
     if a(i) == Some("to") {
         i += 1;
     }
+    if a(i) == Some("scratchpad") && a(i + 1).is_none() {
+        return Ok(Command::MoveScratchpad);
+    }
     if a(i) == Some("mark") {
         let name = a(i + 1).ok_or("move to mark: missing name")?;
         return Ok(Command::MoveToMark(name.to_string()));
@@ -585,6 +590,7 @@ fn parse_one(seg: &str) -> Result<Command, String> {
         "unmark" => Ok(Command::Unmark(a(0).map(str::to_string))),
         "swap" => parse_swap(args),
         "nop" => Ok(Command::Nop),
+        "scratchpad" if a(0) == Some("show") && a(1).is_none() => Ok(Command::ScratchpadShow),
         _ => Err(format!("unknown command: {verb}")),
     }
 }
