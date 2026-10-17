@@ -8,4 +8,4 @@ i3win-core = { path = "../core" }
 serde_json = "1"
 chrono = "0.4"
 chrono-tz = "0.10"
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_System_Power"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_System_Power", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_WiFi", "Win32_Networking_WinSock", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com"] }

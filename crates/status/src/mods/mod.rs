@@ -3,8 +3,11 @@
 pub mod battery;
 pub mod cpu;
 pub mod disk;
+pub mod files;
 pub mod memory;
+pub mod net;
 pub mod time;
+pub mod volume;
 
 use crate::format::{colors_from, make_block, Level};
 use crate::i3status_conf::{get, ModuleRef, Props, Value};
@@ -13,8 +16,11 @@ use i3win_core::i3bar::Block;
 pub use battery::battery_text;
 pub use cpu::cpu_text;
 pub use disk::disk_text;
+pub use files::{path_exists_text, read_file_text};
 pub use memory::memory_text;
+pub use net::{ethernet_text, pick_adapter, wireless_text, Adapter};
 pub use time::time_text;
+pub use volume::volume_text;
 
 pub trait Module: Send {
     /// Module name for the block's `name`.
@@ -32,6 +38,11 @@ enum Kind {
     Disk(String),
     Battery,
     Time,
+    Ethernet(String),
+    Wireless(String),
+    Volume,
+    PathExists(String, String),
+    ReadFile(String, String),
 }
 
 struct Builtin {
@@ -77,6 +88,32 @@ impl Module for Builtin {
             },
             Kind::Battery => battery_text(battery::read_battery(), props),
             Kind::Time => (time_text(chrono::Utc::now(), props), Level::Normal),
+            Kind::Ethernet(wanted) => {
+                let list = net::read_adapters();
+                let adapters: Vec<Adapter> = list.into_iter().map(|(a, _)| a).collect();
+                ethernet_text(pick_adapter(&adapters, wanted, false), props)
+            }
+            Kind::Wireless(wanted) => {
+                let list = net::read_adapters();
+                let adapters: Vec<Adapter> = list.iter().map(|(a, _)| a.clone()).collect();
+                let picked = pick_adapter(&adapters, wanted, true);
+                let wifi = picked
+                    .and_then(|p| adapters.iter().position(|a| std::ptr::eq(a, p)))
+                    .and_then(|i| net::read_wifi(&list[i].1));
+                wireless_text(
+                    picked,
+                    wifi.as_ref().map(|w| w.0.as_str()),
+                    wifi.as_ref().map(|w| w.1),
+                    props,
+                )
+            }
+            Kind::Volume => volume_text(volume::read_volume(), props),
+            Kind::PathExists(path, title) => {
+                path_exists_text(files::path_exists(path), title, props)
+            }
+            Kind::ReadFile(path, title) => {
+                read_file_text(files::read_file(path).as_deref(), title, props)
+            }
         };
         let colors = colors_from(&self.general, Some(&self.props));
         make_block(
@@ -117,6 +154,10 @@ impl Module for Unsupported {
     }
 }
 
+fn wanted_adapter(m: &ModuleRef) -> String {
+    m.instance.clone().unwrap_or_else(|| "_first_".to_string())
+}
+
 pub fn build_module(m: &ModuleRef, props: &Props, general: &Props) -> Box<dyn Module> {
     let kind = match m.module.as_str() {
         "cpu_usage" => Kind::Cpu(cpu::read_cpu_times()),
@@ -133,6 +174,21 @@ pub fn build_module(m: &ModuleRef, props: &Props, general: &Props) -> Box<dyn Mo
         }
         "battery" => Kind::Battery,
         "tztime" | "time" => Kind::Time,
+        "ethernet" => Kind::Ethernet(wanted_adapter(m)),
+        "wireless" => Kind::Wireless(wanted_adapter(m)),
+        "volume" => Kind::Volume,
+        "path_exists" | "read_file" => {
+            let inst = m.instance.clone().unwrap_or_default();
+            let path = get(props, "path")
+                .map(Value::as_str)
+                .unwrap_or_else(|| inst.clone());
+            let title = get(props, "title").map(Value::as_str).unwrap_or(inst);
+            if m.module == "path_exists" {
+                Kind::PathExists(path, title)
+            } else {
+                Kind::ReadFile(path, title)
+            }
+        }
         _ => {
             return Box::new(Unsupported {
                 name: m.module.clone(),
@@ -150,14 +206,94 @@ pub fn build_module(m: &ModuleRef, props: &Props, general: &Props) -> Box<dyn Mo
 }
 
 #[cfg(test)]
-mod tests {
-    use super::battery::{BatStatus, BatteryState};
-    use super::*;
+pub(crate) mod testutil {
+    use crate::i3status_conf::{Props, Value};
 
-    fn p(kv: &[(&str, &str)]) -> Props {
+    pub fn p(kv: &[(&str, &str)]) -> Props {
         kv.iter()
             .map(|(k, v)| (k.to_string(), Value::Str(v.to_string())))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::battery::{BatStatus, BatteryState};
+    use super::testutil::p;
+    use super::*;
+
+    fn ad(name: &str, up: bool, wl: bool, ip: Option<&str>) -> Adapter {
+        Adapter {
+            name: name.into(),
+            up,
+            wireless: wl,
+            ipv4: ip.map(Into::into),
+            speed_bps: 1_000_000_000,
+        }
+    }
+
+    #[test]
+    fn adapter_pick_and_text() {
+        let l = vec![
+            ad("Ethernet", false, false, None),
+            ad("Ethernet 2", true, false, Some("10.0.0.2")),
+            ad("Wi-Fi", true, true, Some("192.168.1.5")),
+        ];
+        assert_eq!(
+            pick_adapter(&l, "_first_", false).unwrap().name,
+            "Ethernet 2"
+        );
+        assert_eq!(pick_adapter(&l, "wi-fi", true).unwrap().name, "Wi-Fi");
+        assert_eq!(
+            ethernet_text(pick_adapter(&l, "_first_", false), &p(&[])),
+            ("E: 10.0.0.2 (1000 Mbit/s)".into(), Level::Good)
+        );
+        assert_eq!(ethernet_text(None, &p(&[])), ("E: down".into(), Level::Bad));
+        assert_eq!(
+            wireless_text(
+                pick_adapter(&l, "_first_", true),
+                Some("home"),
+                Some(70),
+                &p(&[])
+            )
+            .0,
+            "W: (70% at home) 192.168.1.5"
+        );
+        assert_eq!(wireless_text(None, None, None, &p(&[])).0, "W: down");
+    }
+
+    #[test]
+    fn volume_and_files() {
+        assert_eq!(
+            volume_text(Some((42, false)), &p(&[("format", "V %volume")])).0,
+            "V 42%"
+        );
+        assert_eq!(
+            volume_text(Some((42, true)), &p(&[("format_muted", "M")])).0,
+            "M"
+        );
+        assert_eq!(volume_text(None, &p(&[])).1, Level::Degraded);
+        assert_eq!(
+            path_exists_text(true, "VPN", &p(&[])),
+            ("VPN: yes".into(), Level::Good)
+        );
+        assert_eq!(
+            path_exists_text(false, "VPN", &p(&[("format_down", "VPN down")])),
+            ("VPN down".into(), Level::Bad)
+        );
+        assert_eq!(
+            read_file_text(
+                Some(
+                    "hello
+world"
+                ),
+                "f",
+                &p(&[("max_characters", "3")])
+            )
+            .0,
+            "f: hel"
+        );
+        assert_eq!(read_file_text(None, "f", &p(&[])).1, Level::Bad);
     }
 
     #[test]
@@ -275,7 +411,18 @@ mod tests {
 
     #[test]
     fn builtin_modules_render() {
-        for name in ["cpu_usage", "memory", "disk", "battery", "tztime"] {
+        for name in [
+            "cpu_usage",
+            "memory",
+            "disk",
+            "battery",
+            "tztime",
+            "ethernet",
+            "wireless",
+            "volume",
+            "path_exists",
+            "read_file",
+        ] {
             let mut m = build_module(
                 &ModuleRef {
                     module: name.into(),
