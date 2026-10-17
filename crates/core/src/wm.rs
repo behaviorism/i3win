@@ -11,6 +11,7 @@ pub struct OutputInfo {
     pub name: String,
     pub rect: Rect,
     pub scale: f32,
+    pub primary: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,6 +123,7 @@ impl Wm {
                 name: "default".into(),
                 rect: Rect::new(0, 0, 1920, 1080),
                 scale: 1.0,
+                primary: true,
             }]
         } else {
             outputs
@@ -134,6 +136,7 @@ impl Wm {
                     name: o.name,
                     rect: o.rect,
                     scale: o.scale,
+                    primary: o.primary,
                 },
                 Layout::SplitH,
             );
@@ -160,6 +163,7 @@ impl Wm {
                 name: SCRATCH_OUTPUT.into(),
                 rect: Rect::new(0, 0, 0, 0),
                 scale: 1.0,
+                primary: false,
             },
             Layout::SplitH,
         );

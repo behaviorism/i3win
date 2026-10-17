@@ -202,8 +202,8 @@ impl App {
         let Some(cmd) = self
             .wm
             .config
-            .bar
-            .as_ref()
+            .bars
+            .first()
             .and_then(|b| b.status_command.clone())
         else {
             self.blocks.clear();

@@ -60,8 +60,18 @@ pub struct Font {
     pub family: String,
     pub size_pt: f32,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BarMode {
+    #[default]
+    Dock,
+    Hide,
+    Invisible,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct BarConfig {
+    pub id: String,
+    pub outputs: Vec<String>,
+    pub mode: BarMode,
     pub position: BarPosition,
     pub status_command: Option<String>,
     pub font: Option<Font>,
@@ -171,7 +181,7 @@ pub struct Config {
     pub gaps: Gaps,
     pub workspace_gaps: Vec<(String, GapsOverride)>,
     pub colors: ClientColors,
-    pub bar: Option<BarConfig>,
+    pub bars: Vec<BarConfig>,
     pub focus_follows_mouse: bool,
     pub mouse_warping: MouseWarping,
     pub floating_modifier: Option<Modifiers>,
@@ -366,6 +376,9 @@ impl Default for BarColors {
 impl Default for BarConfig {
     fn default() -> Self {
         BarConfig {
+            id: "bar-0".to_string(),
+            outputs: Vec::new(),
+            mode: BarMode::Dock,
             position: BarPosition::Bottom,
             status_command: None,
             font: None,
@@ -533,7 +546,7 @@ pub fn parse_config(text: &str) -> Config {
         gaps: Gaps::default(),
         workspace_gaps: Vec::new(),
         colors: ClientColors::default(),
-        bar: None,
+        bars: Vec::new(),
         focus_follows_mouse: true,
         mouse_warping: MouseWarping::Output,
         floating_modifier: None,
@@ -703,8 +716,20 @@ fn bind(cfg: &mut Config, mode: &str, args: &str, by_code: bool) -> Result<(), S
 }
 
 fn bar_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
-    let bar = cfg.bar.get_or_insert_with(BarConfig::default);
+    let Some(bar) = cfg.bars.last_mut() else {
+        return Err("bar: directive outside a bar block".to_string());
+    };
     match kw {
+        "id" => bar.id = args.to_string(),
+        "output" => bar.outputs.push(unquote(args)),
+        "mode" => {
+            bar.mode = match args {
+                "dock" => BarMode::Dock,
+                "hide" => BarMode::Hide,
+                "invisible" => BarMode::Invisible,
+                _ => return Err(format!("bar: invalid mode '{args}'")),
+            }
+        }
         "position" => {
             bar.position = match args {
                 "top" => BarPosition::Top,
@@ -733,7 +758,10 @@ fn bar_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
 }
 
 fn bar_color_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
-    let colors = &mut cfg.bar.get_or_insert_with(BarConfig::default).colors;
+    let Some(bar) = cfg.bars.last_mut() else {
+        return Err("bar colors: directive outside a bar block".to_string());
+    };
+    let colors = &mut bar.colors;
     let one = |args: &str| parse_colors(args, 1, 1).map(|v| v[0]);
     match kw {
         "background" => colors.background = one(args)?,
@@ -778,7 +806,10 @@ fn top_level(
             stack.push(Block::Mode(name));
         }
         "bar" if args == "{" => {
-            cfg.bar = Some(BarConfig::default());
+            cfg.bars.push(BarConfig {
+                id: format!("bar-{}", cfg.bars.len()),
+                ..BarConfig::default()
+            });
             stack.push(Block::Bar);
         }
         "font" => cfg.font = parse_font(args).map_err(|e| format!("{e}; keeping default"))?,
@@ -986,6 +1017,26 @@ mod tests {
     use crate::tree::Layout;
 
     #[test]
+    fn multiple_bars_ids_and_outputs() {
+        let c = parse_config(
+            "bar {
+status_command a
+}
+bar {
+id top
+position top
+output DISPLAY2
+output primary
+}
+",
+        );
+        assert_eq!(c.bars.len(), 2);
+        assert_eq!(c.bars[0].id, "bar-0");
+        assert_eq!(c.bars[1].id, "top");
+        assert_eq!(c.bars[1].outputs, vec!["DISPLAY2", "primary"]);
+    }
+
+    #[test]
     fn new_options_defaults() {
         let c = parse_config("");
         assert!(c.focus_follows_mouse);
@@ -1090,13 +1141,13 @@ mod tests {
             }
         );
         assert_eq!(c.default_border, Border::Normal(2));
-        assert!(c.bindings.contains_key("default") && c.bar.is_none());
+        assert!(c.bindings.contains_key("default") && c.bars.is_empty());
         assert_eq!(c.colors.focused.background, Color(0x28, 0x55, 0x77));
     }
     #[test]
     fn defaults_match_i3() {
         let c = parse_config("bar {\n}\n");
-        assert_eq!(c.bar.as_ref().unwrap().position, BarPosition::Bottom);
+        assert_eq!(c.bars[0].position, BarPosition::Bottom);
         assert_eq!(
             c.font,
             Font {
@@ -1170,7 +1221,7 @@ mod tests {
     #[test]
     fn bar_block() {
         let c = parse_config("bar {\n position bottom\n status_command i3win-status --x\n colors {\n background #111111\n focused_workspace #010203 #040506 #070809\n }\n}\n");
-        let b = c.bar.unwrap();
+        let b = &c.bars[0];
         assert_eq!(b.position, BarPosition::Bottom);
         assert_eq!(b.status_command.as_deref(), Some("i3win-status --x"));
         assert_eq!(b.colors.background, Color(0x11, 0x11, 0x11));
@@ -1276,10 +1327,7 @@ mod tests {
         let c = parse_config(&default_config_text(true));
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
         assert!(c.bindings["default"].len() >= 50 && c.bindings["resize"].len() == 11);
-        assert_eq!(
-            c.bar.unwrap().status_command.as_deref(),
-            Some("i3win-status")
-        );
+        assert_eq!(c.bars[0].status_command.as_deref(), Some("i3win-status"));
         assert!(default_config_text(false).contains("exec cmd"));
     }
 }

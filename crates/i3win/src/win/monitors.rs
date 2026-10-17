@@ -9,6 +9,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
+/// `MONITORINFO.dwFlags` bit marking the primary monitor.
+const MONITORINFOF_PRIMARY: u32 = 1;
+
 /// Strips the leading device-namespace prefix from a GDI device name (DISPLAY1 from the full path).
 pub fn output_name(device: &str) -> String {
     device.strip_prefix(r"\\.\").unwrap_or(device).to_string()
@@ -54,6 +57,7 @@ unsafe extern "system" fn enum_proc(
         name,
         rect: Rect::new(w.left, w.top, w.right - w.left, w.bottom - w.top),
         scale,
+        primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
     });
     TRUE
 }
@@ -92,11 +96,13 @@ mod tests {
                 name: "B".into(),
                 rect: Rect::new(1920, 0, 1920, 1040),
                 scale: 1.0,
+                primary: false,
             },
             OutputInfo {
                 name: "A".into(),
                 rect: Rect::new(0, 0, 1920, 1040),
                 scale: 1.0,
+                primary: false,
             },
         ];
         sort_outputs(&mut v);
@@ -109,11 +115,13 @@ mod tests {
                 name: "Lower".into(),
                 rect: Rect::new(0, 1080, 1920, 1040),
                 scale: 1.0,
+                primary: false,
             },
             OutputInfo {
                 name: "Upper".into(),
                 rect: Rect::new(0, 0, 1920, 1040),
                 scale: 1.0,
+                primary: false,
             },
         ];
         sort_outputs(&mut v);

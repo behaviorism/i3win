@@ -2,7 +2,7 @@
 //! plus the JSON replies and events built from the window manager state.
 
 use crate::arrange::Arrangement;
-use crate::config::{BarColorTriple, BarPosition, Color};
+use crate::config::{BarColorTriple, BarMode, BarPosition, Color};
 use crate::geom::{Orientation, Rect};
 use crate::tree::{NodeId, NodeKind, WindowId};
 use crate::wm::{CommandResult, IpcEvent, Wm};
@@ -330,51 +330,62 @@ fn color_str(c: Color) -> String {
 }
 
 pub fn bar_config_json(wm: &Wm, payload: &str) -> Value {
-    let Some(bar) = wm.config.bar.as_ref() else {
-        return if payload.trim().is_empty() {
-            json!([])
-        } else {
-            json!({"success": false, "error": "no such bar"})
-        };
-    };
-    match payload.trim() {
-        "" => json!(["bar-0"]),
-        "bar-0" => {
-            let font = bar.font.as_ref().unwrap_or(&wm.config.font);
-            let c = &bar.colors;
-            let mut colors = json!({
-                "background": color_str(c.background),
-                "statusline": color_str(c.statusline),
-                "separator": color_str(c.separator),
-            });
-            let triples: [(&str, &BarColorTriple); 5] = [
-                ("focused_workspace", &c.focused_workspace),
-                ("active_workspace", &c.active_workspace),
-                ("inactive_workspace", &c.inactive_workspace),
-                ("urgent_workspace", &c.urgent_workspace),
-                ("binding_mode", &c.binding_mode),
-            ];
-            for (prefix, t) in triples {
-                colors[format!("{prefix}_border")] = json!(color_str(t.border));
-                colors[format!("{prefix}_bg")] = json!(color_str(t.background));
-                colors[format!("{prefix}_text")] = json!(color_str(t.text));
-            }
-            let position = match bar.position {
-                BarPosition::Top => "top",
-                BarPosition::Bottom => "bottom",
-            };
-            json!({
-                "id": "bar-0",
-                "mode": "dock",
-                "position": position,
-                "status_command": bar.status_command,
-                "font": format!("pango:{} {}", font.family, font.size_pt),
-                "workspace_buttons": bar.workspace_buttons,
-                "colors": colors,
-            })
-        }
-        _ => json!({"success": false, "error": "no such bar"}),
+    let id = payload.trim();
+    if id.is_empty() {
+        return Value::Array(wm.config.bars.iter().map(|b| json!(b.id)).collect());
     }
+    let Some(bar) = wm.config.bars.iter().find(|b| b.id == id) else {
+        return json!({"success": false, "error": "No such bar"});
+    };
+    let font = bar.font.as_ref().unwrap_or(&wm.config.font);
+    let c = &bar.colors;
+    let mut colors = json!({
+        "background": color_str(c.background),
+        "statusline": color_str(c.statusline),
+        "separator": color_str(c.separator),
+        "focused_background": color_str(c.background),
+        "focused_statusline": color_str(c.statusline),
+        "focused_separator": color_str(c.separator),
+    });
+    let triples: [(&str, &BarColorTriple); 5] = [
+        ("focused_workspace", &c.focused_workspace),
+        ("active_workspace", &c.active_workspace),
+        ("inactive_workspace", &c.inactive_workspace),
+        ("urgent_workspace", &c.urgent_workspace),
+        ("binding_mode", &c.binding_mode),
+    ];
+    for (prefix, t) in triples {
+        colors[format!("{prefix}_border")] = json!(color_str(t.border));
+        colors[format!("{prefix}_bg")] = json!(color_str(t.background));
+        colors[format!("{prefix}_text")] = json!(color_str(t.text));
+    }
+    let position = match bar.position {
+        BarPosition::Top => "top",
+        BarPosition::Bottom => "bottom",
+    };
+    let mode = match bar.mode {
+        BarMode::Dock => "dock",
+        BarMode::Hide => "hide",
+        BarMode::Invisible => "invisible",
+    };
+    json!({
+        "id": bar.id,
+        "mode": mode,
+        "hidden_state": "hide",
+        "position": position,
+        "status_command": bar.status_command,
+        "font": format!("pango:{} {}", font.family, font.size_pt),
+        "workspace_buttons": bar.workspace_buttons,
+        "binding_mode_indicator": true,
+        "strip_workspace_numbers": false,
+        "strip_workspace_name": false,
+        "separator_symbol": null,
+        "verbose": false,
+        "modifier": "Mod4",
+        "outputs": bar.outputs,
+        "tray_output": null,
+        "colors": colors,
+    })
 }
 
 pub fn binding_modes_json(wm: &Wm) -> Value {
@@ -466,6 +477,37 @@ pub fn event_json(wm: &Wm, e: &IpcEvent) -> (u32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar_config_all_ids_and_shape() {
+        let wm = Wm::new(
+            crate::config::parse_config(
+                "bar {
+}
+bar {
+id b2
+}
+",
+            ),
+            vec![crate::testutil::out("O1", 0, 1000)],
+        );
+        assert_eq!(bar_config_json(&wm, ""), json!(["bar-0", "b2"]));
+        let v = bar_config_json(&wm, "b2");
+        for k in [
+            "id",
+            "mode",
+            "hidden_state",
+            "position",
+            "workspace_buttons",
+            "binding_mode_indicator",
+            "modifier",
+            "colors",
+        ] {
+            assert!(v.get(k).is_some(), "missing {k}");
+        }
+        assert_eq!(v["position"], "bottom");
+        assert_eq!(bar_config_json(&wm, "nope")["success"], false);
+    }
 
     #[test]
     fn encode_layout() {
@@ -717,7 +759,7 @@ mod reply_tests {
         assert!(b["colors"]["background"].as_str().unwrap().starts_with('#'));
         assert_eq!(
             reply(&mut wm, GET_BAR_CONFIG, "nope")["error"],
-            "no such bar"
+            "No such bar"
         );
     }
 }

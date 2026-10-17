@@ -8,6 +8,7 @@ pub fn out(name: &str, x: i32, w: i32) -> OutputInfo {
         name: name.into(),
         rect: Rect::new(x, 0, w, 500),
         scale: 1.0,
+        primary: false,
     }
 }
 

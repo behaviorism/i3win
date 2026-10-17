@@ -476,6 +476,7 @@ impl Wm {
                         name: o.name,
                         rect: o.rect,
                         scale: o.scale,
+                        primary: o.primary,
                     };
                 }
                 None => {
@@ -485,6 +486,7 @@ impl Wm {
                             name: o.name.clone(),
                             rect: o.rect,
                             scale: o.scale,
+                            primary: o.primary,
                         },
                         Layout::SplitH,
                     );

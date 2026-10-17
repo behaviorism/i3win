@@ -4,7 +4,7 @@
 //! stored in `GWLP_USERDATA` and only posts `MainMsg`s on clicks and wheel turns.
 use std::collections::{HashMap, HashSet};
 
-use i3win_core::arrange::{bar_height, Arrangement};
+use i3win_core::arrange::{bar_applies, bar_height_of, Arrangement};
 use i3win_core::bar_model::workspace_buttons;
 use i3win_core::config::{BarPosition, Color, Font};
 use i3win_core::geom::Rect;
@@ -158,7 +158,7 @@ impl Bars {
 
     /// Brings the bar windows in line with the config, outputs and `blocks`.
     pub fn update(&mut self, wm: &Wm, arr: &Arrangement, blocks: &[Block]) {
-        let Some(bar) = wm.config.bar.as_ref() else {
+        let Some(bar) = wm.config.bars.first() else {
             self.destroy_all();
             return;
         };
@@ -166,13 +166,20 @@ impl Bars {
         let mode = (wm.mode != "default").then_some(wm.mode.as_str());
         let mut live: HashSet<String> = HashSet::new();
         for out in wm.outputs() {
-            let NodeKind::Output { name, rect, scale } = &wm.tree.get(out).kind else {
+            let NodeKind::Output {
+                name,
+                rect,
+                scale,
+                primary,
+            } = &wm.tree.get(out).kind
+            else {
                 continue;
             };
+            if !bar_applies(bar, name, *primary) {
+                continue;
+            }
             let (scale, o) = (*scale, *rect);
-            let Some(h) = bar_height(&wm.config, scale) else {
-                continue;
-            };
+            let h = bar_height_of(bar, &wm.config, scale);
             live.insert(name.clone());
             let r = bar_rect(o, bar.position, h);
             let buttons = workspace_buttons(wm, out);

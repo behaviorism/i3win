@@ -69,6 +69,7 @@ pub enum NodeKind {
         name: String,
         rect: Rect,
         scale: f32,
+        primary: bool,
     },
     Workspace {
         name: String,
@@ -480,6 +481,7 @@ mod tests {
                 name: "O".into(),
                 rect: Rect::new(0, 0, 1000, 500),
                 scale: 1.0,
+                primary: false,
             },
             Layout::SplitH,
         );

@@ -1,5 +1,6 @@
 use crate::config::{
-    BarPosition, Border, Config, Font, Gaps, HideEdgeBorders, SmartBorders, SmartGaps,
+    BarConfig, BarMode, BarPosition, Border, Config, Font, Gaps, HideEdgeBorders, SmartBorders,
+    SmartGaps,
 };
 use crate::geom::Rect;
 use crate::title::format_title;
@@ -77,15 +78,47 @@ pub fn title_height(font: &Font, scale: f32) -> i32 {
     scaled(font.size_pt * 96.0 / 72.0, scale) + scaled(8.0, scale)
 }
 
-pub fn bar_height(config: &Config, scale: f32) -> Option<i32> {
-    let bar = config.bar.as_ref()?;
-    Some(match bar.height {
+pub fn bar_height_of(bar: &BarConfig, config: &Config, scale: f32) -> i32 {
+    match bar.height {
         Some(h) => scaled(h as f32, scale),
         None => {
             let font = bar.font.as_ref().unwrap_or(&config.font);
             title_height(font, scale) + scaled(2.0, scale)
         }
-    })
+    }
+}
+
+/// Whether `bar` is shown on the output (`primary` / `nonprimary` are
+/// special `output` values; no `output` lines means all outputs).
+pub fn bar_applies(bar: &BarConfig, output_name: &str, primary: bool) -> bool {
+    bar.outputs.is_empty()
+        || bar.outputs.iter().any(|o| match o.as_str() {
+            "primary" => primary,
+            "nonprimary" => !primary,
+            n => n == output_name,
+        })
+}
+
+/// Pixels `(top, bottom)` reserved by the Dock-mode bars shown on an output.
+pub fn reserved_bar_space(
+    config: &Config,
+    output_name: &str,
+    primary: bool,
+    scale: f32,
+) -> (i32, i32) {
+    let (mut top, mut bottom) = (0, 0);
+    for bar in config
+        .bars
+        .iter()
+        .filter(|b| b.mode == BarMode::Dock && bar_applies(b, output_name, primary))
+    {
+        let h = bar_height_of(bar, config, scale);
+        match bar.position {
+            BarPosition::Top => top += h,
+            BarPosition::Bottom => bottom += h,
+        }
+    }
+    (top, bottom)
 }
 
 /// Which border lines the current workspace hides on tiled windows.
@@ -352,7 +385,13 @@ pub fn arrange(tree: &Tree, config: &Config, focused: NodeId, machine: &str) -> 
     };
     for &o in &tree.get(tree.root()).children {
         let on = tree.get(o);
-        let NodeKind::Output { name, rect, scale } = &on.kind else {
+        let NodeKind::Output {
+            name,
+            rect,
+            scale,
+            primary,
+        } = &on.kind
+        else {
             continue;
         };
         if name == crate::wm::SCRATCH_OUTPUT {
@@ -362,7 +401,7 @@ pub fn arrange(tree: &Tree, config: &Config, focused: NodeId, machine: &str) -> 
         let visible = on.focus.first().copied();
         for &ws in &on.children {
             if Some(ws) == visible {
-                arrange_workspace(&mut ctx, config, ws, name, *rect, *scale);
+                arrange_workspace(&mut ctx, config, ws, name, *primary, *rect, *scale);
             } else {
                 ctx.hide_under(ws);
             }
@@ -376,6 +415,7 @@ fn arrange_workspace(
     config: &Config,
     ws: NodeId,
     out_name: &str,
+    primary: bool,
     out_rect: Rect,
     scale: f32,
 ) {
@@ -440,14 +480,8 @@ fn arrange_workspace(
     }
 
     let mut area = out_rect;
-    if let Some(bh) = bar_height(config, scale) {
-        let top = config.bar.as_ref().map(|b| b.position) == Some(BarPosition::Top);
-        area = if top {
-            area.inset(0, bh, 0, 0)
-        } else {
-            area.inset(0, 0, 0, bh)
-        };
-    }
+    let (bar_top, bar_bottom) = reserved_bar_space(config, out_name, primary, scale);
+    area = area.inset(0, bar_top, 0, bar_bottom);
     let lead = |outer: i32| px(outer) + g - g / 2;
     let trail = |outer: i32| px(outer) + g / 2;
     let inset = area.inset(
@@ -654,7 +688,7 @@ mod tests {
         let mut cfg = crate::config::parse_config(
             "gaps top 20\ngaps left 10\nworkspace 2 gaps top 0\ndefault_border none\n",
         );
-        cfg.bar = None;
+        cfg.bars.clear();
         let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
         wm.manage(win(1));
         let r = wm.arrange().windows[0].rect;
@@ -671,18 +705,61 @@ mod tests {
         assert_eq!((r2.x, r2.y), (10, 0));
     }
     #[test]
+    fn reserved_space_stacks_and_filters() {
+        let mut c = parse_config(
+            "bar {
+}
+bar {
+}
+bar {
+position top
+output B
+}
+",
+        );
+        c.font = Font {
+            family: "x".into(),
+            size_pt: 9.0,
+        };
+        let h = bar_height_of(&c.bars[0], &c, 1.0);
+        assert_eq!(reserved_bar_space(&c, "A", false, 1.0), (0, 2 * h));
+        assert_eq!(reserved_bar_space(&c, "B", false, 1.0), (h, 2 * h));
+        assert!(bar_applies(
+            &parse_config(
+                "bar {
+output primary
+}
+"
+            )
+            .bars[0],
+            "X",
+            true
+        ));
+        assert!(!bar_applies(
+            &parse_config(
+                "bar {
+output nonprimary
+}
+"
+            )
+            .bars[0],
+            "X",
+            true
+        ));
+    }
+    #[test]
     fn bar_reserves_space() {
         let mut wm = test_wm();
-        wm.config.bar = Some(BarConfig::default());
+        wm.config.bars = vec![BarConfig::default()];
         wm.config.default_border = Border::None;
         wm.manage(win(1));
-        assert_eq!(bar_height(&wm.config, 1.0), Some(22));
+        assert_eq!(bar_height_of(&wm.config.bars[0], &wm.config, 1.0), 22);
         assert_eq!(placement(&wm.arrange(), 1), Rect::new(0, 0, 1000, 478));
     }
     #[test]
     fn fullscreen_covers_output_and_hides_rest() {
         let mut wm = test_wm();
-        wm.config.bar = Some(BarConfig::default());
+        wm.config.bars = vec![BarConfig::default()];
         wm.manage(win(1));
         wm.manage(win(2));
         wm.run_command("fullscreen enable");
@@ -824,7 +901,7 @@ mod tests {
 default_border pixel 2
 ",
         );
-        cfg.bar = None;
+        cfg.bars.clear();
         let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
         wm.manage(win(1));
         wm.manage(win(2));
@@ -841,7 +918,7 @@ default_border pixel 2
             "smart_borders on
 ",
         );
-        cfg.bar = None;
+        cfg.bars.clear();
         let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
         wm.manage(win(1));
         let Deco::Frame { borders, .. } = &wm.arrange().decos[0] else {
@@ -869,7 +946,7 @@ smart_gaps on
 default_border none
 ",
         );
-        cfg.bar = None;
+        cfg.bars.clear();
         let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
         wm.manage(win(1));
         assert_eq!(wm.arrange().windows[0].rect, Rect::new(0, 0, 1000, 500));
@@ -909,7 +986,7 @@ default_border none
 default_border normal 2
 ",
         );
-        cfg.bar = None;
+        cfg.bars.clear();
         cfg.font.size_pt = 9.0;
         let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
         wm.manage(win(1));
