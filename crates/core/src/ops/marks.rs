@@ -134,6 +134,15 @@ impl Wm {
                 _ => self.tree.attach(dest_ws, target, None),
             }
         }
+        if dest_ws == self.scratch {
+            for n in self.tree.windows_under(target) {
+                if self.tree.get(n).scratchpad == crate::tree::ScratchState::None {
+                    self.tree.get_mut(n).scratchpad = crate::tree::ScratchState::Fresh;
+                }
+                self.scratch_order.retain(|&x| x != n);
+                self.scratch_order.push(n);
+            }
+        }
         let f = self.tree.focused_descendant(target);
         self.tree.set_focused_within(f, dest_ws);
         // Focus stays on what was focused before, unless the focused window
@@ -194,6 +203,7 @@ impl Wm {
             return Err("Cannot swap a container with its ancestor".into());
         }
         let focused = self.focused();
+        let focused_ws = self.focused_workspace();
         self.tree.swap(target, other);
         if self.tree.is_floating(target) {
             let ra = self.floating_rect_of(target);
@@ -203,7 +213,12 @@ impl Wm {
         }
         // Focus stays on the same window, which may now sit elsewhere.
         if self.tree.contains(focused) && self.focused_container.is_none() {
-            self.tree.set_focused(focused);
+            if self.tree.workspace_of(focused) == Some(self.scratch) {
+                let f = self.tree.focused_descendant(focused_ws);
+                self.tree.set_focused(f);
+            } else {
+                self.tree.set_focused(focused);
+            }
         }
         for n in [target, other] {
             self.emit_node("move", n);

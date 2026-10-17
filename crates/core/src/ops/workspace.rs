@@ -78,7 +78,11 @@ impl Wm {
 
     /// Removes `ws` if it is empty and not visible; emits the "empty" event.
     pub(crate) fn remove_if_empty_hidden(&mut self, ws: NodeId) {
-        if self.tree.contains(ws) && self.is_workspace_empty(ws) && !self.is_visible(ws) {
+        if self.tree.contains(ws)
+            && ws != self.scratch
+            && self.is_workspace_empty(ws)
+            && !self.is_visible(ws)
+        {
             let name = self.workspace_name(ws).to_string();
             self.tree.remove(ws);
             self.emit(IpcEvent::Workspace {

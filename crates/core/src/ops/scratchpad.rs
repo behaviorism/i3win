@@ -1,4 +1,4 @@
-use crate::geom::sanitize_floating;
+use crate::geom::{sanitize_floating, Rect};
 use crate::tree::{NodeId, NodeKind, ScratchState};
 use crate::wm::{IpcEvent, Wm};
 
@@ -98,7 +98,9 @@ impl Wm {
             let fallback = d.info.rect;
             let r = sanitize_floating(d.floating_rect.unwrap_or(fallback));
             d.floating_rect = Some(match out_rect {
-                Some(o) if state == ScratchState::Fresh => r.centered_in(&o),
+                Some(o) if state == ScratchState::Fresh => {
+                    Rect::new(0, 0, o.w / 2, o.h * 3 / 4).centered_in(&o)
+                }
                 _ => r,
             });
         }
@@ -140,6 +142,21 @@ impl Wm {
         if let Some(v) = visible {
             self.focused_container = None;
             self.tree.set_focused(v);
+            return Ok(());
+        }
+        // A scratchpad window visible on another output: bring it here.
+        let elsewhere = self
+            .outputs()
+            .into_iter()
+            .map(|o| self.visible_workspace(o))
+            .filter(|&w| w != focused_ws)
+            .find_map(|w| {
+                self.tree.get(w).focus.iter().copied().find(|&c| {
+                    self.scratch_state(c) != ScratchState::None && self.tree.is_floating(c)
+                })
+            });
+        if let Some(n) = elsewhere {
+            self.show_scratch_window(n);
             return Ok(());
         }
         self.scratch_order.retain(|&x| self.tree.contains(x));
@@ -268,7 +285,7 @@ mod tests {
         };
         assert_eq!(
             rect(&wm),
-            Rect::new(0, 0, 400, 300).centered_in(&Rect::new(0, 0, 1000, 500))
+            Rect::new(0, 0, 500, 375).centered_in(&Rect::new(0, 0, 1000, 500))
         );
         wm.on_floating_moved(WindowId(1), Rect::new(10, 20, 400, 300));
         wm.run_command("scratchpad show");
@@ -300,5 +317,69 @@ mod tests {
         assert_eq!(wm.focused_window(), Some(WindowId(1)));
         wm.unmanage(WindowId(2));
         assert!(!wm.run_command("scratchpad show")[0].success);
+    }
+    #[test]
+    fn scratch_workspace_is_never_visible_or_focused_via_marks_and_swap() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.manage(win(3));
+        wm.run_command("[id=3] move scratchpad");
+        wm.run_command("[id=3] mark sp");
+        let real = wm.focused_output();
+        assert!(!wm.is_visible(wm.scratch_workspace()));
+        wm.run_command("[id=1] move to mark sp");
+        assert_eq!(wm.focused_output(), real);
+        assert_eq!(wm.focused_window(), Some(WindowId(2)));
+        wm.run_command("[id=2] swap container with mark sp");
+        assert_eq!(wm.focused_output(), real);
+        assert_ne!(wm.workspace_name(wm.focused_workspace()), "__i3_scratch");
+        wm.manage(win(4));
+        assert_eq!(
+            wm.tree
+                .workspace_of(wm.tree.window_node(WindowId(4)).unwrap()),
+            Some(wm.focused_workspace())
+        );
+        check_invariants(&wm);
+    }
+    #[test]
+    fn floating_disable_refused_on_hidden_scratch_window() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("move scratchpad");
+        let r = wm.run_command("[id=1] floating disable");
+        assert!(!r[0].success);
+        assert!(!wm.run_command("[id=1] floating toggle")[0].success);
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        assert_eq!(wm.tree.workspace_of(n), Some(wm.scratch_workspace()));
+        assert!(wm.tree.is_floating(n));
+        assert!(wm.run_command("scratchpad show")[0].success);
+    }
+    #[test]
+    fn scratchpad_show_visible_on_other_output_moves_here() {
+        let mut wm = crate::wm::Wm::new(
+            crate::config::Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        );
+        wm.manage(win(1));
+        wm.run_command("move scratchpad");
+        wm.run_command("scratchpad show");
+        wm.run_command("focus output B");
+        wm.run_command("scratchpad show");
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        assert_eq!(wm.tree.workspace_of(n), Some(wm.focused_workspace()));
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+    }
+    #[test]
+    fn reserved_workspace_names_rejected() {
+        let mut wm = test_wm();
+        assert!(!wm.run_command("workspace __foo")[0].success);
+        wm.manage(win(1));
+        assert!(!wm.run_command("move to workspace __i3_scratch")[0].success);
+        let c = crate::config::parse_config(
+            "workspace __x output A
+",
+        );
+        assert_eq!(c.warnings.len(), 1);
     }
 }

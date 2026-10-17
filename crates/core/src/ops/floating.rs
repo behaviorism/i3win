@@ -23,6 +23,13 @@ impl Wm {
         };
         let floating = self.tree.is_floating(target);
         let enable = want(t, floating);
+        if ws == self.scratch {
+            return if enable {
+                Ok(())
+            } else {
+                Err("Can't disable floating for container in internal workspace".into())
+            };
+        }
         if enable == floating {
             return Ok(());
         }

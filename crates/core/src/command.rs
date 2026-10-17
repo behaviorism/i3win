@@ -305,6 +305,9 @@ fn parse_workspace_target(args: &[Tok]) -> Result<WorkspaceTarget, String> {
     if name.is_empty() {
         return Err("missing workspace".into());
     }
+    if name.starts_with("__") {
+        return Err("Workspace names starting with __ are reserved".into());
+    }
     Ok(WorkspaceTarget::Name(name))
 }
 

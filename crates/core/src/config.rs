@@ -844,6 +844,9 @@ fn top_level(
                 .filter(|i| *i >= 1 && *i + 1 < toks.len())
                 .ok_or_else(|| "workspace: expected NAME output OUTPUT...".to_string())?;
             let name = unquote(&toks[..i].join(" "));
+            if name.starts_with("__") {
+                return Err("Workspace names starting with __ are reserved".into());
+            }
             let outs = toks[i + 1..].iter().map(|o| unquote(o)).collect();
             cfg.workspace_outputs.push((name, outs));
         }

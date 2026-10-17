@@ -242,7 +242,7 @@ impl Wm {
 
     pub fn is_visible(&self, ws: NodeId) -> bool {
         match self.tree.output_of(ws) {
-            Some(o) => self.tree.get(o).focus.first() == Some(&ws),
+            Some(o) => ws != self.scratch && self.tree.get(o).focus.first() == Some(&ws),
             None => false,
         }
     }
@@ -454,7 +454,11 @@ impl Wm {
         }
         if let Some(ws) = ws {
             let n = self.tree.get(ws);
-            if n.children.is_empty() && n.floating.is_empty() && !self.is_visible(ws) {
+            if ws != self.scratch
+                && n.children.is_empty()
+                && n.floating.is_empty()
+                && !self.is_visible(ws)
+            {
                 let name = self.workspace_name(ws).to_string();
                 self.tree.remove(ws);
                 self.emit(IpcEvent::Workspace {
