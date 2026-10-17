@@ -42,12 +42,21 @@ fn text_of(props: &Props, key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Link speed as "N Mbit/s"; 0 and `u64::MAX` (what Windows reports when it
+/// does not know) are "?".
+fn speed_text(bps: u64) -> String {
+    match bps {
+        0 | u64::MAX => "?".to_string(),
+        n => format!("{} Mbit/s", n / 1_000_000),
+    }
+}
+
 pub fn ethernet_text(a: Option<&Adapter>, props: &Props) -> (String, Level) {
     match a.filter(|a| a.up) {
         Some(a) => {
             let vars = [
                 ("ip", a.ipv4.clone().unwrap_or_else(|| "no IP".to_string())),
-                ("speed", format!("{} Mbit/s", a.speed_bps / 1_000_000)),
+                ("speed", speed_text(a.speed_bps)),
             ];
             (
                 substitute(&text_of(props, "format_up", "E: %ip (%speed)"), &vars),
@@ -73,12 +82,17 @@ pub fn wireless_text(
                     "quality",
                     quality.map(|q| format!("{q}%")).unwrap_or_default(),
                 ),
+                ("speed", speed_text(a.speed_bps)),
             ];
+            // Without WLAN info the default's "(%quality at %essid)" would
+            // render as "( at )".
+            let default = if essid.is_some() {
+                "W: (%quality at %essid) %ip"
+            } else {
+                "W: %ip"
+            };
             (
-                substitute(
-                    &text_of(props, "format_up", "W: (%quality at %essid) %ip"),
-                    &vars,
-                ),
+                substitute(&text_of(props, "format_up", default), &vars),
                 Level::Good,
             )
         }

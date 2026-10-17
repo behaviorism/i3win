@@ -9,8 +9,9 @@ pub enum Format {
 }
 
 /// First non-comment, non-blank line: `[section]`, or a `key=value` whose key
-/// is a bare identifier (no whitespace, no `+`) and with no `{`, means
-/// i3blocks; anything else (`general {`, `order += "x"`) is i3status.
+/// is a bare identifier (letters, digits, `_`, `-`, `.`; the value may hold
+/// anything, `{` included), means i3blocks; anything else (`general {`,
+/// `order += "x"`) is i3status.
 pub fn detect_format(text: &str) -> Format {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for raw in text.lines() {
@@ -23,8 +24,11 @@ pub fn detect_format(text: &str) -> Format {
         }
         if let Some((key, _)) = line.split_once('=') {
             let key = key.trim();
-            let bare = !key.is_empty() && !key.contains(|c: char| c.is_whitespace() || c == '+');
-            if bare && !line.contains('{') {
+            let bare = !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'));
+            if bare {
                 return Format::I3Blocks;
             }
         }
@@ -164,6 +168,17 @@ mod tests {
             discover(None, Some("E"), home, &only("E")),
             (PathBuf::from("E"), Some(Format::I3Blocks))
         );
+    }
+
+    #[test]
+    fn detect_braces_in_value_is_i3blocks() {
+        assert_eq!(
+            detect_format("command=awk '{print $1}'\n[a]\n"),
+            Format::I3Blocks
+        );
+        assert_eq!(detect_format("general {\n}\n"), Format::I3Status);
+        assert_eq!(detect_format("general {x=1\n}\n"), Format::I3Status);
+        assert_eq!(detect_format("cpu_usage{format=x}\n"), Format::I3Status);
     }
 
     #[test]

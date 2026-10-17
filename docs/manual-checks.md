@@ -89,3 +89,4 @@ Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 e
 5. A block with `command=exit 2` shows the urgent `Error: Command 'exit 2' exited unexpectedly with code 2`.
 6. With only an `i3status.conf` present, changes to `order` and `format` apply after an i3win reload.
 7. Delete both `i3blocks.conf` and `i3status.conf`, reload -> i3win-status recreates `i3status.conf` with the default modules.
+8. Known pitfall: `shell=bash` may resolve to WSL's `bash.exe` (`C:\Windows\System32\bash.exe`) rather than Git Bash; to use Git Bash give a full path, e.g. `shell=C:\Program Files\Git\bin\bash.exe`. A full path to cmd (`shell=C:\Windows\System32\cmd.exe`) counts as the default cmd shell, with `$VAR` expansion.

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use i3win_core::i3bar::{Block, Click, ClickWriter, StatusParser};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -74,6 +75,34 @@ fn read_line_capped<R: BufRead>(
     }
 }
 
+/// One status line as text: UTF-8 when valid, else (plain-text status
+/// commands printing in the console code page) decoded by `fallback`. When
+/// the line was `capped`, a UTF-8 character cut off at the end is dropped.
+fn decode_line(bytes: &[u8], capped: bool, fallback: impl Fn(&[u8]) -> String) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(e) if capped && e.error_len().is_none() => {
+            String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned()
+        }
+        Err(_) => fallback(bytes),
+    }
+}
+
+/// `bytes` decoded from the OEM code page (lossy UTF-8 if that fails).
+fn oem_decode(bytes: &[u8]) -> String {
+    let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0);
+    // SAFETY: the slices are valid for the duration of each call.
+    unsafe {
+        let n = MultiByteToWideChar(CP_OEMCP, flags, bytes, None);
+        if n <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; n as usize];
+        let n = MultiByteToWideChar(CP_OEMCP, flags, bytes, Some(&mut wide));
+        String::from_utf16_lossy(&wide[..n.max(0) as usize])
+    }
+}
+
 /// The block shown when the status command is gone or could not start.
 pub fn exit_block() -> Block {
     Block {
@@ -131,8 +160,12 @@ impl StatusProcess {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
-                    let line = String::from_utf8_lossy(&buf);
-                    let line = line.trim_end_matches(['\r', '\n']);
+                    let capped = buf.len() >= MAX_LINE;
+                    while matches!(buf.last(), Some(b'\r' | b'\n')) {
+                        buf.pop();
+                    }
+                    let line = decode_line(&buf, capped, oem_decode);
+                    let line = line.as_str();
                     let blocks = parser.feed_line(line);
                     flag.store(parser.click_events, Ordering::SeqCst);
                     if let Some(b) = blocks {
@@ -226,6 +259,15 @@ fn make_job(child: &Child) -> Option<HANDLE> {
 mod tests {
     use super::*;
     use crate::mainloop::{drain_main_msgs, MainMsg};
+
+    #[test]
+    fn status_lines_decode_utf8_or_oem() {
+        let fake = |b: &[u8]| format!("oem:{}", b.len());
+        assert_eq!(decode_line("\u{e9}t".as_bytes(), false, fake), "\u{e9}t");
+        assert_eq!(decode_line(b"\x82t\x82", false, fake), "oem:3");
+        assert_eq!(decode_line(b"ab\xc3", true, fake), "ab");
+        assert!(!oem_decode(b"\x82t\x82").contains('\u{fffd}'));
+    }
 
     #[test]
     fn exit_block_text() {

@@ -259,13 +259,24 @@ Check 'exit: no status process' ((StatusCount) -eq 0)
 $statusExe = "$root\target\debug\i3win-status.exe"
 $blocksConf = "$scratch\i3win-live-i3blocks.conf"
 [IO.File]::WriteAllText($blocksConf, "[t]`ncommand=echo hi`ninterval=1`n")
-$sp = Start-Process $statusExe -ArgumentList '-c', $blocksConf -PassThru -WindowStyle Hidden -RedirectStandardOutput "$scratch\i3win-live-status.out"
+# i3win-status quits on stdin EOF, so give it its own stdin pipe and keep it
+# open until the end (independent of this script's own stdin).
+$psi = New-Object System.Diagnostics.ProcessStartInfo $statusExe
+$psi.Arguments = "-c `"$blocksConf`""
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$sp = [System.Diagnostics.Process]::Start($psi)
+$readTask = $sp.StandardOutput.ReadToEndAsync()
 Start-Sleep -Milliseconds 2500
+Check 'status: still running with stdin open' (-not $sp.HasExited)
 Stop-Process -Id $sp.Id -Force -ErrorAction SilentlyContinue
-$sout = Get-Content "$scratch\i3win-live-status.out" -Raw -ErrorAction SilentlyContinue
+$sout = if ($readTask.Wait(3000)) { $readTask.Result } else { '' }
+$sp.StandardInput.Close()
 Check 'status: i3bar header' ($sout -like '*{"version":1,"click_events":true}*')
 Check 'status: command block output' ($sout -like '*"full_text":"hi"*')
-Remove-Item $blocksConf, "$scratch\i3win-live-status.out" -ErrorAction SilentlyContinue
+Remove-Item $blocksConf -ErrorAction SilentlyContinue
 
 # ---- cleanup
 $np | Stop-Process -Force -ErrorAction SilentlyContinue

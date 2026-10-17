@@ -9,7 +9,9 @@ pub mod net;
 pub mod time;
 pub mod volume;
 
+use crate::command_block::{apply_section_props, cap_text};
 use crate::format::{colors_from, make_block, Level};
+use crate::i3blocks_conf::Section;
 use crate::i3status_conf::{get, ModuleRef, Props, Value};
 use i3win_core::i3bar::Block;
 
@@ -119,11 +121,38 @@ impl Module for Builtin {
         make_block(
             &self.name,
             self.instance.as_deref(),
-            text,
+            cap_text(&text),
             level,
             &colors,
             &self.props,
         )
+    }
+}
+
+/// A built-in module from an i3blocks.conf section: the section's i3blocks
+/// block properties (`label`, `color`, borders, ...) apply on top.
+pub struct SectionModule {
+    pub inner: Box<dyn Module>,
+    pub section: Section,
+}
+
+impl Module for SectionModule {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn instance(&self) -> Option<&str> {
+        self.inner.instance()
+    }
+
+    fn interval(&self) -> Option<f64> {
+        self.inner.interval()
+    }
+
+    fn render(&mut self) -> Block {
+        let mut b = self.inner.render();
+        apply_section_props(&mut b, &self.section);
+        b
     }
 }
 
@@ -354,6 +383,77 @@ world"
     }
 
     #[test]
+    fn disk_threshold_types_follow_i3status() {
+        let g = 1u64 << 30;
+        let lvl =
+            |free: u64, avail: u64, kv: &[(&str, &str)]| disk_text(100 * g, free, avail, &p(kv)).1;
+        // gbytes_avail: GiB of caller-available space.
+        let t = [("low_threshold", "5"), ("threshold_type", "gbytes_avail")];
+        assert_eq!(lvl(50 * g, 4 * g, &t), Level::Bad);
+        assert_eq!(lvl(4 * g, 6 * g, &t), Level::Normal);
+        // decimal prefix: 5 GB = 5e9 bytes; 4.9 GiB is about 5.26e9.
+        let t = [
+            ("low_threshold", "5"),
+            ("threshold_type", "GBYTES_avail"),
+            ("prefix_type", "decimal"),
+        ];
+        assert_eq!(lvl(0, 49 * g / 10, &t), Level::Normal);
+        // bytes_free: plain bytes.
+        let t = [("low_threshold", "1000"), ("threshold_type", "bytes_free")];
+        assert_eq!(lvl(999, 50 * g, &t), Level::Bad);
+        assert_eq!(lvl(1000, 0, &t), Level::Normal);
+        let t = [("low_threshold", "2048"), ("threshold_type", "kbytes_free")];
+        assert_eq!(lvl(g, 0, &t), Level::Normal); // 1 GiB = 1048576 KiB
+        assert_eq!(lvl(1024 * 1024, 0, &t), Level::Bad); // 1024 KiB
+        let t = [
+            ("low_threshold", "50"),
+            ("threshold_type", "percentage_free"),
+        ];
+        assert_eq!(lvl(40 * g, 60 * g, &t), Level::Bad);
+        let t = [("low_threshold", "50"), ("threshold_type", "nonsense")];
+        assert_eq!(lvl(0, 0, &t), Level::Normal);
+    }
+
+    #[test]
+    fn wireless_without_wlan_info_and_unknown_speed() {
+        let mut a = ad("Wi-Fi", true, true, Some("192.168.1.5"));
+        assert_eq!(
+            wireless_text(Some(&a), None, None, &p(&[])),
+            ("W: 192.168.1.5".into(), Level::Good)
+        );
+        assert_eq!(
+            wireless_text(
+                Some(&a),
+                None,
+                None,
+                &p(&[("format_up", "%essid|%quality|%ip")])
+            )
+            .0,
+            "||192.168.1.5"
+        );
+        assert_eq!(
+            wireless_text(
+                Some(&a),
+                Some("home"),
+                Some(5),
+                &p(&[("format_up", "%speed")])
+            )
+            .0,
+            "1000 Mbit/s"
+        );
+        for unknown in [0, u64::MAX] {
+            a.speed_bps = unknown;
+            assert_eq!(
+                wireless_text(Some(&a), Some("h"), Some(1), &p(&[("format_up", "%speed")])).0,
+                "?"
+            );
+            let mut e = ad("Ethernet", true, false, Some("10.0.0.2"));
+            e.speed_bps = unknown;
+            assert_eq!(ethernet_text(Some(&e), &p(&[])).0, "E: 10.0.0.2 (?)");
+        }
+    }
+
+    #[test]
     fn battery_down_and_states() {
         assert_eq!(battery_text(None, &p(&[])).0, "No battery");
         assert_eq!(battery_text(None, &p(&[("format_down", "")])).0, "");
@@ -407,6 +507,37 @@ world"
         let b = m.render();
         assert_eq!(b.full_text, "unsupported: load");
         assert_eq!(b.color.as_deref(), Some("#FF0000"));
+    }
+
+    #[test]
+    fn section_module_applies_i3blocks_props() {
+        let section = Section {
+            name: "cpu_usage".into(),
+            props: vec![
+                ("label".into(), "CPU: ".into()),
+                ("format".into(), "%usage".into()),
+                ("background".into(), "#000000".into()),
+            ],
+        };
+        let props: Props = section
+            .props
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::Str(v.clone())))
+            .collect();
+        let inner = build_module(
+            &ModuleRef {
+                module: "cpu_usage".into(),
+                instance: None,
+            },
+            &props,
+            &props,
+        );
+        let mut m = SectionModule { inner, section };
+        let b = m.render();
+        assert!(b.full_text.starts_with("CPU: "), "{}", b.full_text);
+        assert!(b.full_text.ends_with('%'), "{}", b.full_text);
+        assert_eq!(b.background.as_deref(), Some("#000000"));
+        assert_eq!(b.name.as_deref(), Some("cpu_usage"));
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub(crate) enum Event {
     Output(usize, u64, String),
     /// (slot, run, exit code)
     Exited(usize, u64, i32),
+    /// (slot, run): the command could not be started.
+    SpawnFailed(usize, u64),
     Click(Click),
     /// stdin closed: the bar went away.
     Quit,
@@ -53,19 +55,27 @@ struct Args {
 }
 
 /// `-c PATH`, `--signal N`, `--refresh-all`; other arguments are ignored.
-fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
+/// `--signal` without a valid number is an error.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut a = Args::default();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         if arg == "-c" {
             a.config = it.next().map(PathBuf::from);
         } else if arg == "--signal" {
-            a.signal = it.next().and_then(|n| n.parse().ok());
+            let n = it
+                .next()
+                .ok_or_else(|| "--signal needs a signal number".to_string())?;
+            let sig = n
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("--signal: invalid signal number `{n}`"))?;
+            a.signal = Some(sig);
         } else if arg == "--refresh-all" {
             a.refresh_all = true;
         }
     }
-    a
+    Ok(a)
 }
 
 #[derive(Debug, PartialEq)]
@@ -191,7 +201,8 @@ fn setup_i3blocks(text: &str) -> Setup {
             SectionKind::Command => Slot::Command(CommandSlot::from_section(s)),
             SectionKind::Module(m) => {
                 let props = section_props(&s);
-                Slot::Module(mods::build_module(&m, &props, &props))
+                let inner = mods::build_module(&m, &props, &props);
+                Slot::Module(Box::new(mods::SectionModule { inner, section: s }))
             }
             SectionKind::Static => Slot::Static(command_block::static_block(&s)),
         });
@@ -375,8 +386,7 @@ impl Runner {
             }
             Err(e) => {
                 eprintln!("i3win-status: cannot start `{prog}`: {e}");
-                // What sh reports for a command it cannot find.
-                let _ = self.tx.send(Event::Exited(i, run, 127));
+                let _ = self.tx.send(Event::SpawnFailed(i, run));
             }
         }
     }
@@ -413,7 +423,10 @@ impl Runner {
         }
     }
 
-    fn exited(&mut self, i: usize, run: u64, code: i32) {
+    /// A run ended with `code`; `spawn_failed` when it never started (shown
+    /// as code 127, what sh reports for a missing command, and retried no
+    /// sooner than [`runner::SPAWN_RETRY`]).
+    fn exited(&mut self, i: usize, run: u64, code: i32, spawn_failed: bool) {
         if !self.sched.is_current(i, run) {
             return;
         }
@@ -430,7 +443,11 @@ impl Runner {
         self.pending[i].clear();
         self.pending_size[i] = 0;
         self.stdin[i] = None;
-        self.sched.on_finished(i, self.now());
+        if spawn_failed {
+            self.sched.on_spawn_failed(i, self.now());
+        } else {
+            self.sched.on_finished(i, self.now());
+        }
         self.set_block(i, b);
         // A `repeat` block is due again at once.
         for j in self.sched.due(self.now()) {
@@ -459,7 +476,8 @@ impl Runner {
             Event::Quit => return false,
             Event::Tick => self.tick(),
             Event::Output(i, run, line) => self.output(i, run, line),
-            Event::Exited(i, run, code) => self.exited(i, run, code),
+            Event::Exited(i, run, code) => self.exited(i, run, code, false),
+            Event::SpawnFailed(i, run) => self.exited(i, run, 127, true),
             Event::Click(c) => self.click(c),
             Event::Signal(sig) => {
                 for i in self.sched.on_signal(sig) {
@@ -481,7 +499,13 @@ fn emit(out: &mut impl Write, text: &str) -> bool {
 }
 
 fn main() {
-    let args = parse_args(std::env::args().skip(1));
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("i3win-status: {e}");
+            std::process::exit(2);
+        }
+    };
     if args.signal.is_some() || args.refresh_all {
         let n = match args.signal {
             Some(sig) => signal::send_signal(sig),
@@ -565,14 +589,29 @@ mod tests {
 
     #[test]
     fn args_config_path() {
-        let a = parse_args(["-c".to_string(), r"C:\x.conf".to_string()]);
+        let a = parse_args(["-c".to_string(), r"C:\x.conf".to_string()]).unwrap();
         assert_eq!(a.config, Some(PathBuf::from(r"C:\x.conf")));
-        assert!(parse_args(["--refresh-all".to_string()]).refresh_all);
+        assert!(
+            parse_args(["--refresh-all".to_string()])
+                .unwrap()
+                .refresh_all
+        );
         assert_eq!(
-            parse_args(["--signal".to_string(), "5".to_string()]).signal,
+            parse_args(["--signal".to_string(), "5".to_string()])
+                .unwrap()
+                .signal,
             Some(5)
         );
-        assert_eq!(parse_args(["-c".to_string()]), Args::default());
+        assert_eq!(parse_args(["-c".to_string()]), Ok(Args::default()));
+    }
+
+    #[test]
+    fn args_signal_needs_a_number() {
+        assert!(parse_args(["--signal".to_string()]).is_err());
+        assert!(parse_args(["--signal".to_string(), "abc".to_string()]).is_err());
+        assert!(parse_args(["--signal".to_string(), "-1".to_string()]).is_err());
+        let e = parse_args(["--signal".to_string(), "abc".to_string()]).unwrap_err();
+        assert!(e.contains("abc"), "{e}");
     }
 
     fn sec(name: &str, props: &[(&str, &str)]) -> Section {

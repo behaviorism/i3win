@@ -10,6 +10,27 @@ use std::path::Path;
 /// Largest pixel value accepted from block output (matches core's parser).
 const MAX_PX: f64 = 10_000.0;
 
+/// Longest `full_text`/`short_text` kept, in bytes, so one block cannot push
+/// the status line past the bar's line cap.
+pub const MAX_TEXT: usize = 4 * 1024;
+
+/// `s` cut to at most `max` bytes on a char boundary.
+pub fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// `s` capped at [`MAX_TEXT`] bytes.
+pub fn cap_text(s: &str) -> String {
+    truncate_str(s, MAX_TEXT).to_string()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Interval {
     Secs(f64),
@@ -89,16 +110,24 @@ pub fn block_env(
     env
 }
 
-fn lookup<'a>(env: &'a [(String, String)], name: &str) -> &'a str {
+/// A variable's value: the block's `env` first, then the process environment
+/// (names are case-insensitive, as on Windows); unknown -> empty.
+fn lookup(env: &[(String, String)], name: &str) -> String {
     env.iter()
         .rev()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("")
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            (!name.is_empty())
+                .then(|| std::env::var_os(name))
+                .flatten()
+                .map(|v| v.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
 }
 
 /// sh-like expansion for `cmd.exe` command lines: `$VAR`/`${VAR}` from `env`
-/// (unknown -> empty), `'...'` literal with the quotes removed, `\$` -> `$`,
+/// or the process environment (unknown -> empty), `'...'` literal with the quotes removed, `\$` -> `$`,
 /// `$$` -> `pid`. Double quotes are kept (cmd needs them); `$` expands inside.
 pub fn expand_sh_vars(cmd: &str, env: &[(String, String)], pid: u32) -> String {
     let chars: Vec<char> = cmd.chars().collect();
@@ -133,7 +162,7 @@ pub fn expand_sh_vars(cmd: &str, env: &[(String, String)], pid: u32) -> String {
                 Some('{') => match chars[i + 2..].iter().position(|&ch| ch == '}') {
                     Some(len) => {
                         let name: String = chars[i + 2..i + 2 + len].iter().collect();
-                        out.push_str(lookup(env, &name));
+                        out.push_str(&lookup(env, &name));
                         i += len + 2;
                     }
                     None => out.push('$'),
@@ -144,7 +173,7 @@ pub fn expand_sh_vars(cmd: &str, env: &[(String, String)], pid: u32) -> String {
                         j += 1;
                     }
                     let name: String = chars[i + 1..j].iter().collect();
-                    out.push_str(lookup(env, &name));
+                    out.push_str(&lookup(env, &name));
                     i = j;
                     continue;
                 }
@@ -157,10 +186,20 @@ pub fn expand_sh_vars(cmd: &str, env: &[(String, String)], pid: u32) -> String {
     out
 }
 
-/// `cmd`/`cmd.exe` in any case, or empty (the default shell).
+/// `cmd`/`cmd.exe` in any case, also as a full path, or empty (the default
+/// shell).
 pub fn is_cmd_shell(shell: &str) -> bool {
-    let s = shell.trim();
-    s.is_empty() || s.eq_ignore_ascii_case("cmd") || s.eq_ignore_ascii_case("cmd.exe")
+    let s = Path::new(shell.trim());
+    if s.as_os_str().is_empty() {
+        return true;
+    }
+    let stem_is_cmd = s
+        .file_stem()
+        .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case("cmd"));
+    let ext_ok = s
+        .extension()
+        .is_none_or(|e| e.to_string_lossy().eq_ignore_ascii_case("exe"));
+    stem_is_cmd && ext_ok
 }
 
 /// Program, arguments, and whether the arguments are a raw command line.
@@ -205,8 +244,8 @@ fn truthy(s: &str) -> Option<bool> {
 /// Sets one property from its text form; an empty value unsets it.
 fn set_prop(b: &mut Block, key: &str, v: &str) {
     match key {
-        "full_text" => b.full_text = v.to_string(),
-        "short_text" => b.short_text = opt(v),
+        "full_text" => b.full_text = cap_text(v),
+        "short_text" => b.short_text = opt(&cap_text(v)),
         "color" => b.color = opt(v),
         "background" => b.background = opt(v),
         "border" => b.border = opt(v),
@@ -256,7 +295,7 @@ const RAW_LINES: [&str; 17] = [
 pub fn apply_raw_output(block: &mut Block, out: &str) {
     let mut lines = out.lines();
     // No output at all still replaces the text.
-    block.full_text = lines.next().unwrap_or("").to_string();
+    block.full_text = cap_text(lines.next().unwrap_or(""));
     for (key, line) in RAW_LINES.iter().skip(1).zip(lines) {
         set_prop(block, key, line);
     }
@@ -306,7 +345,7 @@ pub fn exit_code_block(block: &mut Block, cmd: &str, code: i32) {
         127 => format!("Error: Command '{cmd}' not found or missing dependency"),
         n => format!("Error: Command '{cmd}' exited unexpectedly with code {n}"),
     };
-    block.full_text = msg;
+    block.full_text = cap_text(&msg);
     block.short_text = None;
     block.urgent = true;
 }
@@ -319,10 +358,45 @@ pub fn static_block(section: &Section) -> Block {
         }
     }
     if let Some(label) = section.get("label") {
-        b.full_text = format!("{label}{}", b.full_text);
+        b.full_text = cap_text(&format!("{label}{}", b.full_text));
     }
     b.name = Some(section.name.clone());
     b
+}
+
+/// i3blocks block properties a built-in module section may set on top of the
+/// module's own block (`label` is a prefix, handled separately).
+const SECTION_OVERLAY: [&str; 13] = [
+    "color",
+    "background",
+    "border",
+    "border_top",
+    "border_right",
+    "border_bottom",
+    "border_left",
+    "short_text",
+    "separator",
+    "separator_block_width",
+    "min_width",
+    "align",
+    "markup",
+];
+
+/// Applies a built-in module section's i3blocks properties to the module's
+/// block: those present in the section win (an empty value unsets), and
+/// `label` prefixes `full_text`. Without a section `color`, the module's
+/// level color stays.
+pub fn apply_section_props(b: &mut Block, section: &Section) {
+    for key in SECTION_OVERLAY {
+        if let Some(v) = section.get(key) {
+            set_prop(b, key, v);
+        }
+    }
+    let text = match section.get("label") {
+        Some(label) => format!("{label}{}", b.full_text),
+        None => std::mem::take(&mut b.full_text),
+    };
+    b.full_text = cap_text(&text);
 }
 
 #[cfg(test)]
@@ -511,6 +585,100 @@ mod tests {
         );
         exit_code_block(&mut b, "foo.sh", 126);
         assert_eq!(b.full_text, "Error: Command 'foo.sh' not executable");
+    }
+
+    #[test]
+    fn oversized_texts_are_capped_on_char_boundary() {
+        let big = "\u{e9}".repeat(MAX_TEXT); // 2 bytes each
+        let mut b = Block::new("");
+        apply_raw_output(&mut b, &format!("{big}\n{big}\n"));
+        assert!(b.full_text.len() <= MAX_TEXT && b.full_text.len() > MAX_TEXT - 2);
+        assert!(b.short_text.as_ref().unwrap().len() <= MAX_TEXT);
+        let line = serde_json::json!({ "full_text": big, "short_text": big }).to_string();
+        assert!(apply_json_line(&mut b, &line));
+        assert!(b.full_text.len() <= MAX_TEXT);
+        assert!(b.short_text.as_ref().unwrap().len() <= MAX_TEXT);
+        let s = static_block(&sec("a", &[("label", "L"), ("full_text", &big)]));
+        assert!(s.full_text.len() <= MAX_TEXT && s.full_text.starts_with('L'));
+        assert_eq!(truncate_str("a\u{e9}", 2), "a");
+    }
+
+    #[test]
+    fn expand_falls_back_to_process_env_case_insensitively() {
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE set");
+        assert_eq!(
+            expand_sh_vars("echo [$USERPROFILE]", &[], 1),
+            format!("echo [{home}]")
+        );
+        assert_eq!(
+            expand_sh_vars("echo [${userprofile}]", &[], 1),
+            format!("echo [{home}]")
+        );
+        let env = vec![("userprofile".to_string(), "mine".to_string())];
+        assert_eq!(
+            expand_sh_vars("echo [$USERPROFILE]", &env, 1),
+            "echo [mine]"
+        );
+        let env = vec![("Disk".to_string(), "D:".to_string())];
+        assert_eq!(expand_sh_vars("$DISK", &env, 1), "D:");
+    }
+
+    #[test]
+    fn cmd_shell_full_path() {
+        assert!(is_cmd_shell(r"C:\Windows\System32\cmd.exe"));
+        assert!(is_cmd_shell(r"C:\Windows\System32\CMD.EXE"));
+        assert!(is_cmd_shell(r"C:\Windows\System32\cmd"));
+        assert!(!is_cmd_shell(r"C:\Program Files\Git\bin\bash.exe"));
+        assert!(!is_cmd_shell("cmd.bat"));
+        let (prog, _, raw) = shell_command(r"C:\Windows\System32\cmd.exe", "echo hi");
+        assert_eq!(prog, "cmd");
+        assert!(raw);
+    }
+
+    #[test]
+    fn module_section_props_overlay() {
+        let mut b = Block::new("CPU 5%");
+        b.color = Some("#00FF00".into());
+        let s = sec(
+            "cpu_usage",
+            &[
+                ("label", "C: "),
+                ("background", "#000000"),
+                ("border", "#111111"),
+                ("border_top", "1"),
+                ("border_right", "2"),
+                ("border_bottom", "3"),
+                ("border_left", "4"),
+                ("short_text", "c"),
+                ("separator", "false"),
+                ("separator_block_width", "9"),
+                ("min_width", "100"),
+                ("align", "center"),
+                ("markup", "pango"),
+            ],
+        );
+        apply_section_props(&mut b, &s);
+        assert_eq!(b.full_text, "C: CPU 5%");
+        assert_eq!(b.color.as_deref(), Some("#00FF00")); // module color kept
+        assert_eq!(b.background.as_deref(), Some("#000000"));
+        assert_eq!(b.border.as_deref(), Some("#111111"));
+        assert_eq!(
+            (b.border_top, b.border_right, b.border_bottom, b.border_left),
+            (Some(1), Some(2), Some(3), Some(4))
+        );
+        assert_eq!(b.short_text.as_deref(), Some("c"));
+        assert!(!b.separator);
+        assert_eq!(b.separator_block_width, Some(9));
+        assert_eq!(b.min_width, Some(MinWidth::Px(100)));
+        assert_eq!(b.align.as_deref(), Some("center"));
+        assert_eq!(b.markup.as_deref(), Some("pango"));
+        let mut b = Block::new("x");
+        b.color = Some("#00FF00".into());
+        apply_section_props(&mut b, &sec("cpu_usage", &[("color", "#123456")]));
+        assert_eq!(
+            (b.full_text.as_str(), b.color.as_deref()),
+            ("x", Some("#123456"))
+        );
     }
 
     #[test]

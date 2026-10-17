@@ -3,8 +3,8 @@
 //! from an arbitrary origin so tests can use a fake clock.
 
 use crate::command_block::{
-    apply_json_line, apply_raw_output, exit_code_block, parse_interval, static_block, Interval,
-    OutFormat,
+    apply_json_line, apply_raw_output, cap_text, exit_code_block, parse_interval, static_block,
+    truncate_str, Interval, OutFormat,
 };
 use crate::i3blocks_conf::Section;
 use crate::mods::Module;
@@ -12,6 +12,8 @@ use i3win_core::i3bar::{Block, Click};
 
 /// Minimum time between two printed lines (writer coalescing).
 pub const WRITE_GAP: f64 = 0.05;
+/// Least time before retrying a command that could not be started.
+pub const SPAWN_RETRY: f64 = 1.0;
 /// Most output kept from one non-persist run; the rest is dropped.
 pub const MAX_RUN_OUTPUT: usize = 1024 * 1024;
 
@@ -130,6 +132,15 @@ impl Schedule {
         }
     }
 
+    /// Like [`Schedule::on_finished`] for a run that never started, but the
+    /// next attempt waits at least [`SPAWN_RETRY`] (no tight `repeat` loop).
+    pub fn on_spawn_failed(&mut self, i: usize, now: f64) {
+        self.on_finished(i, now);
+        if let Some(c) = self.command_mut(i) {
+            c.next_due = c.next_due.map(|t| t.max(now + SPAWN_RETRY));
+        }
+    }
+
     pub fn on_click(&mut self, i: usize) -> ClickAction {
         match self.command(i) {
             Some(c) if c.is_persist() => ClickAction::SendToStdin,
@@ -178,7 +189,7 @@ fn base_block(section: &Section) -> Block {
 
 fn add_label(b: &mut Block, section: &Section) {
     if let Some(label) = section.get("label") {
-        b.full_text = format!("{label}{}", b.full_text);
+        b.full_text = cap_text(&format!("{label}{}", b.full_text));
     }
 }
 
@@ -249,9 +260,40 @@ pub fn config_error_block(line: usize) -> Block {
     b
 }
 
+/// Longest status line written; the bar drops lines over 64 KiB.
+pub const MAX_STATUS_LINE: usize = 60 * 1024;
+
+/// Serialized blocks, with the longest texts halved until the line fits in
+/// [`MAX_STATUS_LINE`] bytes.
+fn blocks_json(blocks: &[Block]) -> String {
+    let ser = |b: &[Block]| serde_json::to_string(b).unwrap_or_else(|_| "[]".to_string());
+    let json = ser(blocks);
+    if json.len() <= MAX_STATUS_LINE {
+        return json;
+    }
+    let mut blocks = blocks.to_vec();
+    loop {
+        let longest = blocks
+            .iter_mut()
+            .flat_map(|b| std::iter::once(&mut b.full_text).chain(b.short_text.as_mut()))
+            .max_by_key(|t| t.len());
+        match longest {
+            Some(t) if !t.is_empty() => {
+                let keep = truncate_str(t, t.len() / 2).len();
+                t.truncate(keep);
+            }
+            _ => return ser(&blocks), // nothing left to shorten
+        }
+        let json = ser(&blocks);
+        if json.len() <= MAX_STATUS_LINE {
+            return json;
+        }
+    }
+}
+
 /// One i3bar protocol line (`,` prefix after the first).
 pub fn render_line(blocks: &[Block], first: bool) -> String {
-    let json = serde_json::to_string(blocks).unwrap_or_else(|_| "[]".to_string());
+    let json = blocks_json(blocks);
     if first {
         json
     } else {
@@ -362,6 +404,27 @@ mod tests {
         }
         assert_eq!(s.due(10.0), vec![1]);
         assert_eq!(s.due(15.0), vec![1, 2]);
+    }
+
+    #[test]
+    fn failed_spawn_is_not_retried_at_once() {
+        let mut s = Schedule {
+            slots: vec![
+                cmd_slot(Interval::Repeat),
+                cmd_slot(Interval::Secs(5.0)),
+                cmd_slot(Interval::Once),
+            ],
+            blocks: vec![Block::new(""); 3],
+        };
+        for i in 0..3 {
+            s.on_started(i);
+            s.on_spawn_failed(i, 10.0);
+        }
+        assert!(s.due(10.0).is_empty());
+        assert!(s.due(10.0 + SPAWN_RETRY - 0.01).is_empty());
+        assert_eq!(s.due(10.0 + SPAWN_RETRY), vec![0]);
+        assert_eq!(s.due(15.0), vec![0, 1]);
+        assert!(!s.command(0).unwrap().running);
     }
 
     #[test]
@@ -528,6 +591,25 @@ mod tests {
         assert_eq!(plain_line(&blocks, " | "), "a | config error line 4");
         assert_eq!(blocks[1].color.as_deref(), Some("#FF0000"));
         assert!(blocks[1].separator);
+    }
+
+    #[test]
+    fn oversized_output_still_fits_the_bar_line() {
+        let s = sec("w", &[("command", "x")]);
+        let huge = "x".repeat(70_000);
+        let b = run_block(&s, OutFormat::Raw, &format!("{huge}\n{huge}\n"), 0);
+        let line = render_line(&[b], false);
+        assert!(line.len() < 64 * 1024, "{}", line.len());
+        let _: serde_json::Value = serde_json::from_str(&line[1..]).unwrap();
+        // Many capped blocks of control characters (6x JSON escaping) still fit.
+        let ctl = "\u{1}".repeat(70_000);
+        let blocks: Vec<Block> = (0..20)
+            .map(|_| run_block(&s, OutFormat::Raw, &format!("{ctl}\n{ctl}\n"), 0))
+            .collect();
+        let line = render_line(&blocks, true);
+        assert!(line.len() <= MAX_STATUS_LINE, "{}", line.len());
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 20);
     }
 
     struct FakeModule(Option<f64>);
