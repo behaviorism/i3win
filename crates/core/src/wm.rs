@@ -703,6 +703,18 @@ mod tests {
     use crate::wm::*;
 
     #[test]
+    fn gaps_all_overrides_config_workspace_gaps() {
+        let cfg = crate::config::parse_config(
+            "workspace 1 gaps inner 9
+",
+        );
+        let mut wm = Wm::new(cfg, vec![out("A", 0, 1000)]);
+        let ws = wm.focused_workspace();
+        assert_eq!(wm.effective_gaps(ws).inner, 9);
+        wm.run_command("gaps inner all set 3");
+        assert_eq!(wm.effective_gaps(ws).inner, 3);
+    }
+    #[test]
     fn gaps_command_current_and_all() {
         use crate::config::Gaps;
         let mut wm = test_wm();

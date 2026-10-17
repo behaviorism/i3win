@@ -65,6 +65,11 @@ impl Wm {
             GapsWhich::Outer | GapsWhich::Vertical => get(&effective, Side::Top) != 0,
             _ => get(&effective, affected[0]) != 0,
         };
+        let all_ws = if scope == GapsScope::All {
+            self.sorted_workspaces()
+        } else {
+            Vec::new()
+        };
         for &s in affected {
             let cur = get(&effective, s);
             let new = match op {
@@ -84,9 +89,11 @@ impl Wm {
                 GapsScope::Current => *slot(&mut self.tree.get_mut(ws).gaps, s) = Some(new),
                 GapsScope::All => {
                     set(&mut self.config.gaps, s, new);
-                    let all = self.sorted_workspaces();
-                    for w in all {
+                    for &w in &all_ws {
                         *slot(&mut self.tree.get_mut(w).gaps, s) = None;
+                    }
+                    for (_, o) in &mut self.config.workspace_gaps {
+                        *slot(o, s) = None;
                     }
                 }
             }
