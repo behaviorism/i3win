@@ -1,5 +1,6 @@
 use crate::command::{OutputTarget, WorkspaceTarget};
-use crate::geom::{sanitize_floating, Direction, Rect};
+use crate::geom::{Direction, Rect};
+use crate::ops::floating::clamp_floating_rect;
 use crate::tree::{Layout, NodeId, NodeKind, ScratchState};
 use crate::wm::{workspace_num, IpcEvent, OutputInfo, Wm};
 
@@ -43,7 +44,7 @@ impl Wm {
                 r.y = sat(r.y, dy);
                 r.x = r.x.clamp(to.x, to.x.max(to.right().saturating_sub(r.w)));
                 r.y = r.y.clamp(to.y, to.y.max(to.bottom().saturating_sub(r.h)));
-                *r = sanitize_floating(*r);
+                *r = clamp_floating_rect(&self.config, *r);
             }
         }
     }

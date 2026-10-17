@@ -124,7 +124,10 @@ impl Wm {
         if marked_floating {
             if let NodeKind::Window(d) = &mut self.tree.get_mut(target).kind {
                 if d.floating_rect.is_none() {
-                    d.floating_rect = Some(crate::geom::sanitize_floating(d.info.rect));
+                    d.floating_rect = Some(crate::ops::floating::clamp_floating_rect(
+                        &self.config,
+                        d.info.rect,
+                    ));
                 }
             }
             self.tree.attach_floating(dest_ws, target);

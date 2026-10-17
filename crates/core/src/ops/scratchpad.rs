@@ -1,4 +1,5 @@
-use crate::geom::{sanitize_floating, Rect};
+use crate::geom::Rect;
+use crate::ops::floating::clamp_floating_rect;
 use crate::tree::{NodeId, NodeKind, ScratchState};
 use crate::wm::{IpcEvent, Wm};
 
@@ -43,7 +44,10 @@ impl Wm {
         });
         if let NodeKind::Window(d) = &mut self.tree.get_mut(n).kind {
             if d.floating_rect.is_none() {
-                d.floating_rect = Some(sanitize_floating(tiled.unwrap_or(d.info.rect)));
+                d.floating_rect = Some(clamp_floating_rect(
+                    &self.config,
+                    tiled.unwrap_or(d.info.rect),
+                ));
             }
         }
         let old_parent = self.tree.parent(n);
@@ -96,10 +100,11 @@ impl Wm {
         }
         if let NodeKind::Window(d) = &mut self.tree.get_mut(n).kind {
             let fallback = d.info.rect;
-            let r = sanitize_floating(d.floating_rect.unwrap_or(fallback));
+            let r = clamp_floating_rect(&self.config, d.floating_rect.unwrap_or(fallback));
             d.floating_rect = Some(match out_rect {
                 Some(o) if state == ScratchState::Fresh => {
-                    Rect::new(0, 0, o.w / 2, o.h * 3 / 4).centered_in(&o)
+                    clamp_floating_rect(&self.config, Rect::new(0, 0, o.w / 2, o.h * 3 / 4))
+                        .centered_in(&o)
                 }
                 _ => r,
             });
@@ -381,5 +386,24 @@ mod tests {
 ",
         );
         assert_eq!(c.warnings.len(), 1);
+    }
+
+    #[test]
+    fn scratchpad_show_respects_floating_maximum_size() {
+        let mut wm = crate::wm::Wm::new(
+            crate::config::parse_config("floating_maximum_size 300 x 200\n"),
+            vec![out("O1", 0, 1000)],
+        );
+        wm.manage(win(1));
+        wm.run_command("move container to scratchpad");
+        wm.run_command("scratchpad show");
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        match &wm.tree.get(n).kind {
+            NodeKind::Window(d) => {
+                let r = d.floating_rect.unwrap();
+                assert!(r.w <= 300 && r.h <= 200, "{r:?}");
+            }
+            _ => unreachable!(),
+        }
     }
 }
