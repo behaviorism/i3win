@@ -25,6 +25,37 @@ pub struct Drag {
     pub last_apply_ms: u64,
 }
 
+/// What a native (Windows-driven) move/size loop of a tiled window amounted to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeDrag {
+    Resized(Vec<(Direction, i32)>),
+    Moved,
+}
+
+/// Slack (px) before a frame change counts as a resize.
+const NATIVE_SLOP_PX: i32 = 4;
+
+/// Compares DWM frame bounds at START and END. A width or height change over the
+/// slop is a resize with each edge that moved over the slop (positive = outward);
+/// anything else is a move.
+pub fn classify_native(start: Rect, end: Rect) -> NativeDrag {
+    if (end.w - start.w).abs() <= NATIVE_SLOP_PX && (end.h - start.h).abs() <= NATIVE_SLOP_PX {
+        return NativeDrag::Moved;
+    }
+    let edges = [
+        (Direction::Left, start.x - end.x),
+        (Direction::Right, end.right() - start.right()),
+        (Direction::Up, start.y - end.y),
+        (Direction::Down, end.bottom() - start.bottom()),
+    ];
+    NativeDrag::Resized(
+        edges
+            .into_iter()
+            .filter(|(_, d)| d.abs() > NATIVE_SLOP_PX)
+            .collect(),
+    )
+}
+
 /// Tiled live resize applies at most once per this many milliseconds.
 const TILED_RESIZE_INTERVAL_MS: u64 = 16;
 
@@ -283,6 +314,26 @@ mod tests {
         wm.tree.describe(wm.focused_workspace())
     }
 
+    #[test]
+    fn native_resize_edges_from_rects() {
+        let s = Rect::new(0, 0, 500, 500);
+        assert_eq!(
+            classify_native(s, Rect::new(0, 0, 503, 500)),
+            NativeDrag::Moved
+        );
+        assert_eq!(
+            classify_native(s, Rect::new(10, 20, 500, 500)),
+            NativeDrag::Moved
+        );
+        assert_eq!(
+            classify_native(s, Rect::new(0, 0, 600, 500)),
+            NativeDrag::Resized(vec![(Direction::Right, 100)])
+        );
+        assert_eq!(
+            classify_native(s, Rect::new(-50, 0, 550, 480)),
+            NativeDrag::Resized(vec![(Direction::Left, 50), (Direction::Down, -20)])
+        );
+    }
     #[test]
     fn floating_move_and_resize() {
         let mut wm = test_wm();

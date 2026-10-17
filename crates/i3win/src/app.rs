@@ -16,7 +16,7 @@ use i3win_core::tree::{NodeId, NodeKind, WindowId};
 use i3win_core::wm::{Effect, Wm};
 use i3win_core::DropTarget;
 
-use crate::drag::{self, Drag, DragKind, PercentSnapshot, ReleaseWatch};
+use crate::drag::{self, Drag, DragKind, NativeDrag, PercentSnapshot, ReleaseWatch};
 use crate::ipc_server;
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
@@ -45,6 +45,7 @@ pub enum EventDecision {
     Unmanage,
     Focus,
     Title,
+    MoveSizeStart,
     MoveSizeEnd,
 }
 
@@ -66,6 +67,8 @@ pub(crate) fn decide(ev: PlatformEvent, managed: bool, expected_hide: bool) -> E
         (E::Restored(_), true) => Ignore,
         (E::Foreground(_), true) => Focus,
         (E::Foreground(_), false) => TryManage,
+        (E::MoveSizeStart(_), true) => MoveSizeStart,
+        (E::MoveSizeStart(_), false) => Ignore,
         (E::MoveSizeEnd(_), true) => MoveSizeEnd,
         (E::MoveSizeEnd(_), false) => Ignore,
     }
@@ -98,7 +101,7 @@ fn event_id(ev: PlatformEvent) -> WindowId {
     use PlatformEvent::*;
     match ev {
         Shown(i) | Hidden(i) | Destroyed(i) | Foreground(i) | Minimized(i) | Restored(i)
-        | MoveSizeEnd(i) | TitleChanged(i) => i,
+        | MoveSizeStart(i) | MoveSizeEnd(i) | TitleChanged(i) => i,
     }
 }
 
@@ -229,6 +232,8 @@ pub struct App {
     /// IPC pipe name, exported to exec'd children as I3SOCK.
     pipe_name: String,
     drag: Option<DragSession>,
+    /// DWM frame of a tiled window at the start of its native move/size loop.
+    move_start: HashMap<WindowId, Rect>,
     overlay: Overlay,
     /// Time base for drag throttling.
     epoch: Instant,
@@ -279,6 +284,7 @@ impl App {
             pipe_name,
             statuses: HashMap::new(),
             drag: None,
+            move_start: HashMap::new(),
             overlay: Overlay::default(),
             epoch: Instant::now(),
         };
@@ -578,6 +584,7 @@ impl App {
                     self.wm.on_title_changed(id, p.title);
                 }
             }
+            EventDecision::MoveSizeStart => self.on_move_size_start(id),
             EventDecision::MoveSizeEnd => self.on_move_size_end(id),
         }
         if let PlatformEvent::Foreground(fg) = ev {
@@ -611,8 +618,49 @@ impl App {
                 self.wm.on_floating_moved(id, frame);
             }
         } else {
-            // Tiled windows snap back on the next flush.
-            reconcile::invalidate(&mut self.applied, id);
+            self.on_tiled_move_size_end(id, node);
+        }
+    }
+
+    /// A native move/size loop begins: remember a tiled window's frame and keep
+    /// reconcile from fighting the loop.
+    fn on_move_size_start(&mut self, id: WindowId) {
+        let Some(node) = self.wm.tree.window_node(id) else {
+            return;
+        };
+        if self.wm.tree.is_floating(node) {
+            return;
+        }
+        if let Some(r) = window::frame_rect(id) {
+            self.move_start.insert(id, r);
+            self.applied.frozen.insert(id);
+        }
+    }
+
+    /// A native loop of a tiled window ends: a border resize adjusts the tree, a
+    /// title-bar move drops (when allowed); anything else snaps back on the flush.
+    fn on_tiled_move_size_end(&mut self, id: WindowId, node: NodeId) {
+        self.applied.frozen.remove(&id);
+        // Snap back unless the tree changes below (a changed tree re-places anyway).
+        reconcile::invalidate(&mut self.applied, id);
+        let (Some(start), Some(end)) = (self.move_start.remove(&id), window::frame_rect(id)) else {
+            return;
+        };
+        match drag::classify_native(start, end) {
+            NativeDrag::Resized(edges) => {
+                for (dir, delta) in edges {
+                    self.wm.resize_edge(node, dir, delta);
+                }
+            }
+            NativeDrag::Moved => {
+                if self.wm.config.tiling_drag.titlebar {
+                    self.refresh_pointer();
+                    if let Some((x, y)) = self.wm.pointer {
+                        let t = self.drop_target_at(node, x, y);
+                        self.wm.drop_window(node, &t);
+                    }
+                }
+            }
         }
     }
 

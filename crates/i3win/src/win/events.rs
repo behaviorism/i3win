@@ -19,6 +19,7 @@ pub enum PlatformEvent {
     Foreground(WindowId),
     Minimized(WindowId),
     Restored(WindowId),
+    MoveSizeStart(WindowId),
     MoveSizeEnd(WindowId),
     TitleChanged(WindowId),
 }
@@ -35,6 +36,7 @@ pub fn translate(event: u32, hwnd: isize, id_object: i32, id_child: i32) -> Opti
         0x0003 => Some(PlatformEvent::Foreground(id)),
         0x0016 => Some(PlatformEvent::Minimized(id)),
         0x0017 => Some(PlatformEvent::Restored(id)),
+        0x000A => Some(PlatformEvent::MoveSizeStart(id)),
         0x000B => Some(PlatformEvent::MoveSizeEnd(id)),
         0x800C => Some(PlatformEvent::TitleChanged(id)),
         _ => None,
@@ -132,6 +134,18 @@ mod tests {
         assert_eq!(
             translate(0x800C, 7, 0, 0),
             Some(PlatformEvent::TitleChanged(WindowId(7)))
+        );
+    }
+
+    #[test]
+    fn translates_move_size_start_and_end() {
+        assert_eq!(
+            translate(0x000A, 7, 0, 0),
+            Some(PlatformEvent::MoveSizeStart(WindowId(7)))
+        );
+        assert_eq!(
+            translate(0x000B, 7, 0, 0),
+            Some(PlatformEvent::MoveSizeEnd(WindowId(7)))
         );
     }
 

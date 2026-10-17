@@ -20,6 +20,8 @@ pub enum WinOp {
 pub struct Applied {
     pub rects: HashMap<WindowId, Rect>,
     pub hidden: HashSet<WindowId>,
+    /// Windows in a native move/size loop: never placed until they are thawed.
+    pub frozen: HashSet<WindowId>,
 }
 
 /// Diffs `arr` against what was already applied and returns the minimal ops.
@@ -32,7 +34,7 @@ pub fn plan(applied: &mut Applied, arr: &Arrangement, managed: &HashSet<WindowId
         if applied.hidden.remove(&p.id) {
             shows.push(WinOp::Show(p.id));
         }
-        if applied.rects.get(&p.id) != Some(&p.rect) {
+        if !applied.frozen.contains(&p.id) && applied.rects.get(&p.id) != Some(&p.rect) {
             applied.rects.insert(p.id, p.rect);
             places.push(WinOp::Place {
                 id: p.id,
@@ -49,6 +51,7 @@ pub fn plan(applied: &mut Applied, arr: &Arrangement, managed: &HashSet<WindowId
     }
     applied.rects.retain(|id, _| managed.contains(id));
     applied.hidden.retain(|id| managed.contains(id));
+    applied.frozen.retain(|id| managed.contains(id));
     hides.extend(shows);
     hides.extend(places);
     hides
@@ -138,6 +141,15 @@ mod tests {
         let x = arr(vec![(1, Rect::new(0, 0, 10, 10), false)], vec![]);
         plan(&mut a, &x, &managed(&[1]));
         invalidate(&mut a, WindowId(1));
+        assert_eq!(plan(&mut a, &x, &managed(&[1])).len(), 1);
+    }
+    #[test]
+    fn frozen_window_is_not_placed() {
+        let mut a = Applied::default();
+        a.frozen.insert(WindowId(1));
+        let x = arr(vec![(1, Rect::new(0, 0, 10, 10), false)], vec![]);
+        assert!(plan(&mut a, &x, &managed(&[1])).is_empty());
+        a.frozen.clear();
         assert_eq!(plan(&mut a, &x, &managed(&[1])).len(), 1);
     }
     #[test]
