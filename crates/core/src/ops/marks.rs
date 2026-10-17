@@ -103,6 +103,7 @@ impl Wm {
         let src = self.tree.workspace_of(target);
         let src_was_focused =
             src.is_some_and(|s| self.is_visible(s) && self.focused_workspace() == s);
+        let prev_focus = self.focused();
         let marked_floating = self.tree.is_floating(m);
         if marked_floating && !matches!(self.tree.get(target).kind, NodeKind::Window(_)) {
             return Err("only windows can float".into());
@@ -135,7 +136,10 @@ impl Wm {
         }
         let f = self.tree.focused_descendant(target);
         self.tree.set_focused_within(f, dest_ws);
-        if src_was_focused {
+        // Focus stays on what was focused before (following it if it moved).
+        if self.tree.contains(prev_focus) && self.focused_container.is_none() {
+            self.tree.set_focused(prev_focus);
+        } else if src_was_focused {
             if let Some(s) = src.filter(|&s| self.tree.contains(s)) {
                 let f = self.tree.focused_descendant(s);
                 self.tree.set_focused(f);
@@ -280,9 +284,28 @@ mod tests {
         wm.run_command("mark gone; unmark gone");
         assert_eq!(marks_json(&wm), serde_json::json!(["keep"]));
         wm.run_command("move container to mark keep");
-        assert_eq!(ws_desc(&wm), "H[]");
+        // The moved window was focused, so focus follows it to workspace 1.
+        assert_eq!(ws_desc(&wm), "H[w1 w2]");
+        assert_eq!(wm.focused_window(), Some(WindowId(2)));
         wm.run_command("workspace 1");
         assert_eq!(ws_desc(&wm), "H[w1 w2]");
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn move_to_mark_keeps_focus_unless_moved_window_focused() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.manage(win(3));
+        wm.run_command("[id=2] mark t");
+        wm.run_command("[id=1] focus");
+        wm.run_command("[id=3] move container to mark t");
+        assert_eq!(ws_desc(&wm), "H[w1 w2 w3]");
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        wm.run_command("[id=1] move container to mark t");
+        assert_eq!(ws_desc(&wm), "H[w2 w1 w3]");
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
         check_invariants(&wm);
     }
 
