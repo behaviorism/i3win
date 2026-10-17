@@ -99,6 +99,17 @@ pub struct Block {
     pub border_left: Option<i32>,
 }
 
+impl Block {
+    /// A block with i3 protocol defaults (`separator` true, all else unset).
+    pub fn new(full_text: impl Into<String>) -> Block {
+        Block {
+            full_text: full_text.into(),
+            separator: true,
+            ..Block::default()
+        }
+    }
+}
+
 /// i3bar `min_width`: a pixel count, or a text whose rendered width is used.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -221,6 +232,16 @@ impl ClickWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_new_has_i3_defaults() {
+        let b = Block::new("hi");
+        assert_eq!(b.full_text, "hi");
+        assert!(b.separator);
+        assert!(!b.urgent);
+        assert_eq!(b.color, None);
+        assert_eq!(b.min_width, None);
+    }
 
     #[test]
     fn plain_mode() {
