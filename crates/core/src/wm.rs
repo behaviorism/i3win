@@ -83,6 +83,7 @@ fn is_window_command(cmd: &Command) -> bool {
             | Command::Exit
             | Command::Mode(_)
             | Command::Nop
+            | Command::Unmark(None)
             | Command::Gaps { .. }
             | Command::Workspace(_)
             | Command::FocusOutput(_)
@@ -262,7 +263,7 @@ impl Wm {
         self.effects.push(Effect::Ipc(e));
     }
 
-    fn emit_window(&mut self, change: &str, window: WindowId) {
+    pub(crate) fn emit_window(&mut self, change: &str, window: WindowId) {
         self.emit(IpcEvent::Window {
             change: change.into(),
             window,
@@ -565,6 +566,10 @@ impl Wm {
             Command::Reload | Command::Restart => self.effects.push(Effect::Reload),
             Command::Exit => self.effects.push(Effect::Exit),
             Command::Nop => {}
+            Command::Mark { add, toggle, name } => self.mark(target, *add, *toggle, name),
+            Command::Unmark(name) => self.unmark(name.as_deref()),
+            Command::MoveToMark(name) => return self.move_to_mark(target, name),
+            Command::Swap(t) => return self.swap_with(target, t),
             Command::Gaps {
                 which,
                 scope,

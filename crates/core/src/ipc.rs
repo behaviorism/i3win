@@ -125,7 +125,7 @@ pub fn handle(wm: &mut Wm, ctx: &IpcContext, msg_type: u32, payload: &str) -> Re
         },
         GET_OUTPUTS => to_text(&outputs_json(wm)),
         GET_TREE => to_text(&tree_json(wm)),
-        GET_MARKS => "[]".to_string(),
+        GET_MARKS => to_text(&marks_json(wm)),
         GET_BAR_CONFIG => to_text(&bar_config_json(wm, payload)),
         GET_VERSION => to_text(&version_json(ctx)),
         GET_BINDING_MODES => to_text(&binding_modes_json(wm)),
@@ -279,6 +279,7 @@ fn node_json(wm: &Wm, arr: &Arrangement, id: NodeId) -> Value {
         "percent": percent,
         "rect": rect_json(rect),
         "focused": id == wm.focused(),
+        "marks": n.marks,
         "focus": n.focus.iter().map(|c| c.0).collect::<Vec<_>>(),
         "urgent": is_urgent(wm, id),
         "fullscreen_mode": u8::from(n.fullscreen),
@@ -303,6 +304,11 @@ fn node_json(wm: &Wm, arr: &Arrangement, id: NodeId) -> Value {
 pub fn tree_json(wm: &Wm) -> Value {
     let arr = wm.arrange();
     node_json(wm, &arr, wm.tree.root())
+}
+
+/// Sorted names of all marks in the tree.
+pub fn marks_json(wm: &Wm) -> Value {
+    json!(wm.all_marks())
 }
 
 pub fn version_json(ctx: &IpcContext) -> Value {

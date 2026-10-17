@@ -113,6 +113,20 @@ pub enum Command {
     Restart,
     Exit,
     Nop,
+    Mark {
+        add: bool,
+        toggle: bool,
+        name: String,
+    },
+    Unmark(Option<String>),
+    MoveToMark(String),
+    Swap(SwapTarget),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SwapTarget {
+    Mark(String),
+    ConId(u32),
+    Id(isize),
 }
 #[derive(Clone, Debug)]
 pub struct CommandGroup {
@@ -369,12 +383,50 @@ fn parse_move(args: &[Tok]) -> Result<Command, String> {
     if a(i) == Some("to") {
         i += 1;
     }
+    if a(i) == Some("mark") {
+        let name = a(i + 1).ok_or("move to mark: missing name")?;
+        return Ok(Command::MoveToMark(name.to_string()));
+    }
     if a(i) != Some("workspace") {
         return Err(format!("bad move argument: {}", join(args)));
     }
     Ok(Command::MoveToWorkspace(parse_workspace_target(
         &args[i + 1..],
     )?))
+}
+
+fn parse_mark(args: &[Tok]) -> Result<Command, String> {
+    let (mut add, mut toggle) = (false, false);
+    let mut name = None;
+    for (t, _) in args {
+        match t.as_str() {
+            "--add" => add = true,
+            "--replace" => add = false,
+            "--toggle" => toggle = true,
+            _ if name.is_none() => name = Some(t.clone()),
+            _ => return Err(format!("bad mark argument: {}", join(args))),
+        }
+    }
+    let name = name.ok_or("mark: missing name")?;
+    Ok(Command::Mark { add, toggle, name })
+}
+
+fn parse_swap(args: &[Tok]) -> Result<Command, String> {
+    let a = |i: usize| args.get(i).map(|t| t.0.as_str());
+    if a(0) != Some("container") || a(1) != Some("with") {
+        return Err(format!("bad swap argument: {}", join(args)));
+    }
+    let v = a(3).ok_or("swap: missing value")?;
+    match a(2) {
+        Some("mark") => Ok(Command::Swap(SwapTarget::Mark(v.to_string()))),
+        Some("con_id") => Ok(Command::Swap(SwapTarget::ConId(
+            v.parse().map_err(|_| format!("bad con_id: {v}"))?,
+        ))),
+        Some("id") => Ok(Command::Swap(SwapTarget::Id(
+            v.parse().map_err(|_| format!("bad id: {v}"))?,
+        ))),
+        o => Err(format!("bad swap target: {}", o.unwrap_or(""))),
+    }
 }
 
 fn parse_gaps(args: &[Tok]) -> Result<Command, String> {
@@ -529,6 +581,9 @@ fn parse_one(seg: &str) -> Result<Command, String> {
         "reload" => Ok(Command::Reload),
         "restart" => Ok(Command::Restart),
         "exit" => Ok(Command::Exit),
+        "mark" => parse_mark(args),
+        "unmark" => Ok(Command::Unmark(a(0).map(str::to_string))),
+        "swap" => parse_swap(args),
         "nop" => Ok(Command::Nop),
         _ => Err(format!("unknown command: {verb}")),
     }

@@ -395,33 +395,41 @@ impl Tree {
         if self.is_ancestor(a, b) || self.is_ancestor(b, a) {
             return;
         }
-        let ia = self.get(pa).children.iter().position(|&x| x == a);
-        let ib = self.get(pb).children.iter().position(|&x| x == b);
+        // Each node sits in its parent's tiled or floating list.
+        let (fl_a, fl_b) = (self.is_floating(a), self.is_floating(b));
+        let list = |t: &Tree, p: NodeId, fl: bool| {
+            let n = t.get(p);
+            if fl {
+                n.floating.clone()
+            } else {
+                n.children.clone()
+            }
+        };
+        let ia = list(self, pa, fl_a).iter().position(|&x| x == a);
+        let ib = list(self, pb, fl_b).iter().position(|&x| x == b);
         let (Some(ia), Some(ib)) = (ia, ib) else {
             return;
         };
         let fa = self.get(pa).focus.iter().position(|&x| x == a);
         let fb = self.get(pb).focus.iter().position(|&x| x == b);
-        if pa == pb {
-            let p = self.get_mut(pa);
-            p.children.swap(ia, ib);
-            if let (Some(fa), Some(fb)) = (fa, fb) {
-                p.focus.swap(fa, fb);
+        let put = |t: &mut Tree, p: NodeId, fl: bool, i: usize, x: NodeId| {
+            let n = t.get_mut(p);
+            if fl {
+                n.floating[i] = x;
+            } else {
+                n.children[i] = x;
             }
-        } else {
-            let p = self.get_mut(pa);
-            p.children[ia] = b;
-            if let Some(fa) = fa {
-                p.focus[fa] = b;
-            }
-            let p = self.get_mut(pb);
-            p.children[ib] = a;
-            if let Some(fb) = fb {
-                p.focus[fb] = a;
-            }
-            self.get_mut(a).parent = Some(pb);
-            self.get_mut(b).parent = Some(pa);
+        };
+        put(self, pa, fl_a, ia, b);
+        put(self, pb, fl_b, ib, a);
+        if let Some(fa) = fa {
+            self.get_mut(pa).focus[fa] = b;
         }
+        if let Some(fb) = fb {
+            self.get_mut(pb).focus[fb] = a;
+        }
+        self.get_mut(a).parent = Some(pb);
+        self.get_mut(b).parent = Some(pa);
         let (qa, qb) = (self.get(a).percent, self.get(b).percent);
         self.get_mut(a).percent = qb;
         self.get_mut(b).percent = qa;
