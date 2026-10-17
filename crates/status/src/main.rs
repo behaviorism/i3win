@@ -6,6 +6,8 @@ mod format;
 mod i3blocks_conf;
 #[allow(dead_code)]
 mod i3status_conf;
+#[allow(dead_code)]
+mod mods;
 mod modules;
 
 use modules::*;
