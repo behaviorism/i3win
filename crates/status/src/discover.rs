@@ -42,10 +42,10 @@ pub fn discover(
     }
     let cfg = home.join(".config");
     let candidates = [
-        (cfg.join("i3win").join("i3status.conf"), Format::I3Status),
         (cfg.join("i3win").join("i3blocks.conf"), Format::I3Blocks),
         (cfg.join("i3blocks").join("config"), Format::I3Blocks),
-        (cfg.join("i3status").join("config"), Format::I3Status),
+        (home.join(".i3blocks.conf"), Format::I3Blocks),
+        (cfg.join("i3win").join("i3status.conf"), Format::I3Status),
     ];
     for (p, f) in &candidates {
         if exists(p) {
@@ -94,6 +94,32 @@ mod tests {
         assert_eq!(
             discover(None, None, home, &only(r"H\.config\i3win\i3blocks.conf")).1,
             Some(Format::I3Blocks)
+        );
+    }
+
+    #[test]
+    fn i3blocks_wins_over_i3status_and_dotfile() {
+        let home = Path::new("H");
+        let both = |q: &Path| {
+            q == Path::new(r"H\.config\i3win\i3blocks.conf")
+                || q == Path::new(r"H\.config\i3win\i3status.conf")
+        };
+        assert_eq!(
+            discover(None, None, home, &both),
+            (
+                PathBuf::from(r"H\.config\i3win\i3blocks.conf"),
+                Some(Format::I3Blocks)
+            )
+        );
+        let dot = |q: &Path| q == Path::new(r"H\.i3blocks.conf");
+        assert_eq!(
+            discover(None, None, home, &dot),
+            (PathBuf::from(r"H\.i3blocks.conf"), Some(Format::I3Blocks))
+        );
+        let status = |q: &Path| q == Path::new(r"H\.config\i3win\i3status.conf");
+        assert_eq!(
+            discover(None, None, home, &status).1,
+            Some(Format::I3Status)
         );
     }
 
