@@ -72,8 +72,14 @@ impl Wm {
         self.emit_node("mark", target);
     }
 
-    pub(crate) fn unmark(&mut self, name: Option<&str>) {
-        for n in self.all_nodes() {
+    /// Removes mark `name` (every mark when `None`) from `scope`, or from
+    /// every node in the tree when `scope` is `None`.
+    pub(crate) fn unmark(&mut self, scope: Option<NodeId>, name: Option<&str>) {
+        let nodes = match scope {
+            Some(n) => vec![n],
+            None => self.all_nodes(),
+        };
+        for n in nodes {
             let marks = &mut self.tree.get_mut(n).marks;
             let before = marks.len();
             match name {
@@ -88,6 +94,13 @@ impl Wm {
 
     pub(crate) fn move_to_mark(&mut self, target: NodeId, name: &str) -> Result<(), String> {
         let m = self.find_marked(name).ok_or(NO_MARK)?;
+        if matches!(
+            self.tree.get(m).kind,
+            NodeKind::Root | NodeKind::Output { .. }
+        ) {
+            return Err("Cannot move a container to a mark on an output".into());
+        }
+        let mark_is_workspace = matches!(self.tree.get(m).kind, NodeKind::Workspace { .. });
         if m == target
             || self.tree.is_ancestor(target, m)
             || matches!(
@@ -105,6 +118,7 @@ impl Wm {
             src.is_some_and(|s| self.is_visible(s) && self.focused_workspace() == s);
         let prev_focus = self.focused();
         let marked_floating = self.tree.is_floating(m);
+        let target_floating = self.tree.is_floating(target);
         if marked_floating && !matches!(self.tree.get(target).kind, NodeKind::Window(_)) {
             return Err("only windows can float".into());
         }
@@ -121,7 +135,14 @@ impl Wm {
                 self.tree.cleanup(p);
             }
         }
-        if marked_floating {
+        if mark_is_workspace {
+            // A marked workspace receives the container like `move to workspace`.
+            if target_floating {
+                self.tree.attach_floating(m, target);
+            } else {
+                self.insert_tiled(m, target);
+            }
+        } else if marked_floating {
             if let NodeKind::Window(d) = &mut self.tree.get_mut(target).kind {
                 if d.floating_rect.is_none() {
                     d.floating_rect = Some(crate::ops::floating::clamp_floating_rect(
@@ -137,15 +158,7 @@ impl Wm {
                 _ => self.tree.attach(dest_ws, target, None),
             }
         }
-        if dest_ws == self.scratch {
-            for n in self.tree.windows_under(target) {
-                if self.tree.get(n).scratchpad == crate::tree::ScratchState::None {
-                    self.tree.get_mut(n).scratchpad = crate::tree::ScratchState::Fresh;
-                }
-                self.scratch_order.retain(|&x| x != n);
-                self.scratch_order.push(n);
-            }
-        }
+        self.on_node_rehomed(target, src, dest_ws);
         let f = self.tree.focused_descendant(target);
         self.tree.set_focused_within(f, dest_ws);
         // Focus stays on what was focused before, unless the focused window
@@ -207,7 +220,13 @@ impl Wm {
         }
         let focused = self.focused();
         let focused_ws = self.focused_workspace();
+        let target_ws = self.tree.workspace_of(target);
+        let other_ws = self.tree.workspace_of(other);
         self.tree.swap(target, other);
+        if let (Some(tw), Some(ow)) = (target_ws, other_ws) {
+            self.on_node_rehomed(target, Some(tw), ow);
+            self.on_node_rehomed(other, Some(ow), tw);
+        }
         if self.tree.is_floating(target) {
             let ra = self.floating_rect_of(target);
             let rb = self.floating_rect_of(other);
@@ -247,7 +266,7 @@ impl Wm {
 mod tests {
     use crate::ipc::marks_json;
     use crate::testutil::*;
-    use crate::tree::WindowId;
+    use crate::tree::{ScratchState, WindowId};
     use crate::wm::{Effect, IpcEvent};
 
     #[test]
@@ -339,6 +358,157 @@ mod tests {
         wm.run_command("[id=1] floating enable");
         assert!(!wm.run_command("[id=2] swap container with id 1")[0].success);
         assert!(!wm.run_command("swap container with con_id 9999")[0].success);
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn move_to_mark_on_workspace_of_other_output() {
+        let mut wm = crate::wm::Wm::new(
+            crate::config::Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        );
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("focus output B; mark wsm; focus output A");
+        let b = wm.outputs()[1];
+        assert!(wm.run_command("[id=1] move container to mark wsm")[0].success);
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        assert_eq!(wm.tree.workspace_of(n1), Some(wm.visible_workspace(b)));
+        assert_eq!(wm.tree.describe(wm.visible_workspace(b)), "H[w1]");
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn move_to_mark_on_workspace_same_output() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("workspace 5; mark wsm");
+        assert!(wm.run_command("[id=1] move container to mark wsm")[0].success);
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "5");
+        assert_eq!(ws_desc(&wm), "H[w1]");
+        let a = wm.arrange();
+        assert!(a.windows.iter().any(|p| p.id == WindowId(1)));
+        assert!(!a.hidden.contains(&WindowId(1)));
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn move_floating_to_mark_on_workspace_stays_floating() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("floating enable; workspace 5; mark wsm");
+        assert!(wm.run_command("[id=1] move container to mark wsm")[0].success);
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        assert!(wm.tree.is_floating(n1));
+        assert_eq!(wm.tree.workspace_of(n1), Some(wm.focused_workspace()));
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn move_to_mark_on_output_is_refused() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        let o = wm.outputs()[0];
+        wm.tree.get_mut(o).marks.push("om".into());
+        assert!(!wm.run_command("[id=1] move container to mark om")[0].success);
+        assert_eq!(ws_desc(&wm), "H[w1]");
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn swap_floating_with_hidden_scratch_window_keeps_scratchpad_usable() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("[id=2] move scratchpad; [id=2] mark sp; [id=1] floating enable");
+        assert!(wm.run_command("[id=1] swap container with mark sp")[0].success);
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        assert_eq!(wm.tree.workspace_of(n1), Some(wm.scratch_workspace()));
+        assert_eq!(wm.tree.get(n1).scratchpad, ScratchState::Fresh);
+        assert_eq!(wm.tree.get(n2).scratchpad, ScratchState::None);
+        assert!(wm.run_command("scratchpad show")[0].success);
+        assert_eq!(wm.tree.workspace_of(n1), Some(wm.focused_workspace()));
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn unmark_with_criteria_clears_only_matched() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("[id=1] mark --add a; [id=1] mark --add c; [id=2] mark b");
+        wm.run_command("[id=1] unmark b");
+        assert_eq!(marks_json(&wm), serde_json::json!(["a", "b", "c"]));
+        wm.run_command("[id=1] unmark c");
+        assert_eq!(marks_json(&wm), serde_json::json!(["a", "b"]));
+        wm.run_command("[id=1] unmark");
+        assert_eq!(marks_json(&wm), serde_json::json!(["b"]));
+        wm.run_command("[id=1] mark a; unmark");
+        assert_eq!(marks_json(&wm), serde_json::json!([]));
+    }
+
+    #[test]
+    fn move_to_mark_clears_fullscreen_and_scratch_state() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("fullscreen enable; workspace 2");
+        wm.manage(win(2));
+        wm.run_command("fullscreen enable; mark t");
+        wm.run_command("[id=1] move container to mark t");
+        let ws = wm.focused_workspace();
+        let fs = wm
+            .tree
+            .windows_under(ws)
+            .into_iter()
+            .filter(|&n| wm.tree.get(n).fullscreen)
+            .count();
+        assert_eq!(fs, 1);
+        wm.manage(win(3));
+        wm.run_command("[id=3] move scratchpad");
+        wm.run_command("[id=3] move container to mark t");
+        let n3 = wm.tree.window_node(WindowId(3)).unwrap();
+        assert_eq!(wm.tree.get(n3).scratchpad, ScratchState::None);
+        assert!(!wm.tree.is_floating(n3));
+        assert!(!wm.run_command("scratchpad show")[0].success);
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn swap_across_workspaces_clears_fullscreen() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("fullscreen enable; workspace 2");
+        wm.manage(win(2));
+        wm.run_command("[id=2] swap container with id 1");
+        for id in [1, 2] {
+            let n = wm.tree.window_node(WindowId(id)).unwrap();
+            assert!(!wm.tree.get(n).fullscreen, "w{id}");
+        }
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn con_mark_and_con_id_target_containers() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("split v");
+        wm.manage(win(3));
+        assert_eq!(ws_desc(&wm), "H[w1 V[w2 w3]]");
+        wm.run_command("focus parent; mark x; [id=1] focus");
+        assert!(wm.run_command("[con_mark=x] layout tabbed")[0].success);
+        assert_eq!(ws_desc(&wm), "H[w1 T[w2 w3]]");
+        let c = wm
+            .tree
+            .parent(wm.tree.window_node(WindowId(2)).unwrap())
+            .unwrap();
+        wm.run_command(&format!("[con_id={}] layout stacking", c.0));
+        assert_eq!(ws_desc(&wm), "H[w1 S[w2 w3]]");
+        // A container has no window properties to match.
+        wm.run_command("[con_mark=x class=.] layout splitv");
+        assert_eq!(ws_desc(&wm), "H[w1 S[w2 w3]]");
         check_invariants(&wm);
     }
 }

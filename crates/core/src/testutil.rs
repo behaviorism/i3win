@@ -38,6 +38,23 @@ pub fn check_invariants(wm: &Wm) {
     use crate::tree::NodeKind;
     fn walk(wm: &Wm, n: crate::tree::NodeId) {
         let node = wm.tree.get(n);
+        if let Some(p) = node.parent {
+            let pk = &wm.tree.get(p).kind;
+            match node.kind {
+                NodeKind::Root => panic!("root has a parent"),
+                NodeKind::Output { .. } => assert!(matches!(pk, NodeKind::Root)),
+                NodeKind::Workspace { .. } => {
+                    assert!(
+                        matches!(pk, NodeKind::Output { .. }),
+                        "workspace {n:?} parent"
+                    )
+                }
+                _ => assert!(
+                    matches!(pk, NodeKind::Workspace { .. } | NodeKind::Container),
+                    "{n:?} is not under a workspace or container"
+                ),
+            }
+        }
         match node.kind {
             NodeKind::Root | NodeKind::Output { .. } => {}
             NodeKind::Workspace { .. } | NodeKind::Container => {

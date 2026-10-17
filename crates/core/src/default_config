@@ -2,7 +2,7 @@
 # It will not be overwritten, so edit it as you like.
 #
 # Should you change your keyboard layout some time, delete
-# this file and re-run i3win to configure it again.
+# this file and restart i3win to regenerate it.
 
 # i3 config file (v4)
 #
@@ -24,7 +24,7 @@ floating_modifier $mod
 # Use Mouse+$mod+left button to drag tiling windows
 tiling_drag modifier titlebar
 
-# (i3win addition) Focus follows the keyboard only, as in i3's own default.
+# i3win addition: click-to-focus for new Windows users; i3's default is yes.
 focus_follows_mouse no
 
 # start a terminal

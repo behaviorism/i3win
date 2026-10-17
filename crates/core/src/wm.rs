@@ -4,7 +4,7 @@ use crate::criteria::select_matches;
 use crate::geom::Rect;
 use crate::keys::KeyCombo;
 use crate::ops::floating::clamp_floating_rect;
-use crate::tree::{Layout, NodeId, NodeKind, Tree, WindowData, WindowId, WindowInfo};
+use crate::tree::{Layout, NodeId, NodeKind, ScratchState, Tree, WindowData, WindowId, WindowInfo};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutputInfo {
@@ -94,7 +94,6 @@ fn is_window_command(cmd: &Command) -> bool {
             | Command::Mode(_)
             | Command::Nop
             | Command::ScratchpadShow
-            | Command::Unmark(None)
             | Command::Gaps { .. }
             | Command::Workspace { .. }
             | Command::RenameWorkspace { .. }
@@ -349,6 +348,33 @@ impl Wm {
         }
     }
 
+    /// Bookkeeping after `node` was re-parented from workspace `old` to
+    /// workspace `new` (nothing when it stayed on the same workspace).
+    /// Windows entering the scratch workspace become scratchpad windows
+    /// (`Fresh` unless they already were one), queued last in
+    /// `scratch_order`; windows moving anywhere else stop being scratchpad
+    /// windows. Fullscreen never follows a node to another workspace.
+    pub(crate) fn on_node_rehomed(&mut self, node: NodeId, old: Option<NodeId>, new: NodeId) {
+        if old == Some(new) {
+            return;
+        }
+        let to_scratch = new == self.scratch;
+        self.tree.get_mut(node).fullscreen = false;
+        for n in self.tree.windows_under(node) {
+            let nd = self.tree.get_mut(n);
+            nd.fullscreen = false;
+            if !to_scratch {
+                nd.scratchpad = ScratchState::None;
+            } else if nd.scratchpad == ScratchState::None {
+                nd.scratchpad = ScratchState::Fresh;
+            }
+            self.scratch_order.retain(|&x| x != n);
+            if to_scratch {
+                self.scratch_order.push(n);
+            }
+        }
+    }
+
     fn resolve_assign(&mut self, target: Option<&WorkspaceTarget>) -> NodeId {
         let name = match target {
             Some(WorkspaceTarget::Number(n)) => {
@@ -448,12 +474,14 @@ impl Wm {
                 .no_focus
                 .iter()
                 .any(|c| c.matches_node(self, node));
+        let mut pushed = None;
         if ws == self.focused_workspace() {
             // A new node is queued last in every focus list, so skipping the
             // focus calls leaves the current focus untouched.
             if !popup_blocked && !no_focus {
                 self.tree.set_focused(node);
                 self.push_focus(id);
+                pushed = Some(id);
             }
         } else {
             self.tree.set_focused_within(node, ws);
@@ -472,6 +500,16 @@ impl Wm {
             for g in groups {
                 for c in &g.commands {
                     let _ = self.exec_command(c, node);
+                }
+            }
+        }
+        // for_window may have moved the new window away (e.g. `move
+        // scratchpad`): the OS focus must follow the real focus leaf.
+        if pushed.is_some() {
+            let leaf = self.focus_leaf_window();
+            if leaf != pushed {
+                if let Some(w) = leaf {
+                    self.push_focus(w);
                 }
             }
         }
@@ -626,6 +664,16 @@ impl Wm {
                     });
                     continue;
                 }
+                // `unmark` without criteria clears marks tree-wide; with
+                // criteria only the matched containers' (via exec_command).
+                if let (Command::Unmark(name), None) = (cmd, &matched) {
+                    self.unmark(None, name.as_deref());
+                    results.push(CommandResult {
+                        success: true,
+                        error: None,
+                    });
+                    continue;
+                }
                 let mut targets = match &matched {
                     Some(t) => t.clone(),
                     None => vec![self.focused()],
@@ -683,7 +731,7 @@ impl Wm {
             Command::Exit => self.effects.push(Effect::Exit),
             Command::Nop => {}
             Command::Mark { add, toggle, name } => self.mark(target, *add, *toggle, name),
-            Command::Unmark(name) => self.unmark(name.as_deref()),
+            Command::Unmark(name) => self.unmark(Some(target), name.as_deref()),
             Command::MoveToMark(name) => return self.move_to_mark(target, name),
             Command::MoveScratchpad => return self.move_to_scratchpad(target),
             Command::ScratchpadShow => return self.scratchpad_show(),
@@ -951,6 +999,23 @@ mod tests {
         let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
         wm.manage(win(1));
         assert!(wm.take_effects().contains(&Effect::Close(WindowId(1))));
+    }
+    #[test]
+    fn for_window_move_away_pushes_real_focus_leaf() {
+        for cmd in ["move scratchpad", "move to workspace 3"] {
+            let cfg = crate::config::parse_config(&format!("for_window [class=\"c2\"] {cmd}\n"));
+            let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+            wm.manage(win(1));
+            wm.take_effects();
+            wm.manage(win(2));
+            let last_focus = wm.take_effects().into_iter().rev().find_map(|e| match e {
+                Effect::Focus(w) => Some(w),
+                _ => None,
+            });
+            assert_eq!(last_focus, Some(WindowId(1)), "{cmd}");
+            assert_eq!(wm.focused_window(), Some(WindowId(1)), "{cmd}");
+            check_invariants(&wm);
+        }
     }
     #[test]
     fn unmanage_refocuses_previous() {

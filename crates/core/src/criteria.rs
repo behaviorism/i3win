@@ -215,14 +215,33 @@ impl Criteria {
     }
 }
 
-/// All windows matching `c`; with `urgent=latest|oldest` only the most / least
-/// recently urgent window among the matches.
+/// Windows and split containers in tree order (tiled before floating).
+fn windows_and_containers(wm: &Wm) -> Vec<NodeId> {
+    fn walk(wm: &Wm, n: NodeId, out: &mut Vec<NodeId>) {
+        let node = wm.tree.get(n);
+        if matches!(node.kind, NodeKind::Window(_) | NodeKind::Container) {
+            out.push(n);
+        }
+        for &c in node.children.iter().chain(node.floating.iter()) {
+            walk(wm, c, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(wm, wm.tree.root(), &mut out);
+    out
+}
+
+/// All windows matching `c` (split containers too when `con_mark` or
+/// `con_id` is given: every other key is a window property); with
+/// `urgent=latest|oldest` only the most / least recently urgent window among
+/// the matches.
 pub fn select_matches(wm: &Wm, c: &Criteria) -> Vec<NodeId> {
-    let matched = wm
-        .tree
-        .windows_under(wm.tree.root())
-        .into_iter()
-        .filter(|&n| c.matches_node(wm, n));
+    let candidates = if c.con_mark.is_some() || c.con_id.is_some() {
+        windows_and_containers(wm)
+    } else {
+        wm.tree.windows_under(wm.tree.root())
+    };
+    let matched = candidates.into_iter().filter(|&n| c.matches_node(wm, n));
     let Some(pick) = c.urgent else {
         return matched.collect();
     };

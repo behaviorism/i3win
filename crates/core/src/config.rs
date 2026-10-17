@@ -1132,6 +1132,11 @@ mod tests {
             assert!(t.contains(line), "missing: {line}");
         }
         assert!(!t.contains("position"));
+        assert!(t.contains("delete\n# this file and restart i3win to regenerate it."));
+        assert!(t.contains(
+            "i3win addition: click-to-focus for new Windows users; i3's default is yes."
+        ));
+        assert!(!t.contains("re-run i3win") && !t.contains("as in i3's own default"));
         assert!(default_config_text(false).contains("bindsym $mod+Return exec cmd"));
         let c = parse_config(&t);
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);

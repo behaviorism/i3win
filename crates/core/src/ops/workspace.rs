@@ -1,7 +1,7 @@
 use crate::command::{OutputTarget, WorkspaceTarget};
 use crate::geom::{Direction, Rect};
 use crate::ops::floating::clamp_floating_rect;
-use crate::tree::{Layout, NodeId, NodeKind, ScratchState};
+use crate::tree::{Layout, NodeId, NodeKind};
 use crate::wm::{workspace_num, IpcEvent, OutputInfo, Wm};
 
 fn sort_key(num: Option<i32>, name: &str) -> (bool, i32, String) {
@@ -336,17 +336,12 @@ impl Wm {
         let src_rect = self.tree.output_of(src).map(|o| self.output_rect(o));
         let src_was_focused = self.is_visible(src) && self.focused_workspace() == src;
         let old_parent = self.tree.parent(target);
-        let moved_nodes = self.tree.windows_under(target);
-        let moved: Vec<_> = moved_nodes
-            .iter()
-            .copied()
+        let moved: Vec<_> = self
+            .tree
+            .windows_under(target)
+            .into_iter()
             .filter_map(|n| self.tree.window_id(n))
             .collect();
-        for &n in &moved_nodes {
-            let node = self.tree.get_mut(n);
-            node.fullscreen = false;
-            node.scratchpad = ScratchState::None;
-        }
         self.tree.detach(target);
         if let Some(p) = old_parent {
             if matches!(self.tree.get(p).kind, NodeKind::Container) {
@@ -362,6 +357,7 @@ impl Wm {
         } else {
             self.insert_tiled(dest, target);
         }
+        self.on_node_rehomed(target, Some(src), dest);
         let f = self.tree.focused_descendant(target);
         self.tree.set_focused_within(f, dest);
         if src_was_focused {

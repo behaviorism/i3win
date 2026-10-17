@@ -51,7 +51,6 @@ impl Wm {
             }
         }
         let old_parent = self.tree.parent(n);
-        self.tree.get_mut(n).fullscreen = false;
         self.tree.detach(n);
         if let Some(p) = old_parent {
             if matches!(self.tree.get(p).kind, NodeKind::Container) {
@@ -59,8 +58,7 @@ impl Wm {
             }
         }
         self.tree.attach_floating(self.scratch, n);
-        self.scratch_order.retain(|&x| x != n);
-        self.scratch_order.push(n);
+        self.on_node_rehomed(n, Some(ws), self.scratch);
         self.focused_container = None;
         if was_focused && self.is_visible(ws) {
             let f = self.tree.focused_descendant(ws);
@@ -386,6 +384,30 @@ mod tests {
 ",
         );
         assert_eq!(c.warnings.len(), 1);
+    }
+
+    #[test]
+    fn geometry_on_hidden_scratch_window_uses_focused_output() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("[id=2] move scratchpad; scratchpad show");
+        wm.on_floating_moved(WindowId(2), Rect::new(10, 20, 400, 300));
+        wm.run_command("scratchpad show");
+        let n = wm.tree.window_node(WindowId(2)).unwrap();
+        assert_eq!(wm.tree.workspace_of(n), Some(wm.scratch_workspace()));
+        wm.run_command("[id=2] move position center");
+        wm.run_command("scratchpad show");
+        let rect = |wm: &crate::wm::Wm| match &wm.tree.get(n).kind {
+            NodeKind::Window(d) => d.floating_rect.unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(rect(&wm), Rect::new(300, 100, 400, 300));
+        wm.run_command("scratchpad show");
+        wm.run_command("[id=2] resize set 50 ppt 50 ppt");
+        wm.run_command("scratchpad show");
+        assert_eq!((rect(&wm).w, rect(&wm).h), (500, 250));
+        check_invariants(&wm);
     }
 
     #[test]

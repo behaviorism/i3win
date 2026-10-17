@@ -65,10 +65,16 @@ impl Wm {
         Ok(())
     }
 
-    /// Rect of the output that holds `n`.
+    /// Rect of the output that holds `n`. A hidden scratchpad window is
+    /// measured against the focused output, where `scratchpad show` puts it
+    /// (the `__i3` output has no size).
     pub(crate) fn output_rect_of(&self, n: NodeId) -> Option<Rect> {
         let ws = self.tree.workspace_of(n)?;
-        let o = self.tree.output_of(ws)?;
+        let o = if ws == self.scratch {
+            self.focused_output()
+        } else {
+            self.tree.output_of(ws)?
+        };
         match &self.tree.get(o).kind {
             NodeKind::Output { rect, .. } => Some(*rect),
             _ => None,
