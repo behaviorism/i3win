@@ -12,7 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
-use crate::mainloop::{main_hwnd, WM_APP_KEY};
+use crate::mainloop::{main_hwnd, WM_APP_KEY, WM_APP_MODS};
 
 const HC_ACTION: i32 = 0;
 const LLKHF_EXTENDED: u32 = 0x01;
@@ -59,6 +59,9 @@ pub struct KeyMatcher {
     combos: HashMap<KeyCombo, (bool, bool)>,
     /// Swallowed keys -> the release binding to fire on their key-up, with its mask_menu.
     swallowed: HashMap<u16, Option<(KeyCombo, bool)>>,
+    /// Modifier whose held state is reported by `watch_flip` (Hide-mode bars).
+    watch: Option<Modifiers>,
+    watch_held: bool,
 }
 
 impl Default for KeyMatcher {
@@ -73,6 +76,8 @@ impl KeyMatcher {
             down_mods: HashSet::new(),
             combos: HashMap::new(),
             swallowed: HashMap::new(),
+            watch: None,
+            watch_held: false,
         }
     }
 
@@ -86,6 +91,26 @@ impl KeyMatcher {
                 e.0 = true;
             }
         }
+    }
+
+    /// Sets the modifier to watch (`None` disables); the current state is the baseline.
+    pub fn set_watch(&mut self, watch: Option<Modifiers>) {
+        self.watch = watch;
+        self.watch_held = watch.is_some_and(|m| self.mods().contains(m));
+    }
+
+    /// Applies a modifier key event and returns the new held state of the watched
+    /// modifier when it flipped (`None` for repeats, other keys or no watch).
+    pub fn watch_flip(&mut self, vk: u16, down: bool) -> Option<bool> {
+        let watch = self.watch?;
+        modifier_of(vk)?;
+        if down {
+            self.down_mods.insert(vk);
+        } else {
+            self.down_mods.remove(&vk);
+        }
+        let held = self.mods().contains(watch);
+        (held != std::mem::replace(&mut self.watch_held, held)).then_some(held)
     }
 
     pub fn mods(&self) -> Modifiers {
@@ -180,6 +205,26 @@ unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
         let vk = info.vkCode as u16;
         let own = info.flags.0 & LLKHF_INJECTED != 0 && info.dwExtraInfo == OWN_INPUT_TAG;
         let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
+        let flip = if own {
+            None
+        } else {
+            MATCHER.with(|m| {
+                m.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut m| m.watch_flip(vk, down))
+            })
+        };
+        if let Some(held) = flip {
+            let main = main_hwnd();
+            if main != 0 {
+                let _ = PostMessageW(
+                    HWND(main as *mut _),
+                    WM_APP_MODS,
+                    WPARAM(held as usize),
+                    LPARAM(0),
+                );
+            }
+        }
         let action = MATCHER.with(|m| match m.try_borrow_mut() {
             Ok(mut m) => {
                 if down && !own && modifier_of(vk).is_none() {
@@ -254,6 +299,14 @@ pub fn set_combos(combos: &[(KeyCombo, bool)]) {
     });
 }
 
+pub fn set_modifier_watch(mods: Option<Modifiers>) {
+    MATCHER.with(|m| {
+        if let Ok(mut m) = m.try_borrow_mut() {
+            m.set_watch(mods);
+        }
+    });
+}
+
 pub fn drain() -> Vec<(Option<KeyCombo>, bool, bool)> {
     QUEUE.with(|q| {
         q.try_borrow_mut()
@@ -264,6 +317,16 @@ pub fn drain() -> Vec<(Option<KeyCombo>, bool, bool)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn modifier_watch_disabled_without_hide_bars() {
+        let mut k = KeyMatcher::new();
+        k.set_watch(None);
+        assert_eq!(k.watch_flip(0x5B, true), None);
+        k.set_watch(Some(Modifiers::WIN));
+        assert_eq!(k.watch_flip(0x5B, true), Some(true));
+        assert_eq!(k.watch_flip(0x5B, true), None);
+        assert_eq!(k.watch_flip(0x5B, false), Some(false));
+    }
     use super::*;
     use i3win_core::keys::parse_combo;
     fn m(binds: &[&str]) -> KeyMatcher {

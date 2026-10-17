@@ -7,11 +7,11 @@ use std::process::Command;
 use std::time::Instant;
 
 use i3win_core::arrange::floating_frame_from_client;
-use i3win_core::config::{default_config_text, parse_config, Config};
+use i3win_core::config::{default_config_text, parse_config, BarMode, Config};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::Block;
 use i3win_core::ipc::{self, IpcContext, Request, EV_TICK};
-use i3win_core::keys::KeyCombo;
+use i3win_core::keys::{KeyCombo, Modifiers};
 use i3win_core::tree::{NodeKind, WindowId};
 use i3win_core::wm::{Effect, Wm};
 
@@ -145,11 +145,14 @@ pub struct App {
     bars: Bars,
     /// Blocks changed since the bars were last redrawn.
     bars_dirty: bool,
+    /// Whether the modifier watched for Hide-mode bars is currently held.
+    modifier_held: bool,
     /// One status process and its latest blocks per configured bar id.
     statuses: HashMap<String, BarStatus>,
     store: HiddenStore,
     config_path: PathBuf,
     last_combos: Vec<(KeyCombo, bool)>,
+    last_watch: Option<Modifiers>,
     /// Effects queued outside the core (exec lines from the config), flushed first.
     pending: Vec<Effect>,
     /// Last successfully read config text, served by GET_CONFIG.
@@ -193,9 +196,11 @@ impl App {
             decos: Decos::new(),
             bars: Bars::new(),
             bars_dirty: false,
+            modifier_held: false,
             store: HiddenStore::open(paths::hidden_path()),
             config_path,
             last_combos: Vec::new(),
+            last_watch: None,
             pending,
             config_text,
             pipe_name,
@@ -241,12 +246,21 @@ impl App {
             .collect()
     }
 
+    /// The watched modifier of Hide-mode bars went down or up: redraw only the bars.
+    pub fn on_modifier_state(&mut self, held: bool) {
+        if self.modifier_held != held {
+            self.modifier_held = held;
+            self.refresh_bars();
+        }
+    }
+
     /// Redraws only the bars with the current blocks.
     fn refresh_bars(&mut self) {
         self.bars_dirty = false;
         let arr = self.wm.arrange();
         let blocks = self.all_blocks();
-        self.bars.update(&self.wm, &arr, &blocks);
+        self.bars
+            .update(&self.wm, &arr, &blocks, self.modifier_held);
     }
 
     fn try_manage_in(wm: &mut Wm, id: WindowId) {
@@ -510,7 +524,8 @@ impl App {
                 .map_or(1.0, |(_, s)| *s)
         });
         let blocks = self.all_blocks();
-        self.bars.update(&self.wm, &arr, &blocks);
+        self.bars
+            .update(&self.wm, &arr, &blocks, self.modifier_held);
         self.bars_dirty = false;
         // Focus last: focusing a still-hidden window fails.
         let leaf = self
@@ -526,6 +541,20 @@ impl App {
         if combos != self.last_combos {
             keyboard::set_combos(&combos);
             self.last_combos = combos;
+        }
+        let watch = self
+            .wm
+            .config
+            .bars
+            .iter()
+            .find(|b| self.wm.bar_state_of(&b.id).0 == BarMode::Hide)
+            .and_then(|b| b.modifier);
+        if watch != self.last_watch {
+            keyboard::set_modifier_watch(watch);
+            self.last_watch = watch;
+            if watch.is_none() {
+                self.modifier_held = false;
+            }
         }
     }
 

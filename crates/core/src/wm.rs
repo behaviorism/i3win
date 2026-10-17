@@ -1,5 +1,12 @@
-use crate::command::{parse_commands, BorderArg, Command, TitleIconArg, Toggle, WorkspaceTarget};
-use crate::config::{Border, Config, FocusOnActivation, PopupDuringFullscreen};
+use std::collections::HashMap;
+
+use crate::command::{
+    parse_commands, BarModeArg, BorderArg, Command, HiddenArg, TitleIconArg, Toggle,
+    WorkspaceTarget,
+};
+use crate::config::{
+    BarMode, Border, Config, FocusOnActivation, HiddenState, PopupDuringFullscreen,
+};
 use crate::criteria::select_matches;
 use crate::geom::Rect;
 use crate::keys::KeyCombo;
@@ -36,6 +43,10 @@ pub enum IpcEvent {
     Output,
     Tick {
         payload: String,
+    },
+    /// A bar's runtime mode / hidden_state changed.
+    BarconfigUpdate {
+        id: String,
     },
 }
 
@@ -75,6 +86,8 @@ pub struct Wm {
     pub(crate) scratch_order: Vec<NodeId>,
     /// Mouse pointer position, set by the platform before each command.
     pub pointer: Option<(i32, i32)>,
+    /// Runtime (mode, hidden_state) per bar id; initialised from the config.
+    pub bar_state: HashMap<String, (BarMode, HiddenState)>,
 }
 
 pub const SCRATCH_OUTPUT: &str = "__i3";
@@ -94,6 +107,8 @@ fn is_window_command(cmd: &Command) -> bool {
             | Command::Exit
             | Command::Mode(_)
             | Command::Nop
+            | Command::BarMode { .. }
+            | Command::BarHiddenState { .. }
             | Command::ScratchpadShow
             | Command::Gaps { .. }
             | Command::Workspace { .. }
@@ -117,7 +132,9 @@ impl Wm {
             scratch: NodeId(0),
             scratch_order: Vec::new(),
             pointer: None,
+            bar_state: HashMap::new(),
         };
+        wm.init_bar_state();
         let outputs = if outputs.is_empty() {
             vec![OutputInfo {
                 name: "default".into(),
@@ -734,6 +751,35 @@ impl Wm {
             Command::Reload | Command::Restart => self.effects.push(Effect::Reload),
             Command::Exit => self.effects.push(Effect::Exit),
             Command::Nop => {}
+            Command::BarMode { mode, id } => {
+                let ids = self.bar_ids(id.as_deref())?;
+                for id in ids {
+                    let st = self.bar_state_of(&id);
+                    let new = match mode {
+                        BarModeArg::Dock => BarMode::Dock,
+                        BarModeArg::Hide => BarMode::Hide,
+                        BarModeArg::Invisible => BarMode::Invisible,
+                        BarModeArg::Toggle if st.0 == BarMode::Dock => BarMode::Hide,
+                        BarModeArg::Toggle => BarMode::Dock,
+                    };
+                    self.bar_state.insert(id.clone(), (new, st.1));
+                    self.emit(IpcEvent::BarconfigUpdate { id });
+                }
+            }
+            Command::BarHiddenState { state, id } => {
+                let ids = self.bar_ids(id.as_deref())?;
+                for id in ids {
+                    let st = self.bar_state_of(&id);
+                    let new = match state {
+                        HiddenArg::Hide => HiddenState::Hide,
+                        HiddenArg::Show => HiddenState::Show,
+                        HiddenArg::Toggle if st.1 == HiddenState::Hide => HiddenState::Show,
+                        HiddenArg::Toggle => HiddenState::Hide,
+                    };
+                    self.bar_state.insert(id.clone(), (st.0, new));
+                    self.emit(IpcEvent::BarconfigUpdate { id });
+                }
+            }
             Command::Mark { add, toggle, name } => self.mark(target, *add, *toggle, name),
             Command::Unmark(name) => self.unmark(Some(target), name.as_deref()),
             Command::MoveToMark(name) => return self.move_to_mark(target, name),
@@ -875,8 +921,38 @@ impl Wm {
             .unwrap_or_default()
     }
 
+    fn init_bar_state(&mut self) {
+        self.bar_state = self
+            .config
+            .bars
+            .iter()
+            .map(|b| (b.id.clone(), (b.mode, b.hidden_state)))
+            .collect();
+    }
+
+    /// Current (mode, hidden_state) of a bar (config values if never changed).
+    pub fn bar_state_of(&self, id: &str) -> (BarMode, HiddenState) {
+        self.bar_state.get(id).copied().unwrap_or_else(|| {
+            self.config
+                .bars
+                .iter()
+                .find(|b| b.id == id)
+                .map(|b| (b.mode, b.hidden_state))
+                .unwrap_or_default()
+        })
+    }
+
+    fn bar_ids(&self, id: Option<&str>) -> Result<Vec<String>, String> {
+        match id {
+            None => Ok(self.config.bars.iter().map(|b| b.id.clone()).collect()),
+            Some(i) if self.config.bars.iter().any(|b| b.id == i) => Ok(vec![i.to_string()]),
+            Some(_) => Err("No such bar".into()),
+        }
+    }
+
     pub fn reload_config(&mut self, config: Config) {
         self.config = config;
+        self.init_bar_state();
         if self.mode != "default" {
             self.mode = "default".into();
             self.emit(IpcEvent::Mode {
@@ -893,6 +969,56 @@ mod tests {
     use crate::testutil::*;
     use crate::tree::{Layout, NodeKind, WindowId};
     use crate::wm::*;
+
+    #[test]
+    fn bar_commands_change_state_and_emit() {
+        use crate::config::parse_config;
+        let mut wm = Wm::new(
+            parse_config(
+                "bar {
+}
+bar {
+id b
+mode hide
+}
+",
+            ),
+            vec![out("O1", 0, 1000)],
+        );
+        wm.take_effects();
+        assert!(wm.run_command("bar mode toggle bar-0")[0].success);
+        assert_eq!(wm.bar_state_of("bar-0").0, BarMode::Hide);
+        assert!(wm.run_command("bar hidden_state show")[0].success);
+        assert_eq!(wm.bar_state_of("b").1, HiddenState::Show);
+        assert!(!wm.run_command("bar mode dock nope")[0].success);
+        let n = wm
+            .take_effects()
+            .iter()
+            .filter(|e| matches!(e, Effect::Ipc(IpcEvent::BarconfigUpdate { .. })))
+            .count();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn hide_mode_bar_reserves_no_space() {
+        use crate::config::{parse_config, Font};
+        let mut cfg = parse_config(
+            "bar {
+mode hide
+}
+default_border none
+",
+        );
+        cfg.font = Font {
+            family: "x".into(),
+            size_pt: 9.0,
+        };
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        assert_eq!(wm.arrange().windows[0].rect.h, 500);
+        wm.run_command("bar mode dock");
+        assert!(wm.arrange().windows[0].rect.h < 500);
+    }
 
     #[test]
     fn gaps_all_overrides_config_workspace_gaps() {

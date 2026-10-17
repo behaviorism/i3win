@@ -364,7 +364,8 @@ pub fn bar_config_json(wm: &Wm, payload: &str) -> Value {
         BarPosition::Top => "top",
         BarPosition::Bottom => "bottom",
     };
-    let mode = match bar.mode {
+    let (rt_mode, rt_hidden) = wm.bar_state_of(&bar.id);
+    let mode = match rt_mode {
         BarMode::Dock => "dock",
         BarMode::Hide => "hide",
         BarMode::Invisible => "invisible",
@@ -379,7 +380,7 @@ pub fn bar_config_json(wm: &Wm, payload: &str) -> Value {
     json!({
         "id": bar.id,
         "mode": mode,
-        "hidden_state": match bar.hidden_state {
+        "hidden_state": match rt_hidden {
             HiddenState::Hide => "hide",
             HiddenState::Show => "show",
         },
@@ -482,6 +483,11 @@ pub fn event_json(wm: &Wm, e: &IpcEvent) -> (u32, &'static str, String) {
             r#"{"change":"unspecified"}"#.to_string(),
         ),
         IpcEvent::Tick { payload } => (EV_TICK, "tick", tick_event(false, payload)),
+        IpcEvent::BarconfigUpdate { id } => (
+            EV_BARCONFIG_UPDATE,
+            "barconfig_update",
+            to_text(&bar_config_json(wm, id)),
+        ),
     }
 }
 

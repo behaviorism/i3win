@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use i3win_core::arrange::{bar_applies, bar_height_of, Arrangement};
 use i3win_core::bar_model::workspace_buttons;
-use i3win_core::config::{BarMode, BarPosition, Font};
+use i3win_core::config::{BarMode, BarPosition, Font, HiddenState};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::{Block, Click};
 use i3win_core::markup::parse_markup;
@@ -165,8 +165,16 @@ impl Bars {
     }
 
     /// Brings the bar windows in line with the config, outputs and `blocks`
-    /// (latest status blocks per bar id). Only Dock bars get windows for now.
-    pub fn update(&mut self, wm: &Wm, arr: &Arrangement, blocks: &HashMap<String, Vec<Block>>) {
+    /// (latest status blocks per bar id). Dock bars reserve space; Hide bars are
+    /// overlays shown while `hidden_state` is show, `modifier_held`, or a
+    /// workspace on the output is urgent; Invisible bars get no window.
+    pub fn update(
+        &mut self,
+        wm: &Wm,
+        arr: &Arrangement,
+        blocks: &HashMap<String, Vec<Block>>,
+        modifier_held: bool,
+    ) {
         let mode = (wm.mode != "default").then_some(wm.mode.as_str());
         let mut live: HashSet<(String, String)> = HashSet::new();
         let no_blocks: Vec<Block> = Vec::new();
@@ -184,11 +192,14 @@ impl Bars {
             // Heights already taken at the top and bottom edges by earlier bars.
             let (mut top, mut bottom) = (0, 0);
             for bar in &wm.config.bars {
-                if bar.mode != BarMode::Dock || !bar_applies(bar, name, *primary) {
+                let (bar_mode, hidden_state) = wm.bar_state_of(&bar.id);
+                if bar_mode == BarMode::Invisible || !bar_applies(bar, name, *primary) {
                     continue;
                 }
                 let h = bar_height_of(bar, &wm.config, scale);
+                let mut overlay_offset = 0;
                 let offset = match bar.position {
+                    _ if bar_mode == BarMode::Hide => &mut overlay_offset,
                     BarPosition::Top => &mut top,
                     BarPosition::Bottom => &mut bottom,
                 };
@@ -250,7 +261,11 @@ impl Bars {
                     );
                 }
                 if let Some(bw) = self.windows.get_mut(&key) {
-                    let want_shown = !arr.fullscreen_outputs.contains(name);
+                    let revealed = bar_mode == BarMode::Dock
+                        || hidden_state == HiddenState::Show
+                        || (modifier_held && bar.modifier.is_some())
+                        || buttons.iter().any(|b| b.urgent);
+                    let want_shown = revealed && !arr.fullscreen_outputs.contains(name);
                     // Re-asserting topmost every flush would hop over menus and tooltips.
                     let raise = created || bw.rect != r || (want_shown && !bw.shown);
                     // SAFETY: plain Win32 calls on our own window.

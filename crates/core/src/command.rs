@@ -8,6 +8,19 @@ pub enum Len {
     Px(i32),
     Ppt(i32),
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarModeArg {
+    Dock,
+    Hide,
+    Invisible,
+    Toggle,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HiddenArg {
+    Hide,
+    Show,
+    Toggle,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub enum Toggle {
     Toggle,
@@ -87,6 +100,14 @@ pub enum GapsOp {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Exec(String),
+    BarMode {
+        mode: BarModeArg,
+        id: Option<String>,
+    },
+    BarHiddenState {
+        state: HiddenArg,
+        id: Option<String>,
+    },
     Focus(Direction),
     FocusParent,
     FocusChild,
@@ -763,6 +784,34 @@ fn parse_one(seg: &str) -> Result<Command, String> {
         "unmark" => Ok(Command::Unmark(a(0).map(str::to_string))),
         "swap" => parse_swap(args),
         "nop" => Ok(Command::Nop),
+        "bar" => {
+            let id = a(2).map(str::to_string);
+            if a(3).is_some() {
+                return Err("bar: too many arguments".into());
+            }
+            match (a(0), a(1)) {
+                (Some("mode"), Some(m)) => {
+                    let mode = match m {
+                        "dock" => BarModeArg::Dock,
+                        "hide" => BarModeArg::Hide,
+                        "invisible" => BarModeArg::Invisible,
+                        "toggle" => BarModeArg::Toggle,
+                        o => return Err(format!("bar mode: bad argument {o}")),
+                    };
+                    Ok(Command::BarMode { mode, id })
+                }
+                (Some("hidden_state"), Some(m)) => {
+                    let state = match m {
+                        "hide" => HiddenArg::Hide,
+                        "show" => HiddenArg::Show,
+                        "toggle" => HiddenArg::Toggle,
+                        o => return Err(format!("bar hidden_state: bad argument {o}")),
+                    };
+                    Ok(Command::BarHiddenState { state, id })
+                }
+                _ => Err("bar: expected `mode` or `hidden_state` with an argument".into()),
+            }
+        }
         "scratchpad" if a(0) == Some("show") && a(1).is_none() => Ok(Command::ScratchpadShow),
         _ => Err(format!("unknown command: {verb}")),
     }
@@ -771,6 +820,25 @@ fn parse_one(seg: &str) -> Result<Command, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_bar_commands() {
+        assert_eq!(
+            parse_one("bar mode toggle b").unwrap(),
+            Command::BarMode {
+                mode: BarModeArg::Toggle,
+                id: Some("b".into())
+            }
+        );
+        assert_eq!(
+            parse_one("bar hidden_state show").unwrap(),
+            Command::BarHiddenState {
+                state: HiddenArg::Show,
+                id: None
+            }
+        );
+        assert!(parse_one("bar mode sideways").is_err());
+    }
 
     fn ws(target: WorkspaceTarget) -> Command {
         Command::Workspace {

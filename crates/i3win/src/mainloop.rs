@@ -15,6 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 pub const WM_APP_EVENTS: u32 = WM_APP + 1;
 pub const WM_APP_KEY: u32 = WM_APP + 2;
 pub const WM_APP_MAIN: u32 = WM_APP + 3;
+/// The watched modifier of Hide-mode bars went down (wparam 1) or up (0).
+pub const WM_APP_MODS: u32 = WM_APP + 4;
 
 #[derive(Debug)]
 pub enum MainMsg {
@@ -161,6 +163,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 app.flush();
             }) {
+                repost(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
+        WM_APP_MODS => {
+            if !with_app(|app| app.on_modifier_state(wp.0 != 0)) {
                 repost(hwnd, msg, wp, lp);
             }
             LRESULT(0)

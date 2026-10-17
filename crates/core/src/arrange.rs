@@ -105,8 +105,10 @@ pub fn bar_applies(bar: &BarConfig, output_name: &str, primary: bool) -> bool {
 }
 
 /// Pixels `(top, bottom)` reserved by the Dock-mode bars shown on an output.
+/// `mode_of` gives a bar's current (runtime) mode by id.
 pub fn reserved_bar_space(
     config: &Config,
+    mode_of: &dyn Fn(&str) -> BarMode,
     output_name: &str,
     primary: bool,
     scale: f32,
@@ -115,7 +117,7 @@ pub fn reserved_bar_space(
     for bar in config
         .bars
         .iter()
-        .filter(|b| b.mode == BarMode::Dock && bar_applies(b, output_name, primary))
+        .filter(|b| mode_of(&b.id) == BarMode::Dock && bar_applies(b, output_name, primary))
     {
         let h = bar_height_of(bar, config, scale);
         match bar.position {
@@ -138,6 +140,7 @@ struct Ctx<'a> {
     tree: &'a Tree,
     config: &'a Config,
     machine: &'a str,
+    bar_mode: &'a dyn Fn(&str) -> BarMode,
     focused: NodeId,
     th: i32,
     g: i32,
@@ -381,11 +384,18 @@ fn visible_tiled(tree: &Tree, id: NodeId) -> usize {
     n.children.iter().map(|&c| visible_tiled(tree, c)).sum()
 }
 
-pub fn arrange(tree: &Tree, config: &Config, focused: NodeId, machine: &str) -> Arrangement {
+pub fn arrange(
+    tree: &Tree,
+    config: &Config,
+    focused: NodeId,
+    machine: &str,
+    bar_mode: &dyn Fn(&str) -> BarMode,
+) -> Arrangement {
     let mut ctx = Ctx {
         tree,
         config,
         machine,
+        bar_mode,
         focused,
         th: 0,
         g: px(config.gaps.inner),
@@ -490,7 +500,7 @@ fn arrange_workspace(
     }
 
     let mut area = out_rect;
-    let (bar_top, bar_bottom) = reserved_bar_space(config, out_name, primary, scale);
+    let (bar_top, bar_bottom) = reserved_bar_space(config, ctx.bar_mode, out_name, primary, scale);
     area = area.inset(0, bar_top, 0, bar_bottom);
     let lead = |outer: i32| px(outer) + g - g / 2;
     let trail = |outer: i32| px(outer) + g / 2;
@@ -557,7 +567,13 @@ impl Wm {
     }
 
     pub fn arrange(&self) -> Arrangement {
-        arrange(&self.tree, &self.config, self.focused(), &self.machine)
+        arrange(
+            &self.tree,
+            &self.config,
+            self.focused(),
+            &self.machine,
+            &|id| self.bar_state_of(id).0,
+        )
     }
 }
 
@@ -567,6 +583,9 @@ mod tests {
     use crate::config::{parse_config, BarConfig, Border, Font};
     use crate::testutil::{out, test_wm, win};
 
+    fn mode_of_cfg(c: &Config, id: &str) -> BarMode {
+        c.bars.iter().find(|b| b.id == id).unwrap().mode
+    }
     fn placement(a: &Arrangement, w: isize) -> Rect {
         a.windows.iter().find(|p| p.id == WindowId(w)).unwrap().rect
     }
@@ -733,8 +752,14 @@ output B
             size_pt: 9.0,
         };
         let h = bar_height_of(&c.bars[0], &c, 1.0);
-        assert_eq!(reserved_bar_space(&c, "A", false, 1.0), (0, 2 * h));
-        assert_eq!(reserved_bar_space(&c, "B", false, 1.0), (h, 2 * h));
+        assert_eq!(
+            reserved_bar_space(&c, &|id| mode_of_cfg(&c, id), "A", false, 1.0),
+            (0, 2 * h)
+        );
+        assert_eq!(
+            reserved_bar_space(&c, &|id| mode_of_cfg(&c, id), "B", false, 1.0),
+            (h, 2 * h)
+        );
         assert!(bar_applies(
             &parse_config(
                 "bar {
