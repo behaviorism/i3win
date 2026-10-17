@@ -203,9 +203,12 @@ impl Wm {
                 let Some(dst) = self.tree.workspace_of(*t) else {
                     return false;
                 };
-                let moved_windows = [dragged, *t];
+                let in_tabs = self.tree.parent(*t).is_some_and(|p| {
+                    matches!(self.tree.get(p).layout, Layout::Tabbed | Layout::Stacked)
+                });
+                let mut moved_windows = vec![dragged];
                 match zone {
-                    DropZone::Swap => {
+                    DropZone::Swap if !in_tabs => {
                         self.tree.swap(dragged, *t);
                         if self.tree.workspace_of(dragged) != Some(dst) {
                             return false;
@@ -214,11 +217,18 @@ impl Wm {
                             self.on_node_rehomed(dragged, Some(src), dst);
                             self.on_node_rehomed(*t, Some(dst), src);
                         }
+                        moved_windows.push(*t);
                     }
-                    DropZone::Side(d) => self.insert_beside(dragged, *t, *d),
-                }
-                if src != dst && !matches!(zone, DropZone::Swap) {
-                    self.on_node_rehomed(dragged, Some(src), dst);
+                    _ => {
+                        let d = match zone {
+                            DropZone::Side(d) => *d,
+                            DropZone::Swap => Direction::Right,
+                        };
+                        self.insert_beside(dragged, *t, d);
+                        if src != dst {
+                            self.on_node_rehomed(dragged, Some(src), dst);
+                        }
+                    }
                 }
                 self.finish_drop(dragged, src);
                 for n in moved_windows {
@@ -513,6 +523,44 @@ mod tests {
         assert_eq!(ws_desc(&wm), "H[T[w1 w3] w2]");
         assert!(wm.drop_window(n(&wm, 2), &DropTarget::Workspace("4".into())));
         assert_eq!(wm.tree.describe(wm.find_workspace("4").unwrap()), "H[w2]");
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn drop_swap_on_tab_inserts_tab() {
+        let mut wm = test_wm();
+        wm.config.bars.clear();
+        for i in 1..=3 {
+            wm.manage(win(i));
+        }
+        let n = |wm: &Wm, i| wm.tree.window_node(WindowId(i)).unwrap();
+        wm.run_command("[id=1] split v, layout tabbed");
+        assert!(wm.drop_window(n(&wm, 3), &DropTarget::Window(n(&wm, 1), DropZone::Swap)));
+        assert_eq!(ws_desc(&wm), "H[T[w1 w3] w2]");
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn drop_side_across_outputs() {
+        let mut wm = Wm::new(
+            crate::config::Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        );
+        wm.config.bars.clear();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("focus output right");
+        wm.manage(win(3));
+        wm.run_command("[id=2] fullscreen enable");
+        let n = |wm: &Wm, i| wm.tree.window_node(WindowId(i)).unwrap();
+        assert!(wm.drop_window(
+            n(&wm, 2),
+            &DropTarget::Window(n(&wm, 3), DropZone::Side(Direction::Down))
+        ));
+        let b = wm.outputs()[1];
+        assert_eq!(wm.tree.describe(wm.visible_workspace(b)), "H[V[w3 w2]]");
+        assert!(!wm.tree.get(n(&wm, 2)).fullscreen);
+        assert_eq!(wm.focused_window(), Some(WindowId(2)));
         check_invariants(&wm);
     }
 
