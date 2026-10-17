@@ -1,3 +1,4 @@
+use crate::config::GapsOverride;
 use crate::geom::{Orientation, Rect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -89,6 +90,8 @@ pub struct Node {
     pub layout: Layout,
     pub percent: f64,
     pub fullscreen: bool,
+    /// Runtime per-workspace gaps override (Workspace nodes only).
+    pub gaps: GapsOverride,
 }
 
 pub struct Tree {
@@ -142,6 +145,7 @@ impl Tree {
             layout,
             percent: 1.0,
             fullscreen: false,
+            gaps: GapsOverride::default(),
         }));
         id
     }

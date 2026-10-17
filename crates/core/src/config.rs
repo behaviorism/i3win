@@ -79,6 +79,81 @@ pub struct Binding {
     pub combo: KeyCombo,
     pub command: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Gaps {
+    pub inner: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub left: i32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct GapsOverride {
+    pub inner: Option<i32>,
+    pub top: Option<i32>,
+    pub right: Option<i32>,
+    pub bottom: Option<i32>,
+    pub left: Option<i32>,
+}
+impl Gaps {
+    /// Each `Some` field of `o` replaces the corresponding field.
+    pub fn with(self, o: &GapsOverride) -> Gaps {
+        Gaps {
+            inner: o.inner.unwrap_or(self.inner),
+            top: o.top.unwrap_or(self.top),
+            right: o.right.unwrap_or(self.right),
+            bottom: o.bottom.unwrap_or(self.bottom),
+            left: o.left.unwrap_or(self.left),
+        }
+    }
+}
+impl GapsOverride {
+    /// `o`'s `Some` fields take precedence over `self`'s.
+    pub fn merge(&self, o: &GapsOverride) -> GapsOverride {
+        GapsOverride {
+            inner: o.inner.or(self.inner),
+            top: o.top.or(self.top),
+            right: o.right.or(self.right),
+            bottom: o.bottom.or(self.bottom),
+            left: o.left.or(self.left),
+        }
+    }
+}
+
+/// Parses `inner|outer|horizontal|vertical|top|right|bottom|left N`.
+fn parse_gaps_override(toks: &[&str]) -> Result<GapsOverride, String> {
+    let [which, n] = toks else {
+        return Err(format!("unsupported gaps form: {}", toks.join(" ")));
+    };
+    let n: i32 = n
+        .parse()
+        .map_err(|_| format!("gaps: invalid value '{n}'"))?;
+    let mut o = GapsOverride::default();
+    match *which {
+        "inner" => o.inner = Some(n),
+        "outer" => {
+            o.top = Some(n);
+            o.right = Some(n);
+            o.bottom = Some(n);
+            o.left = Some(n);
+        }
+        "horizontal" => {
+            o.left = Some(n);
+            o.right = Some(n);
+        }
+        "vertical" => {
+            o.top = Some(n);
+            o.bottom = Some(n);
+        }
+        "top" => o.top = Some(n),
+        "right" => o.right = Some(n),
+        "bottom" => o.bottom = Some(n),
+        "left" => o.left = Some(n),
+        _ => return Err(format!("unsupported gaps form: {which} {n}")),
+    }
+    Ok(o)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bindings: HashMap<String, Vec<Binding>>, // key "default" always present
@@ -91,8 +166,8 @@ pub struct Config {
     pub for_window: Vec<(Criteria, String)>,
     pub assigns: Vec<(Criteria, WorkspaceTarget)>,
     pub workspace_outputs: Vec<(String, Vec<String>)>,
-    pub gaps_inner: i32,
-    pub gaps_outer: i32,
+    pub gaps: Gaps,
+    pub workspace_gaps: Vec<(String, GapsOverride)>,
     pub colors: ClientColors,
     pub bar: Option<BarConfig>,
     pub focus_follows_mouse: bool,
@@ -453,8 +528,8 @@ pub fn parse_config(text: &str) -> Config {
         for_window: Vec::new(),
         assigns: Vec::new(),
         workspace_outputs: Vec::new(),
-        gaps_inner: 0,
-        gaps_outer: 0,
+        gaps: Gaps::default(),
+        workspace_gaps: Vec::new(),
         colors: ClientColors::default(),
         bar: None,
         focus_follows_mouse: true,
@@ -739,6 +814,22 @@ fn top_level(
         }
         "workspace" => {
             let toks: Vec<&str> = args.split_whitespace().collect();
+            let gaps_at = toks.iter().position(|t| *t == "gaps").filter(|i| {
+                *i >= 1
+                    && toks
+                        .iter()
+                        .position(|t| *t == "output")
+                        .is_none_or(|o| *i < o)
+            });
+            if let Some(i) = gaps_at {
+                let name = unquote(&toks[..i].join(" "));
+                let o = parse_gaps_override(&toks[i + 1..])?;
+                match cfg.workspace_gaps.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, cur)) => *cur = cur.merge(&o),
+                    None => cfg.workspace_gaps.push((name, o)),
+                }
+                return Ok(());
+            }
             let i = toks
                 .iter()
                 .position(|t| *t == "output")
@@ -750,19 +841,8 @@ fn top_level(
         }
         "gaps" => {
             let toks: Vec<&str> = args.split_whitespace().collect();
-            match toks.as_slice() {
-                [which @ ("inner" | "outer"), n] => {
-                    let n: i32 = n
-                        .parse()
-                        .map_err(|_| format!("gaps: invalid value '{n}'"))?;
-                    if *which == "inner" {
-                        cfg.gaps_inner = n;
-                    } else {
-                        cfg.gaps_outer = n;
-                    }
-                }
-                _ => return Err(format!("unsupported gaps form: {args}")),
-            }
+            let o = parse_gaps_override(&toks)?;
+            cfg.gaps = cfg.gaps.with(&o);
         }
         "focus_follows_mouse" => cfg.focus_follows_mouse = parse_bool(kw, args)?,
         "mouse_warping" => {
@@ -1056,8 +1136,42 @@ mod tests {
             }
         );
         assert_eq!(c.default_border, Border::Pixel(3));
-        assert_eq!((c.gaps_inner, c.gaps_outer), (10, 4));
+        assert_eq!(
+            c.gaps,
+            Gaps {
+                inner: 10,
+                top: 4,
+                right: 4,
+                bottom: 4,
+                left: 4
+            }
+        );
         assert_eq!(c.workspace_layout, Layout::Tabbed);
+    }
+    #[test]
+    fn gaps_forms() {
+        let c = parse_config("gaps inner 10\ngaps outer 5\ngaps horizontal 7\ngaps top 1\nworkspace 2 gaps inner 0\nworkspace 2 gaps left 3\n");
+        assert_eq!(
+            c.gaps,
+            Gaps {
+                inner: 10,
+                top: 1,
+                right: 7,
+                bottom: 5,
+                left: 7
+            }
+        );
+        assert_eq!(
+            c.workspace_gaps,
+            vec![(
+                "2".to_string(),
+                GapsOverride {
+                    inner: Some(0),
+                    left: Some(3),
+                    ..Default::default()
+                }
+            )]
+        );
     }
     #[test]
     fn client_colors_child_border_defaults_to_background() {

@@ -1,4 +1,4 @@
-use crate::config::{BarPosition, Border, Config, Font};
+use crate::config::{BarPosition, Border, Config, Font, Gaps};
 use crate::geom::Rect;
 use crate::tree::{Layout, NodeId, NodeKind, Tree, WindowId};
 use crate::wm::Wm;
@@ -264,12 +264,24 @@ impl Ctx<'_> {
     }
 }
 
+/// Config gaps, then the config `workspace NAME gaps` override, then the runtime override.
+pub fn effective_gaps(tree: &Tree, config: &Config, ws: NodeId) -> Gaps {
+    let node = tree.get(ws);
+    let mut gaps = config.gaps;
+    if let NodeKind::Workspace { name, .. } = &node.kind {
+        if let Some((_, o)) = config.workspace_gaps.iter().find(|(n, _)| n == name) {
+            gaps = gaps.with(o);
+        }
+    }
+    gaps.with(&node.gaps)
+}
+
 pub fn arrange(tree: &Tree, config: &Config, focused: NodeId) -> Arrangement {
     let mut ctx = Ctx {
         tree,
         focused,
         th: 0,
-        g: px(config.gaps_inner),
+        g: px(config.gaps.inner),
         border: config.default_border,
         out: Arrangement::default(),
     };
@@ -333,11 +345,18 @@ fn arrange_workspace(
             area.inset(0, 0, 0, bh)
         };
     }
-    let g = ctx.g;
-    let out = px(config.gaps_outer);
-    let lead = out + g - g / 2;
-    let trail = out + g / 2;
-    ctx.place(ws, area.inset(lead, lead, trail, trail), false);
+    let gaps = effective_gaps(tree, config, ws);
+    let g = px(gaps.inner);
+    ctx.g = g;
+    let lead = |outer: i32| px(outer) + g - g / 2;
+    let trail = |outer: i32| px(outer) + g / 2;
+    let inset = area.inset(
+        lead(gaps.left),
+        lead(gaps.top),
+        trail(gaps.right),
+        trail(gaps.bottom),
+    );
+    ctx.place(ws, inset, false);
 
     place_floating(ctx, config, ws, None);
 }
@@ -382,6 +401,10 @@ pub fn floating_frame_from_client(config: &Config, scale: f32, client: Rect) -> 
 }
 
 impl Wm {
+    pub fn effective_gaps(&self, ws: NodeId) -> Gaps {
+        effective_gaps(&self.tree, &self.config, ws)
+    }
+
     pub fn arrange(&self) -> Arrangement {
         arrange(&self.tree, &self.config, self.focused())
     }
@@ -391,7 +414,7 @@ impl Wm {
 mod tests {
     use super::*;
     use crate::config::{BarConfig, Border, Font};
-    use crate::testutil::{test_wm, win};
+    use crate::testutil::{out, test_wm, win};
 
     fn placement(a: &Arrangement, w: isize) -> Rect {
         a.windows.iter().find(|p| p.id == WindowId(w)).unwrap().rect
@@ -505,13 +528,39 @@ mod tests {
     fn gaps() {
         let mut wm = test_wm();
         wm.config.default_border = Border::None;
-        wm.config.gaps_inner = 10;
-        wm.config.gaps_outer = 5;
+        wm.config.gaps = Gaps {
+            inner: 10,
+            top: 5,
+            right: 5,
+            bottom: 5,
+            left: 5,
+        };
         wm.manage(win(1));
         wm.manage(win(2));
         let a = wm.arrange();
         assert_eq!(placement(&a, 1), Rect::new(15, 15, 480, 470));
         assert_eq!(placement(&a, 2), Rect::new(505, 15, 480, 470));
+    }
+    #[test]
+    fn per_side_outer_gaps_and_workspace_override() {
+        let mut cfg = crate::config::parse_config(
+            "gaps top 20\ngaps left 10\nworkspace 2 gaps top 0\ndefault_border none\n",
+        );
+        cfg.bar = None;
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        let r = wm.arrange().windows[0].rect;
+        assert_eq!((r.x, r.y, r.w, r.h), (10, 20, 990, 480));
+        wm.run_command("workspace 2");
+        wm.manage(win(2));
+        let r2 = wm
+            .arrange()
+            .windows
+            .iter()
+            .find(|p| p.id == WindowId(2))
+            .unwrap()
+            .rect;
+        assert_eq!((r2.x, r2.y), (10, 0));
     }
     #[test]
     fn bar_reserves_space() {
