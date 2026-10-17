@@ -68,9 +68,10 @@ pub fn end_title_drag() {
     }
 }
 
-/// The captured press of `hwnd` ended (button up or capture lost): a started drag
-/// gets its Release.
-fn finish_title_drag(hwnd: HWND) {
+/// The captured press of `hwnd` ended: on button-up (`released`) a started drag
+/// gets its Release; on capture lost to someone else (or the deco destroyed) it
+/// is cancelled.
+fn finish_title_drag(hwnd: HWND, released: bool) {
     let Some(d) = TITLE_DRAG
         .with(|t| t.get())
         .filter(|d| d.hwnd == hwnd.0 as isize)
@@ -79,12 +80,17 @@ fn finish_title_drag(hwnd: HWND) {
     };
     TITLE_DRAG.with(|t| t.set(None));
     if d.started {
-        let (x, y) = cursor().unwrap_or(d.origin);
-        mouse::post_event(MouseEvent::Release {
-            button: Button::Left,
-            x,
-            y,
-        });
+        let ev = if released {
+            let (x, y) = cursor().unwrap_or(d.origin);
+            MouseEvent::Release {
+                button: Button::Left,
+                x,
+                y,
+            }
+        } else {
+            MouseEvent::Cancel
+        };
+        mouse::post_event(ev);
     }
 }
 
@@ -494,7 +500,7 @@ unsafe extern "system" fn deco_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            finish_title_drag(hwnd);
+            finish_title_drag(hwnd, true);
             // Releasing capture sends WM_CAPTURECHANGED, which finds nothing left.
             if GetCapture() == hwnd {
                 let _ = ReleaseCapture();
@@ -502,11 +508,11 @@ unsafe extern "system" fn deco_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            finish_title_drag(hwnd);
+            finish_title_drag(hwnd, false);
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            finish_title_drag(hwnd);
+            finish_title_drag(hwnd, false);
             if !ptr.is_null() {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(ptr));

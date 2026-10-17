@@ -16,7 +16,7 @@ use i3win_core::tree::{NodeId, NodeKind, WindowId};
 use i3win_core::wm::{Effect, Wm};
 use i3win_core::DropTarget;
 
-use crate::drag::{self, Drag, DragKind, PercentSnapshot};
+use crate::drag::{self, Drag, DragKind, PercentSnapshot, ReleaseWatch};
 use crate::ipc_server;
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
@@ -182,6 +182,10 @@ struct DragSession {
     percents: PercentSnapshot,
     /// The drop target last previewed (tiling drag only).
     target: Option<DropTarget>,
+    /// Missed button-up detection (arms once the button is seen down).
+    watch: ReleaseWatch,
+    /// A throttled tiled-resize position the drag timer still has to apply.
+    pending: Option<(i32, i32)>,
 }
 
 /// Whether `button` is up right now (logical button, honoring swapped buttons).
@@ -400,6 +404,8 @@ impl App {
             from_titlebar,
             percents,
             target: None,
+            watch: ReleaseWatch::default(),
+            pending: None,
         });
         mouse::set_drag_active(true);
     }
@@ -436,19 +442,38 @@ impl App {
             }
             false
         } else {
-            drag::drag_step(&mut self.wm, &mut s.drag, x, y, now)
+            let changed = drag::drag_step(&mut self.wm, &mut s.drag, x, y, now);
+            s.pending = drag::pending_step(&s.drag, x, y).then_some((x, y));
+            if s.pending.is_some() {
+                mainloop::arm_drag_timer();
+            }
+            changed
         };
         self.drag = Some(s);
         changed
     }
 
-    /// Whether the drag's button (or the hook's) is no longer down although its
-    /// release never arrived; a stale hook drag is force-released.
+    /// The drag timer fired: applies a throttled tiled-resize step still owed.
+    pub fn on_drag_timer(&mut self) {
+        let Some((x, y)) = self.drag.as_ref().and_then(|s| s.pending) else {
+            return;
+        };
+        if self.step_drag(x, y) {
+            self.flush();
+        }
+    }
+
+    /// Whether the drag's button was released without a release message (see
+    /// `ReleaseWatch`); a hook drag ending this way is force-released in the hook.
     fn release_missed(&mut self, x: i32, y: i32) -> bool {
-        if mouse::drag_button().is_some_and(button_up) {
+        let Some(s) = self.drag.as_mut() else {
+            return false;
+        };
+        let missed = s.watch.on_move(!button_up(s.button));
+        if missed && !s.from_titlebar {
             let _ = mouse::force_release(x, y);
         }
-        self.drag.as_ref().is_some_and(|s| button_up(s.button))
+        missed
     }
 
     /// Ends the drag at (x, y): last move applied, tiling drag dropped.

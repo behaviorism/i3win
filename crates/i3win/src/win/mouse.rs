@@ -21,9 +21,9 @@ use crate::win::keyboard::{self, OWN_INPUT_TAG};
 
 const HC_ACTION: i32 = 0;
 const LLMHF_INJECTED: u32 = 0x01;
-/// Button events that fit before the main thread drains, reserved up front so the
-/// hook does not allocate.
-const QUEUE_CAPACITY: usize = 64;
+/// Events that fit before the main thread drains, reserved up front. The queue
+/// never grows past it (the hook must not allocate): when full, events are dropped.
+const QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
@@ -181,11 +181,6 @@ impl MouseMatcher {
 
     /// Ends a drag whose button-up was missed (the App saw the button no longer down):
     /// clears `dragging` and returns the Release at (x, y); `None` without a drag.
-    /// The button of the drag this matcher started, if any.
-    pub fn drag_button(&self) -> Option<Button> {
-        self.dragging
-    }
-
     pub fn force_release(&mut self, x: i32, y: i32) -> Option<MouseEvent> {
         let button = self.dragging.take()?;
         Some(MouseEvent::Release { button, x, y })
@@ -222,15 +217,33 @@ fn wake() {
     }
 }
 
-/// Queues a button event after the move it followed; false if the queue is busy.
+/// Pushes `ev` after the move it followed, never past `cap` (no reallocation):
+/// the move is dropped first when only `ev` fits; false when `ev` does not fit.
+fn push_bounded(
+    q: &mut Vec<MouseEvent>,
+    cap: usize,
+    latest_move: Option<(i32, i32)>,
+    ev: MouseEvent,
+) -> bool {
+    if let Some((x, y)) = latest_move {
+        if q.len() + 2 <= cap {
+            q.push(MouseEvent::Move { x, y });
+        }
+    }
+    if q.len() < cap {
+        q.push(ev);
+        true
+    } else {
+        false
+    }
+}
+
+/// Queues an event after the move it followed; false if the queue is busy or full.
 fn queue(ev: MouseEvent) -> bool {
     QUEUE.with(|q| match q.try_borrow_mut() {
         Ok(mut q) => {
-            if let Some((x, y)) = LATEST_MOVE.with(|m| m.take()) {
-                q.push(MouseEvent::Move { x, y });
-            }
-            q.push(ev);
-            true
+            let latest = LATEST_MOVE.with(|m| m.take());
+            push_bounded(&mut q, QUEUE_CAPACITY, latest, ev)
         }
         Err(_) => false,
     })
@@ -347,11 +360,6 @@ pub fn post_event(ev: MouseEvent) {
 pub fn post_move(x: i32, y: i32) {
     LATEST_MOVE.with(|m| m.set(Some((x, y))));
     wake();
-}
-
-/// The button of the hook drag in progress, if any.
-pub fn drag_button() -> Option<Button> {
-    MATCHER.with(|m| m.try_borrow().ok().and_then(|m| m.drag_button()))
 }
 
 /// Ends a hook drag whose button-up was missed; see `MouseMatcher::force_release`.
@@ -551,6 +559,19 @@ mod tests {
                 .0,
             MouseAction::Pass
         ));
+    }
+    #[test]
+    fn queue_never_grows_past_capacity() {
+        let mut q = Vec::with_capacity(3);
+        let ev = MouseEvent::Cancel;
+        assert!(push_bounded(&mut q, 3, Some((1, 1)), ev));
+        assert_eq!(q, vec![MouseEvent::Move { x: 1, y: 1 }, ev]);
+        // Only one slot left: the move is dropped, the event kept.
+        assert!(push_bounded(&mut q, 3, Some((2, 2)), ev));
+        assert_eq!(q.len(), 3);
+        assert_eq!(q[2], ev);
+        assert!(!push_bounded(&mut q, 3, None, ev));
+        assert_eq!((q.len(), q.capacity()), (3, 3));
     }
     #[test]
     fn moves_posted_only_when_wanted() {

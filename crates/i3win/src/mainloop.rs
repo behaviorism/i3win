@@ -19,6 +19,21 @@ pub const WM_APP_MAIN: u32 = WM_APP + 3;
 pub const WM_APP_MODS: u32 = WM_APP + 4;
 /// The mouse hook queued button events or a coalesced move (one pending at a time).
 pub const WM_APP_MOUSE: u32 = WM_APP + 5;
+/// One-shot timer on the main window applying a throttled tiled-resize step.
+pub const DRAG_TIMER_ID: usize = 1;
+/// Tiled live resize throttle interval.
+const DRAG_TIMER_MS: u32 = 16;
+
+/// Main thread: (re)arms the one-shot drag timer.
+pub fn arm_drag_timer() {
+    let main = main_hwnd();
+    if main != 0 {
+        // SAFETY: plain Win32 call on our own window.
+        unsafe {
+            SetTimer(HWND(main as *mut _), DRAG_TIMER_ID, DRAG_TIMER_MS, None);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum MainMsg {
@@ -206,6 +221,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 app.flush();
             }) {
                 repost(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == DRAG_TIMER_ID => {
+            let _ = KillTimer(hwnd, DRAG_TIMER_ID);
+            if !with_app(|app| app.on_drag_timer()) {
+                arm_drag_timer();
             }
             LRESULT(0)
         }

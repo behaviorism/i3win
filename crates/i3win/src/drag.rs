@@ -160,6 +160,33 @@ pub fn drag_step(wm: &mut Wm, d: &mut Drag, x: i32, y: i32, now_ms: u64) -> bool
     }
 }
 
+/// Whether a throttled tiled resize still owes the move to (x, y) (the pointer
+/// stopped within the throttle interval): the caller re-applies it later.
+pub fn pending_step(d: &Drag, x: i32, y: i32) -> bool {
+    matches!(d.kind, DragKind::ResizeTiled { .. }) && d.last != (x, y)
+}
+
+/// Detects a missed button-up from the async button state. A press the mouse hook
+/// swallowed never reaches the async state, so its button reads "up" for the whole
+/// drag: the watch arms only once the button has been seen down during this drag,
+/// and hook-swallowed drags end only on the hook's Release (or Escape).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReleaseWatch {
+    armed: bool,
+}
+
+impl ReleaseWatch {
+    /// Feeds the async state of the drag's button at a move; true = release missed.
+    pub fn on_move(&mut self, button_down: bool) -> bool {
+        if button_down {
+            self.armed = true;
+            false
+        } else {
+            self.armed
+        }
+    }
+}
+
 /// Ends a drag at its last position: a tiling drag drops onto `target`.
 pub fn finish_drag(wm: &mut Wm, d: &Drag, target: Option<DropTarget>) {
     if let (DragKind::Tiling, Some(t)) = (d.kind, target) {
@@ -293,7 +320,11 @@ mod tests {
         assert!(drag_step(&mut wm, &mut d, 500, 100, 100));
         assert!((wm.tree.get(n1).percent - 0.6).abs() < 1e-9);
         assert!(!drag_step(&mut wm, &mut d, 600, 100, 105)); // < 16 ms later: skipped
-        let mut t = start_drag(&wm, n1, Button::Left, 10, 10, false).unwrap();
+        assert!(pending_step(&d, 600, 100));
+        assert!(drag_step(&mut wm, &mut d, 600, 100, 116)); // the timer applies it
+        assert!(!pending_step(&d, 600, 100));
+        assert!((wm.tree.get(n1).percent - 0.7).abs() < 1e-9);
+        let t = start_drag(&wm, n1, Button::Left, 10, 10, false).unwrap();
         let n2 = wm.tree.window_node(WindowId(2)).unwrap();
         finish_drag(
             &mut wm,
@@ -301,7 +332,6 @@ mod tests {
             Some(DropTarget::Window(n2, DropZone::Side(Direction::Right))),
         );
         assert_eq!(ws_desc(&wm), "H[w2 w1]");
-        let _ = &mut t;
     }
     #[test]
     fn cancel_restores_floating_and_tiled() {
@@ -340,6 +370,18 @@ mod tests {
         wm.run_command("floating enable");
         let d = start_drag(&wm, n, Button::Left, 10, 10, true).unwrap();
         assert!(matches!(d.kind, DragKind::MoveFloating { .. }));
+    }
+    #[test]
+    fn release_watch_arms_only_after_seen_down() {
+        // Hook-swallowed press: the async state never shows the button down.
+        let mut w = ReleaseWatch::default();
+        assert!(!w.on_move(false));
+        assert!(!w.on_move(false));
+        // Title-bar press: down, then up without a release message.
+        let mut w = ReleaseWatch::default();
+        assert!(!w.on_move(true));
+        assert!(!w.on_move(true));
+        assert!(w.on_move(false));
     }
     #[test]
     fn tiling_drag_respects_config() {
