@@ -282,17 +282,7 @@ impl Wm {
                 focus.insert(i.min(focus.len()), ws);
             }
         } else {
-            if self.tree.get(src_out).children.len() == 1 {
-                let mut n = 1;
-                while self.find_workspace(&n.to_string()).is_some() {
-                    n += 1;
-                }
-                self.create_workspace(src_out, &n.to_string());
-            }
-            let (from, to) = (self.output_rect(src_out), self.output_rect(dest_out));
-            self.tree.detach(ws);
-            self.attach_workspace_sorted(dest_out, ws);
-            self.shift_workspace_floating(ws, from, to);
+            self.relocate_workspace(ws, src_out, dest_out);
             if was_focused {
                 self.show_workspace(ws);
             }
@@ -413,6 +403,23 @@ impl Wm {
         Ok(())
     }
 
+    /// Moves `ws` from `src_out` to `dest_out`, first giving `src_out` a
+    /// placeholder workspace if `ws` was its only one, and carrying floating
+    /// windows along.
+    fn relocate_workspace(&mut self, ws: NodeId, src_out: NodeId, dest_out: NodeId) {
+        if self.tree.get(src_out).children.len() == 1 {
+            let mut n = 1;
+            while self.find_workspace(&n.to_string()).is_some() {
+                n += 1;
+            }
+            self.create_workspace(src_out, &n.to_string());
+        }
+        let (from, to) = (self.output_rect(src_out), self.output_rect(dest_out));
+        self.tree.detach(ws);
+        self.attach_workspace_sorted(dest_out, ws);
+        self.shift_workspace_floating(ws, from, to);
+    }
+
     pub fn move_workspace_to_output(&mut self, t: &OutputTarget) -> Result<(), String> {
         let ws = self.focused_workspace();
         let dest = self.resolve_output(t).ok_or("no such output")?;
@@ -422,17 +429,7 @@ impl Wm {
         if dest == src_out {
             return Ok(());
         }
-        if self.tree.get(src_out).children.len() == 1 {
-            let mut n = 1;
-            while self.find_workspace(&n.to_string()).is_some() {
-                n += 1;
-            }
-            self.create_workspace(src_out, &n.to_string());
-        }
-        let (from, to) = (self.output_rect(src_out), self.output_rect(dest));
-        self.tree.detach(ws);
-        self.attach_workspace_sorted(dest, ws);
-        self.shift_workspace_floating(ws, from, to);
+        self.relocate_workspace(ws, src_out, dest);
         self.show_workspace(ws);
         let name = self.workspace_name(ws).to_string();
         self.emit(IpcEvent::Workspace {
@@ -655,6 +652,31 @@ mod tests {
             })));
         wm.run_command("workspace back_and_forth");
         assert_eq!(wm.workspace_name(wm.focused_workspace()), "9");
+    }
+    #[test]
+    fn rename_onto_assigned_output_relocates() {
+        let mut wm = Wm::new(
+            Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        );
+        wm.config.workspace_outputs = vec![("7".into(), vec!["B".into()])];
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("[id=2] floating enable");
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        let r = wm.run_command("rename workspace to 7");
+        assert!(r[0].success, "{:?}", r[0]);
+        let (a, b) = (wm.outputs()[0], wm.outputs()[1]);
+        let ws = wm.find_workspace("7").unwrap();
+        assert_eq!(wm.tree.output_of(ws), Some(b));
+        assert_eq!(wm.workspace_name(wm.visible_workspace(b)), "7");
+        assert_eq!(wm.focused_workspace(), ws);
+        assert_eq!(wm.workspace_name(wm.visible_workspace(a)), "1");
+        assert_eq!(wm.tree.workspace_of(n2), Some(ws));
+        let r = wm.arrange();
+        let p = r.windows.iter().find(|p| p.id == WindowId(2)).unwrap();
+        assert!(p.rect.x >= 1000, "floating window moved to B: {:?}", p.rect);
+        check_invariants(&wm);
     }
     #[test]
     fn auto_back_and_forth() {

@@ -575,6 +575,26 @@ mod reply_tests {
         assert!(matches!(handle(&mut wm, &ctx(), SEND_TICK, "hi"), Request::Tick(p) if p == "hi"));
     }
     #[test]
+    fn rename_event_json_current_is_renamed_workspace() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.take_effects();
+        wm.run_command("rename workspace to foo");
+        let e = wm
+            .take_effects()
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::Ipc(ev @ IpcEvent::Workspace { .. }) => Some(ev),
+                _ => None,
+            })
+            .unwrap();
+        let (_, _, p) = event_json(&wm, &e);
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["change"], "rename");
+        assert_eq!(v["current"]["name"], "foo");
+        assert!(v["old"].is_null());
+    }
+    #[test]
     fn workspace_event_json() {
         let mut wm = test_wm();
         wm.take_effects();
