@@ -6,6 +6,7 @@ pub mod criteria;
 pub mod geom;
 pub mod i3bar;
 pub mod ipc;
+pub mod keycodes;
 pub mod keys;
 mod ops;
 #[cfg(test)]

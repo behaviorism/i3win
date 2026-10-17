@@ -169,11 +169,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_KEY => {
             if !with_app(|app| {
-                for (combo, mask_menu) in keyboard::drain() {
+                for (combo, mask_menu, release) in keyboard::drain() {
                     if mask_menu {
                         window::send_dummy_key();
                     }
-                    app.on_binding(combo);
+                    app.on_binding(combo, release);
                 }
                 app.flush();
             }) {

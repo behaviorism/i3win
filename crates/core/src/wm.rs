@@ -788,12 +788,12 @@ impl Wm {
         }
     }
 
-    pub fn binding_pressed(&mut self, combo: KeyCombo) -> bool {
+    pub fn binding_pressed(&mut self, combo: KeyCombo, release: bool) -> bool {
         let command = self
             .config
             .bindings
             .get(&self.mode)
-            .and_then(|bs| bs.iter().find(|b| b.combo == combo))
+            .and_then(|bs| bs.iter().find(|b| b.combo == combo && b.release == release))
             .map(|b| b.command.clone());
         match command {
             Some(command) => {
@@ -807,11 +807,11 @@ impl Wm {
         }
     }
 
-    pub fn active_combos(&self) -> Vec<KeyCombo> {
+    pub fn active_combos(&self) -> Vec<(KeyCombo, bool)> {
         self.config
             .bindings
             .get(&self.mode)
-            .map(|bs| bs.iter().map(|b| b.combo).collect())
+            .map(|bs| bs.iter().map(|b| (b.combo, b.release)).collect())
             .unwrap_or_default()
     }
 
@@ -988,13 +988,25 @@ mod tests {
             "bindsym Mod1+r mode \"resize\"\nmode \"resize\" {\nbindsym Escape mode \"default\"\n}\n",
         );
         let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
-        assert!(wm.binding_pressed(crate::keys::parse_combo("Mod1+r").unwrap()));
+        assert!(wm.binding_pressed(crate::keys::parse_combo("Mod1+r").unwrap(), false));
         assert_eq!(wm.mode, "resize");
         assert_eq!(
             wm.active_combos(),
-            vec![crate::keys::parse_combo("Escape").unwrap()]
+            vec![(crate::keys::parse_combo("Escape").unwrap(), false)]
         );
-        assert!(!wm.binding_pressed(crate::keys::parse_combo("Mod1+x").unwrap()));
+        assert!(!wm.binding_pressed(crate::keys::parse_combo("Mod1+x").unwrap(), false));
+    }
+    #[test]
+    fn release_binding_only_fires_on_release() {
+        let mut wm = Wm::new(crate::config::parse_config("bindsym --release Mod1+x mode resize\nmode \"resize\" {\nbindsym Escape mode default\n}\n"), vec![out("O1", 0, 1000)]);
+        let combo = crate::keys::parse_combo("Mod1+x").unwrap();
+        assert!(!wm.binding_pressed(combo, false));
+        assert!(wm.binding_pressed(combo, true));
+        assert_eq!(wm.mode, "resize");
+        assert_eq!(
+            wm.active_combos(),
+            vec![(crate::keys::parse_combo("Escape").unwrap(), false)]
+        );
     }
     #[test]
     fn run_command_reports_errors_and_effects() {

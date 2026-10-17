@@ -137,7 +137,7 @@ pub struct App {
     status: Option<StatusProcess>,
     store: HiddenStore,
     config_path: PathBuf,
-    last_combos: Vec<KeyCombo>,
+    last_combos: Vec<(KeyCombo, bool)>,
     /// Effects queued outside the core (exec lines from the config), flushed first.
     pending: Vec<Effect>,
     /// Last successfully read config text, served by GET_CONFIG.
@@ -317,9 +317,9 @@ impl App {
     }
 
     /// Handles a bound key combo. Does not flush.
-    pub fn on_binding(&mut self, combo: KeyCombo) {
+    pub fn on_binding(&mut self, combo: KeyCombo, release: bool) {
         self.refresh_pointer();
-        self.wm.binding_pressed(combo);
+        self.wm.binding_pressed(combo, release);
     }
 
     /// Handles a cross-thread message. Does not flush; returns whether the caller

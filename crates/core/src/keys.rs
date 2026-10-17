@@ -27,6 +27,16 @@ pub struct KeyCombo {
     pub vk: u16,
 }
 
+/// `KeyCombo.vk` with this bit set is a scan code: bits 0-7 the code, bit 8 (0x100) extended.
+pub const SCANCODE_FLAG: u16 = 0x8000;
+
+pub fn scancode_combo(mods: Modifiers, scancode: u8, extended: bool) -> KeyCombo {
+    KeyCombo {
+        mods,
+        vk: SCANCODE_FLAG | scancode as u16 | if extended { 0x100 } else { 0 },
+    }
+}
+
 /// Map an i3/X11 keysym name to a Windows virtual-key code.
 pub fn keysym_to_vk(name: &str) -> Option<u16> {
     let mut chars = name.chars();
@@ -89,6 +99,13 @@ pub fn keysym_to_vk(name: &str) -> Option<u16> {
 
 /// Parse a combo such as `Mod1+Shift+Return`. All parts but the last are modifiers.
 pub fn parse_combo(s: &str) -> Result<KeyCombo, String> {
+    let (mods, key) = split_combo(s)?;
+    let vk = keysym_to_vk(key).ok_or_else(|| format!("unknown key '{key}' in '{s}'"))?;
+    Ok(KeyCombo { mods, vk })
+}
+
+/// Split `Mod1+Shift+KEY` into its modifiers and the trailing key text.
+pub fn split_combo(s: &str) -> Result<(Modifiers, &str), String> {
     let parts: Vec<&str> = s.split('+').collect();
     let (key, mod_parts) = parts.split_last().ok_or("empty key combo")?;
     let mut mods = Modifiers::default();
@@ -102,8 +119,7 @@ pub fn parse_combo(s: &str) -> Result<KeyCombo, String> {
                 other => return Err(format!("unknown modifier '{other}' in '{s}'")),
             };
     }
-    let vk = keysym_to_vk(key).ok_or_else(|| format!("unknown key '{key}' in '{s}'"))?;
-    Ok(KeyCombo { mods, vk })
+    Ok((mods, *key))
 }
 
 #[cfg(test)]

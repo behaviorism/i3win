@@ -1,6 +1,7 @@
 use crate::command::WorkspaceTarget;
 use crate::criteria::{parse_criteria, Criteria};
-use crate::keys::{parse_combo, KeyCombo, Modifiers};
+use crate::keycodes::x11_keycode_to_scancode;
+use crate::keys::{parse_combo, scancode_combo, split_combo, KeyCombo, Modifiers};
 use crate::tree::Layout;
 use std::collections::HashMap;
 
@@ -78,6 +79,7 @@ pub enum Border {
 pub struct Binding {
     pub combo: KeyCombo,
     pub command: String,
+    pub release: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Gaps {
@@ -629,9 +631,13 @@ fn handle_line(
             Ok(())
         }
         Some(Block::Mode(name)) => {
-            if kw == "bindsym" {
+            if kw == "bindsym" || kw == "bindcode" {
                 let name = name.clone();
-                bindsym(cfg, &name, args)
+                if kw == "bindsym" {
+                    bindsym(cfg, &name, args)
+                } else {
+                    bindcode(cfg, &name, args)
+                }
             } else {
                 Err(format!("unsupported line in mode block: {line}"))
             }
@@ -649,13 +655,21 @@ fn handle_line(
 }
 
 fn bindsym(cfg: &mut Config, mode: &str, args: &str) -> Result<(), String> {
+    bind(cfg, mode, args, false)
+}
+
+fn bindcode(cfg: &mut Config, mode: &str, args: &str) -> Result<(), String> {
+    bind(cfg, mode, args, true)
+}
+
+fn bind(cfg: &mut Config, mode: &str, args: &str, by_code: bool) -> Result<(), String> {
+    let kw = if by_code { "bindcode" } else { "bindsym" };
     let mut rest = args;
+    let mut release = false;
     loop {
         let tok = first_token(rest);
-        if tok == "--release" {
-            return Err("bindsym --release is not supported".to_string());
-        }
         if tok.starts_with("--") {
+            release |= tok == "--release";
             rest = skip_tokens(rest, 1);
         } else {
             break;
@@ -664,15 +678,26 @@ fn bindsym(cfg: &mut Config, mode: &str, args: &str) -> Result<(), String> {
     let combo_text = first_token(rest);
     let command = skip_tokens(rest, 1);
     if combo_text.is_empty() || command.is_empty() {
-        return Err("bindsym: expected COMBO COMMAND".to_string());
+        return Err(format!("{kw}: expected COMBO COMMAND"));
     }
-    let combo = parse_combo(combo_text)?;
+    let combo = if by_code {
+        let (mods, code) = split_combo(combo_text)?;
+        let code: u16 = code
+            .parse()
+            .map_err(|_| format!("bindcode: invalid keycode '{code}'"))?;
+        let (scancode, extended) = x11_keycode_to_scancode(code)
+            .ok_or_else(|| format!("bindcode: unknown keycode {code}"))?;
+        scancode_combo(mods, scancode, extended)
+    } else {
+        parse_combo(combo_text)?
+    };
     cfg.bindings
         .entry(mode.to_string())
         .or_default()
         .push(Binding {
             combo,
             command: command.to_string(),
+            release,
         });
     Ok(())
 }
@@ -743,6 +768,7 @@ fn top_level(
             vars.sort_by_key(|(n, _)| std::cmp::Reverse(n.len()));
         }
         "bindsym" => bindsym(cfg, "default", args)?,
+        "bindcode" => bindcode(cfg, "default", args)?,
         "mode" => {
             let name = args
                 .strip_suffix('{')
@@ -1109,6 +1135,15 @@ mod tests {
         assert!(default_config_text(false).contains("bindsym $mod+Return exec cmd"));
         let c = parse_config(&t);
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    }
+    #[test]
+    fn bindcode_and_release_parse() {
+        let c = parse_config("set $mod Mod1\nbindcode $mod+38 nop a\nbindsym --release $mod+x nop b\nbindcode 300 nop\n");
+        let b = &c.bindings["default"];
+        assert_eq!(b[0].combo, scancode_combo(Modifiers::ALT, 0x1E, false));
+        assert!(!b[0].release);
+        assert!(b[1].release);
+        assert_eq!(c.warnings.len(), 1);
     }
     #[test]
     fn variables_and_bindsym() {
