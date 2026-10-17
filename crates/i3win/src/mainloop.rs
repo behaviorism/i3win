@@ -180,6 +180,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // pending flag stays set and the repost delivers it later.
             if !with_app(|app| {
                 let (events, latest_move) = mouse::drain();
+                // A swallowed Alt/Win-click must not leave the menu bar / Start armed.
+                let mask = events.iter().any(|e| {
+                    matches!(e, mouse::MouseEvent::Press { mods, .. } if mouse::needs_menu_mask(*mods))
+                });
+                if mask {
+                    window::send_dummy_key();
+                }
                 app.on_mouse(events, latest_move);
             }) {
                 repost(hwnd, msg, wp, lp);

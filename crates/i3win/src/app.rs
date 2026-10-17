@@ -140,7 +140,7 @@ pub(crate) fn route_click<'a, T>(statuses: &'a HashMap<String, T>, bar: &str) ->
 
 /// What the mouse hook tests presses against: floating placements first, most
 /// recently focused first, then the rest in arrangement order.
-fn mouse_snapshot(wm: &Wm, arr: &Arrangement) -> mouse::Snapshot {
+fn mouse_snapshot(wm: &Wm, arr: &Arrangement, foreground_managed: bool) -> mouse::Snapshot {
     let focus_rank = |id: WindowId| {
         let node = wm.tree.window_node(id)?;
         let ws = wm.tree.parent(node)?;
@@ -165,6 +165,7 @@ fn mouse_snapshot(wm: &Wm, arr: &Arrangement) -> mouse::Snapshot {
         hits: floating.into_iter().map(|(_, h)| h).chain(tiled).collect(),
         modifier: wm.config.floating_modifier,
         want_moves: wm.config.focus_follows_mouse,
+        foreground_managed,
     }
 }
 
@@ -360,6 +361,10 @@ impl App {
                 }
             }
             EventDecision::MoveSizeEnd => self.on_move_size_end(id),
+        }
+        if let PlatformEvent::Foreground(fg) = ev {
+            // Between flushes too: a menu or unmanaged window in front blocks drags at once.
+            mouse::set_foreground_managed(self.is_managed(fg));
         }
     }
 
@@ -605,7 +610,8 @@ impl App {
         } else if leaf.is_none() {
             self.park_foreground();
         }
-        mouse::set_snapshot(mouse_snapshot(&self.wm, &arr));
+        let fg_managed = window::foreground().is_some_and(|fg| self.is_managed(fg));
+        mouse::set_snapshot(mouse_snapshot(&self.wm, &arr, fg_managed));
         let combos = self.wm.active_combos();
         if combos != self.last_combos {
             keyboard::set_combos(&combos);
@@ -711,11 +717,12 @@ mod tests {
             });
         }
         // 3 was managed (and focused) last, so it is above 2 despite being placed after it.
-        let s = mouse_snapshot(&wm, &wm.arrange());
+        let s = mouse_snapshot(&wm, &wm.arrange(), true);
         let ids: Vec<(isize, bool)> = s.hits.iter().map(|h| (h.id.0, h.floating)).collect();
         assert_eq!(ids, vec![(3, true), (2, true), (1, false)]);
         wm.on_focus_changed(WindowId(2));
-        let s = mouse_snapshot(&wm, &wm.arrange());
+        let s = mouse_snapshot(&wm, &wm.arrange(), false);
+        assert!(!s.foreground_managed);
         assert_eq!(s.hits[0].id, WindowId(2));
         assert_eq!(s.modifier, Some(Modifiers::ALT));
         assert!(!s.want_moves);

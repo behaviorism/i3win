@@ -54,6 +54,16 @@ pub struct Snapshot {
     pub modifier: Option<Modifiers>,
     /// Post moves even without a drag (focus follows mouse is on).
     pub want_moves: bool,
+    /// The foreground window is managed. When false (Start menu, a context menu, an
+    /// unmanaged or elevated window in front) presses never start a drag, since an
+    /// unmanaged window may cover a managed rect.
+    pub foreground_managed: bool,
+}
+
+/// Whether a swallowed modifier-click must be followed by the menu-masking dummy key:
+/// Alt or Win going down and up with no input between opens the menu bar / Start.
+pub fn needs_menu_mask(mods: Modifiers) -> bool {
+    mods.contains(Modifiers::ALT) || mods.contains(Modifiers::WIN)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +73,8 @@ pub enum MouseEvent {
         x: i32,
         y: i32,
         id: WindowId,
+        /// Modifiers held at the press.
+        mods: Modifiers,
     },
     Release {
         button: Button,
@@ -112,8 +124,9 @@ impl MouseMatcher {
             }
             return (MouseAction::Pass, None);
         }
-        // One drag at a time; Middle never starts one.
-        if self.dragging.is_some() || button == Button::Middle {
+        // One drag at a time; Middle never starts one; nothing over an unmanaged foreground.
+        if self.dragging.is_some() || button == Button::Middle || !self.snapshot.foreground_managed
+        {
             return (MouseAction::Pass, None);
         }
         let held = self
@@ -133,6 +146,7 @@ impl MouseMatcher {
                         x,
                         y,
                         id: hit.id,
+                        mods,
                     }),
                 )
             }
@@ -148,6 +162,19 @@ impl MouseMatcher {
     #[cfg_attr(not(test), allow(dead_code))] // read by the drag state machine (Task 4)
     pub fn is_dragging(&self) -> bool {
         self.dragging.is_some()
+    }
+
+    /// Updates only the foreground flag of the snapshot (Foreground events).
+    pub fn set_foreground_managed(&mut self, managed: bool) {
+        self.snapshot.foreground_managed = managed;
+    }
+
+    /// Ends a drag whose button-up was missed (the App saw the button no longer down):
+    /// clears `dragging` and returns the Release at (x, y); `None` without a drag.
+    #[cfg_attr(not(test), allow(dead_code))] // used by the drag state machine (Task 4)
+    pub fn force_release(&mut self, x: i32, y: i32) -> Option<MouseEvent> {
+        let button = self.dragging.take()?;
+        Some(MouseEvent::Release { button, x, y })
     }
 }
 
@@ -273,6 +300,15 @@ pub fn set_snapshot(s: Snapshot) {
     });
 }
 
+/// Main thread, on Foreground events between flushes.
+pub fn set_foreground_managed(managed: bool) {
+    MATCHER.with(|m| {
+        if let Ok(mut m) = m.try_borrow_mut() {
+            m.set_foreground_managed(managed);
+        }
+    });
+}
+
 /// Button events in order (each preceded by the move it followed), then the latest
 /// move after them. Clears the pending flag so the next hook event posts a new wake-up.
 pub fn drain() -> (Vec<MouseEvent>, Option<(i32, i32)>) {
@@ -305,6 +341,7 @@ mod tests {
             ],
             modifier: Some(Modifiers::ALT),
             want_moves: false,
+            foreground_managed: true,
         }
     }
     #[test]
@@ -319,7 +356,8 @@ mod tests {
                 button: Button::Left,
                 x: 150,
                 y: 150,
-                id: WindowId(2)
+                id: WindowId(2),
+                mods: Modifiers::ALT
             })
         );
         assert_eq!(
@@ -402,6 +440,60 @@ mod tests {
         m.set_snapshot(s);
         assert!(matches!(
             m.on_button(Button::Left, true, 150, 150, Modifiers::default())
+                .0,
+            MouseAction::Pass
+        ));
+    }
+    #[test]
+    fn unmanaged_foreground_passes_press_but_not_running_drag() {
+        let mut m = MouseMatcher::default();
+        let mut s = snap();
+        s.foreground_managed = false;
+        m.set_snapshot(s);
+        assert!(matches!(
+            m.on_button(Button::Left, true, 150, 150, Modifiers::ALT),
+            (MouseAction::Pass, None)
+        ));
+        assert!(!m.is_dragging());
+        // A drag started while the foreground was managed keeps going.
+        m.set_foreground_managed(true);
+        m.on_button(Button::Left, true, 150, 150, Modifiers::ALT);
+        m.set_foreground_managed(false);
+        assert!(m.on_move(155, 155).is_some());
+        assert!(matches!(
+            m.on_button(Button::Left, false, 155, 155, Modifiers::default())
+                .0,
+            MouseAction::Swallow
+        ));
+    }
+    #[test]
+    fn menu_mask_only_for_alt_or_win() {
+        assert!(needs_menu_mask(Modifiers::ALT));
+        assert!(needs_menu_mask(Modifiers::WIN));
+        assert!(needs_menu_mask(Modifiers::WIN | Modifiers::SHIFT));
+        assert!(!needs_menu_mask(Modifiers::CTRL));
+        assert!(!needs_menu_mask(Modifiers::CTRL | Modifiers::SHIFT));
+        assert!(!needs_menu_mask(Modifiers::default()));
+    }
+    #[test]
+    fn force_release_ends_drag_once() {
+        let mut m = MouseMatcher::default();
+        m.set_snapshot(snap());
+        assert_eq!(m.force_release(0, 0), None);
+        m.on_button(Button::Right, true, 50, 50, Modifiers::ALT);
+        assert_eq!(
+            m.force_release(70, 80),
+            Some(MouseEvent::Release {
+                button: Button::Right,
+                x: 70,
+                y: 80
+            })
+        );
+        assert!(!m.is_dragging());
+        assert_eq!(m.on_move(71, 81), None);
+        // The late real button-up now passes.
+        assert!(matches!(
+            m.on_button(Button::Right, false, 71, 81, Modifiers::default())
                 .0,
             MouseAction::Pass
         ));
