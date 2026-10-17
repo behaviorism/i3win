@@ -6,7 +6,7 @@ use std::mem::size_of;
 use i3win_core::geom::Rect;
 use i3win_core::tree::{WindowId, WindowInfo};
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT, TRUE, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
@@ -18,11 +18,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindowAsync, GWL_EXSTYLE, GWL_STYLE,
-    GW_OWNER, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
+    EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindow,
+    GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, PostMessageW, SetCursorPos, SetForegroundWindow, SetWindowPos,
+    ShowWindowAsync, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_TOP,
+    SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+    SW_HIDE, SW_RESTORE, SW_SHOWNA, WM_CLOSE,
 };
 
 const WS_CHILD: u32 = 0x4000_0000;
@@ -380,6 +381,33 @@ pub fn enumerate_top_level() -> Vec<WindowId> {
         )
     };
     out
+}
+
+/// Moves the pointer to screen point (x, y).
+pub fn set_cursor_pos(x: i32, y: i32) {
+    // SAFETY: plain Win32 call.
+    let _ = unsafe { SetCursorPos(x, y) };
+}
+
+/// The pointer position in screen coordinates.
+pub fn cursor_pos() -> Option<(i32, i32)> {
+    let mut p = POINT::default();
+    // SAFETY: p is a valid out pointer for the synchronous call.
+    unsafe { GetCursorPos(&mut p).ok().map(|()| (p.x, p.y)) }
+}
+
+/// The top-level window under screen point (x, y), if any.
+pub fn window_at_point(x: i32, y: i32) -> Option<WindowId> {
+    // SAFETY: plain Win32 calls.
+    unsafe {
+        let h = WindowFromPoint(POINT { x, y });
+        if h.0.is_null() {
+            return None;
+        }
+        let root = GetAncestor(h, GA_ROOT);
+        let root = if root.0.is_null() { h } else { root };
+        Some(WindowId(root.0 as isize))
+    }
 }
 
 pub fn foreground() -> Option<WindowId> {

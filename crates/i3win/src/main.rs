@@ -3,6 +3,7 @@
 mod app;
 mod bar_layout;
 mod drag;
+mod hover;
 mod ipc_server;
 mod mainloop;
 mod paths;

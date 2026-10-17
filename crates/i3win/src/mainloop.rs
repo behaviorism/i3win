@@ -21,6 +21,10 @@ pub const WM_APP_MODS: u32 = WM_APP + 4;
 pub const WM_APP_MOUSE: u32 = WM_APP + 5;
 /// One-shot timer on the main window applying a throttled tiled-resize step.
 pub const DRAG_TIMER_ID: usize = 1;
+/// One-shot timer on the main window re-running the hover decision after the rest time.
+pub const HOVER_TIMER_ID: usize = 2;
+/// One-shot timer lifting a move/size freeze that never got its END event.
+pub const FREEZE_TIMER_ID: usize = 3;
 /// Tiled live resize throttle interval.
 const DRAG_TIMER_MS: u32 = 16;
 
@@ -31,6 +35,38 @@ pub fn arm_drag_timer() {
         // SAFETY: plain Win32 call on our own window.
         unsafe {
             SetTimer(HWND(main as *mut _), DRAG_TIMER_ID, DRAG_TIMER_MS, None);
+        }
+    }
+}
+
+/// Main thread: (re)arms the one-shot freeze expiry timer.
+pub fn arm_freeze_timer() {
+    let main = main_hwnd();
+    if main != 0 {
+        // SAFETY: plain Win32 call on our own window.
+        unsafe {
+            SetTimer(
+                HWND(main as *mut _),
+                FREEZE_TIMER_ID,
+                crate::hover::FREEZE_TIMEOUT_MS as u32,
+                None,
+            );
+        }
+    }
+}
+
+/// Main thread: (re)arms the one-shot hover rest timer.
+pub fn arm_hover_timer() {
+    let main = main_hwnd();
+    if main != 0 {
+        // SAFETY: plain Win32 call on our own window.
+        unsafe {
+            SetTimer(
+                HWND(main as *mut _),
+                HOVER_TIMER_ID,
+                crate::hover::HOVER_REST_MS as u32,
+                None,
+            );
         }
     }
 }
@@ -228,6 +264,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = KillTimer(hwnd, DRAG_TIMER_ID);
             if !with_app(|app| app.on_drag_timer()) {
                 arm_drag_timer();
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == HOVER_TIMER_ID => {
+            let _ = KillTimer(hwnd, HOVER_TIMER_ID);
+            if !with_app(|app| app.on_hover_timer()) {
+                arm_hover_timer();
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == FREEZE_TIMER_ID => {
+            let _ = KillTimer(hwnd, FREEZE_TIMER_ID);
+            if !with_app(|app| app.on_freeze_timer()) {
+                arm_freeze_timer();
             }
             LRESULT(0)
         }

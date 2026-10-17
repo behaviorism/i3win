@@ -17,6 +17,7 @@ use i3win_core::wm::{Effect, Wm};
 use i3win_core::DropTarget;
 
 use crate::drag::{self, Drag, DragKind, NativeDrag, PercentSnapshot, ReleaseWatch};
+use crate::hover::{self, HoverInput, HoverState};
 use crate::ipc_server;
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
@@ -233,7 +234,15 @@ pub struct App {
     pipe_name: String,
     drag: Option<DragSession>,
     /// DWM frame of a tiled window at the start of its native move/size loop.
-    move_start: HashMap<WindowId, Rect>,
+    move_start: HashMap<WindowId, (Rect, u64)>,
+    hover: HoverState,
+    /// The latest pointer position seen by the hover logic.
+    hover_pos: Option<(i32, i32)>,
+    /// The next flush's focus change came from a binding or command (warp the pointer).
+    warp_pending: bool,
+    /// Focused node and its output as of the last flush.
+    last_focus: Option<NodeId>,
+    last_output: Option<NodeId>,
     overlay: Overlay,
     /// Time base for drag throttling.
     epoch: Instant,
@@ -250,6 +259,11 @@ impl App {
         };
         for w in &config.warnings {
             log::warn!("config: {w}");
+        }
+        if !config.focus_follows_mouse_explicit {
+            log::info!(
+                "focus_follows_mouse is on (i3 default); add \"focus_follows_mouse no\" to your config to turn it off"
+            );
         }
         let pending: Vec<Effect> = config
             .exec
@@ -285,6 +299,11 @@ impl App {
             statuses: HashMap::new(),
             drag: None,
             move_start: HashMap::new(),
+            hover: HoverState::default(),
+            hover_pos: None,
+            warp_pending: false,
+            last_focus: None,
+            last_output: None,
             overlay: Overlay::default(),
             epoch: Instant::now(),
         };
@@ -347,7 +366,9 @@ impl App {
         if let Some((x, y)) = latest_move {
             // Only the newest position is checked for a missed button-up: an older
             // queued move may precede the real release in the same batch.
-            changed |= if self.release_missed(x, y) {
+            changed |= if self.drag.is_none() {
+                self.hover_at(x, y)
+            } else if self.release_missed(x, y) {
                 self.end_drag(x, y)
             } else {
                 self.step_drag(x, y)
@@ -376,7 +397,13 @@ impl App {
                 self.begin_drag(node, Button::Left, x, y, true);
                 false
             }
-            MouseEvent::Move { x, y } => self.step_drag(x, y),
+            MouseEvent::Move { x, y } => {
+                if self.drag.is_some() {
+                    self.step_drag(x, y)
+                } else {
+                    self.hover_at(x, y)
+                }
+            }
             MouseEvent::Release { button, x, y } => {
                 if self.drag.as_ref().is_some_and(|s| s.button == button) {
                     self.end_drag(x, y)
@@ -414,6 +441,107 @@ impl App {
             pending: None,
         });
         mouse::set_drag_active(true);
+    }
+
+    /// The managed window under (x, y) (a deco maps to its window), and whether the
+    /// point is on a bar or a tab/stack row.
+    fn classify_point(&self, x: i32, y: i32) -> (Option<WindowId>, bool, bool) {
+        let Some(top) = window::window_at_point(x, y) else {
+            return (None, false, false);
+        };
+        if self.bars.owns(top) {
+            return (None, true, false);
+        }
+        if let Some((node, tab_row)) = self.decos.lookup(top) {
+            return if tab_row {
+                (None, false, true)
+            } else {
+                (self.wm.tree.window_id(node), false, false)
+            };
+        }
+        (self.is_managed(top).then_some(top), false, false)
+    }
+
+    /// Focus-follows-mouse: runs the hover decision for the pointer at (x, y).
+    /// Returns whether focus changed (a flush is needed).
+    fn hover_at(&mut self, x: i32, y: i32) -> bool {
+        self.hover_pos = Some((x, y));
+        if !self.wm.config.focus_follows_mouse {
+            return false;
+        }
+        let (under, over_bar, over_tab_row) = self.classify_point(x, y);
+        let focused = self
+            .wm
+            .tree
+            .window_id(self.wm.tree.focused_descendant(self.wm.tree.root()));
+        let input = HoverInput {
+            under,
+            focused,
+            foreground_managed: window::foreground().is_some_and(|fg| self.is_managed(fg)),
+            button_down: [Button::Left, Button::Right, Button::Middle]
+                .into_iter()
+                .any(|b| !button_up(b)),
+            dragging: self.drag.is_some(),
+            over_bar,
+            over_tab_row,
+            now_ms: self.now_ms(),
+            pos: (x, y),
+        };
+        let fire = hover::hover_step(&mut self.hover, &input);
+        if self.hover.candidate.is_some() {
+            mainloop::arm_hover_timer();
+        }
+        match fire.and_then(|w| self.wm.tree.window_node(w)) {
+            Some(node) => {
+                self.wm.focus_node(node);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The hover rest timer fired: re-runs the decision at the last position.
+    pub fn on_hover_timer(&mut self) {
+        if self.drag.is_some() {
+            return;
+        }
+        if let Some((x, y)) = self.hover_pos {
+            if self.hover_at(x, y) {
+                self.flush();
+            }
+        }
+    }
+
+    /// Thaws windows whose native move/size loop never reported its end: the
+    /// foreground moved elsewhere, or the freeze is 10 s old. Returns whether any thawed.
+    fn thaw_expired(&mut self) -> bool {
+        if self.move_start.is_empty() {
+            return false;
+        }
+        let (now, fg) = (self.now_ms(), window::foreground());
+        let expired: Vec<WindowId> = self
+            .move_start
+            .iter()
+            .filter(|(id, (_, at))| hover::freeze_expired(**id, *at, now, fg))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &expired {
+            self.move_start.remove(id);
+            self.applied.frozen.remove(id);
+            reconcile::invalidate(&mut self.applied, *id);
+        }
+        !expired.is_empty()
+    }
+
+    /// The freeze timer fired: lifts stale freezes.
+    pub fn on_freeze_timer(&mut self) {
+        let thawed = self.thaw_expired();
+        if !self.move_start.is_empty() {
+            mainloop::arm_freeze_timer();
+        }
+        if thawed {
+            self.flush();
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -574,6 +702,7 @@ impl App {
                     window::show(id);
                 }
                 self.wm.unmanage(id);
+                self.move_start.remove(&id);
                 self.tracker.forget(id);
                 self.store.remove(id);
                 self.store.persist_if_dirty();
@@ -632,8 +761,9 @@ impl App {
             return;
         }
         if let Some(r) = window::frame_rect(id) {
-            self.move_start.insert(id, r);
+            self.move_start.insert(id, (r, self.now_ms()));
             self.applied.frozen.insert(id);
+            mainloop::arm_freeze_timer();
         }
     }
 
@@ -643,7 +773,8 @@ impl App {
         self.applied.frozen.remove(&id);
         // Snap back unless the tree changes below (a changed tree re-places anyway).
         reconcile::invalidate(&mut self.applied, id);
-        let (Some(start), Some(end)) = (self.move_start.remove(&id), window::frame_rect(id)) else {
+        let (Some((start, _)), Some(end)) = (self.move_start.remove(&id), window::frame_rect(id))
+        else {
             return;
         };
         match drag::classify_native(start, end) {
@@ -666,15 +797,13 @@ impl App {
 
     /// Publishes the cursor position for `move position mouse`.
     fn refresh_pointer(&mut self) {
-        let mut p = windows::Win32::Foundation::POINT::default();
-        // SAFETY: p is a valid out pointer for the synchronous call.
-        let ok = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p) };
-        self.wm.pointer = ok.ok().map(|()| (p.x, p.y));
+        self.wm.pointer = window::cursor_pos();
     }
 
     /// Handles a bound key combo. Does not flush.
     pub fn on_binding(&mut self, combo: KeyCombo, release: bool) {
         self.refresh_pointer();
+        self.warp_pending = true;
         self.wm.binding_pressed(combo, release);
     }
 
@@ -715,6 +844,7 @@ impl App {
             } => return self.on_ipc(msg_type, &payload, &reply),
             MainMsg::RunCommand(c) => {
                 self.refresh_pointer();
+                self.warp_pending = true;
                 self.wm.run_command(&c);
             }
             MainMsg::StatusClick { bar, click } => {
@@ -735,6 +865,7 @@ impl App {
         reply: &std::sync::mpsc::Sender<String>,
     ) -> bool {
         self.refresh_pointer();
+        self.warp_pending |= msg_type == i3win_core::ipc::RUN_COMMAND;
         let path = self.config_path.display().to_string();
         let ctx = IpcContext {
             config_path: &path,
@@ -775,6 +906,7 @@ impl App {
 
     /// Applies effects, then the arrangement, then focus.
     pub fn flush(&mut self) {
+        self.thaw_expired();
         let mut focus = Vec::new();
         loop {
             let mut effects = std::mem::take(&mut self.pending);
@@ -876,6 +1008,7 @@ impl App {
         } else if leaf.is_none() {
             self.park_foreground();
         }
+        self.warp_pointer(&arr, leaf);
         let fg_managed = window::foreground().is_some_and(|fg| self.is_managed(fg));
         mouse::set_snapshot(mouse_snapshot(&self.wm, &arr, fg_managed));
         let combos = self.wm.active_combos();
@@ -883,6 +1016,36 @@ impl App {
             keyboard::set_combos(&combos);
             self.last_combos = combos;
         }
+    }
+
+    /// After a keyboard/IPC focus change, moves the pointer per `mouse_warping`.
+    fn warp_pointer(&mut self, arr: &Arrangement, leaf: Option<WindowId>) {
+        let node = self.wm.tree.focused_descendant(self.wm.tree.root());
+        let output = self.wm.tree.output_of(node);
+        if std::mem::take(&mut self.warp_pending) {
+            let rect = leaf
+                .and_then(|w| arr.windows.iter().find(|p| p.id == w).map(|p| p.rect))
+                .or_else(|| {
+                    output.and_then(|o| match &self.wm.tree.get(o).kind {
+                        NodeKind::Output { rect, .. } => Some(*rect),
+                        _ => None,
+                    })
+                });
+            let target = hover::warp_target(
+                self.last_output,
+                output,
+                self.wm.config.mouse_warping,
+                self.last_focus != Some(node),
+                rect,
+            );
+            if let Some((x, y)) = target {
+                window::set_cursor_pos(x, y);
+                self.hover.ignore_until_move_from = Some((x, y));
+                self.hover.candidate = None;
+            }
+        }
+        self.last_focus = Some(node);
+        self.last_output = output;
     }
 
     /// With nothing to focus, keep typing out of windows we have hidden.

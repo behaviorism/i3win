@@ -210,6 +210,8 @@ pub struct Config {
     pub colors: ClientColors,
     pub bars: Vec<BarConfig>,
     pub focus_follows_mouse: bool,
+    /// The config text has a `focus_follows_mouse` line.
+    pub focus_follows_mouse_explicit: bool,
     pub mouse_warping: MouseWarping,
     pub floating_modifier: Option<Modifiers>,
     pub tiling_drag: TilingDrag,
@@ -589,6 +591,7 @@ pub fn parse_config(text: &str) -> Config {
         colors: ClientColors::default(),
         bars: Vec::new(),
         focus_follows_mouse: true,
+        focus_follows_mouse_explicit: false,
         mouse_warping: MouseWarping::Output,
         floating_modifier: None,
         tiling_drag: TilingDrag {
@@ -1061,7 +1064,10 @@ fn top_level(
             let o = parse_gaps_override(&toks)?;
             cfg.gaps = cfg.gaps.with(&o);
         }
-        "focus_follows_mouse" => cfg.focus_follows_mouse = parse_bool(kw, args)?,
+        "focus_follows_mouse" => {
+            cfg.focus_follows_mouse = parse_bool(kw, args)?;
+            cfg.focus_follows_mouse_explicit = true;
+        }
         "mouse_warping" => {
             cfg.mouse_warping = match args {
                 "output" => MouseWarping::Output,
@@ -1183,6 +1189,18 @@ output primary
         assert_eq!(c.bars[0].id, "bar-0");
         assert_eq!(c.bars[1].id, "top");
         assert_eq!(c.bars[1].outputs, vec!["DISPLAY2", "primary"]);
+    }
+
+    #[test]
+    fn ffm_explicit_flag() {
+        assert!(!parse_config("").focus_follows_mouse_explicit);
+        assert!(
+            parse_config(
+                "focus_follows_mouse yes
+"
+            )
+            .focus_follows_mouse_explicit
+        );
     }
 
     #[test]

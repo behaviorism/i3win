@@ -128,6 +128,27 @@ pub fn tab_at(tabs: &[Tab], _origin: (i32, i32), x: i32, y: i32) -> Option<NodeI
         .map(|t| t.node)
 }
 
+/// The tab a wheel step selects: the next one for a downward step (`delta < 0`),
+/// the previous one for an upward step, wrapping. The active tab is the focused
+/// one (or the focused-inactive one of an unfocused container).
+pub fn wheel_target(tabs: &[Tab], delta: i32) -> Option<NodeId> {
+    use i3win_core::arrange::DecoState;
+    if tabs.len() < 2 || delta == 0 {
+        return None;
+    }
+    let cur = tabs
+        .iter()
+        .position(|t| matches!(t.state, DecoState::Focused | DecoState::FocusedInactive))
+        .unwrap_or(0);
+    let n = tabs.len();
+    let next = if delta < 0 {
+        (cur + 1) % n
+    } else {
+        (cur + n - 1) % n
+    };
+    Some(tabs[next].node)
+}
+
 fn register_class() {
     // SAFETY: plain class registration; "already exists" is fine.
     unsafe {
@@ -279,6 +300,13 @@ impl Decos {
             }
             self.windows.insert(key, (hwnd, data));
         }
+    }
+
+    /// The node a deco window belongs to and whether it is a tab/stack row.
+    pub fn lookup(&self, id: WindowId) -> Option<(NodeId, bool)> {
+        self.windows.iter().find_map(|(k, (h, d))| {
+            (h.0 as isize == id.0).then_some((*k, matches!(d.deco, Deco::TabBar { .. })))
+        })
     }
 
     /// Destroys every deco window and frees cached fonts.
@@ -507,6 +535,15 @@ unsafe extern "system" fn deco_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             LRESULT(0)
         }
+        WM_MOUSEWHEEL => {
+            if let Some(Deco::TabBar { tabs, .. }) = ptr.as_ref().map(|d| &d.deco) {
+                let delta = i32::from((wp.0 >> 16) as u16 as i16);
+                if let Some(n) = wheel_target(tabs, delta) {
+                    mainloop::post(MainMsg::RunCommand(format!("[con_id={}] focus", n.0)));
+                }
+            }
+            LRESULT(0)
+        }
         WM_CAPTURECHANGED => {
             finish_title_drag(hwnd, false);
             LRESULT(0)
@@ -549,6 +586,29 @@ mod tests {
         ];
         assert_eq!(tab_at(&tabs, (100, 0), 160, 10), Some(NodeId(2)));
         assert_eq!(tab_at(&tabs, (100, 0), 99, 10), None);
+    }
+    #[test]
+    fn wheel_cycles_tabs_with_wrap() {
+        let tab = |n: u32, state| Tab {
+            title: String::new(),
+            markup: false,
+            state,
+            rect: Rect::default(),
+            node: NodeId(n),
+        };
+        let tabs = vec![
+            tab(1, DecoState::Unfocused),
+            tab(2, DecoState::Focused),
+            tab(3, DecoState::Unfocused),
+        ];
+        assert_eq!(wheel_target(&tabs, -120), Some(NodeId(3)));
+        assert_eq!(wheel_target(&tabs, 120), Some(NodeId(1)));
+        let last = vec![
+            tab(1, DecoState::Unfocused),
+            tab(2, DecoState::FocusedInactive),
+        ];
+        assert_eq!(wheel_target(&last, -120), Some(NodeId(1)));
+        assert_eq!(wheel_target(&tabs[..1], 120), None);
     }
     #[test]
     fn title_drag_threshold() {

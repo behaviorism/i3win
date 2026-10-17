@@ -10,7 +10,7 @@ use i3win_core::config::{BarBinding, BarMode, BarPosition, Font, HiddenState};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::{Block, Click};
 use i3win_core::markup::parse_markup;
-use i3win_core::tree::NodeKind;
+use i3win_core::tree::{NodeKind, WindowId};
 use i3win_core::wm::Wm;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -334,6 +334,11 @@ impl Bars {
                 _ => None,
             }
         })
+    }
+
+    /// Whether `id` is one of the bar windows.
+    pub fn owns(&self, id: WindowId) -> bool {
+        self.windows.values().any(|bw| bw.hwnd.0 as isize == id.0)
     }
 
     /// Destroys every bar window.
