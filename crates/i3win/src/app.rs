@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use i3win_core::arrange::floating_frame_from_client;
+use i3win_core::arrange::{floating_frame_from_client, Arrangement};
 use i3win_core::config::{default_config_text, parse_config, BarMode, Config};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::Block;
@@ -24,6 +24,7 @@ use crate::win::bar::Bars;
 use crate::win::deco::Decos;
 use crate::win::events::{self, PlatformEvent};
 use crate::win::hidden::{self, HiddenStore, HideTracker};
+use crate::win::mouse::{self, MouseEvent};
 use crate::win::window::{self, Manage};
 use crate::win::{keyboard, monitors};
 
@@ -135,6 +136,36 @@ struct BarStatus {
 #[cfg_attr(not(test), allow(dead_code))] // exercised by tests
 pub(crate) fn route_click<'a, T>(statuses: &'a HashMap<String, T>, bar: &str) -> Option<&'a T> {
     statuses.get(bar)
+}
+
+/// What the mouse hook tests presses against: floating placements first, most
+/// recently focused first, then the rest in arrangement order.
+fn mouse_snapshot(wm: &Wm, arr: &Arrangement) -> mouse::Snapshot {
+    let focus_rank = |id: WindowId| {
+        let node = wm.tree.window_node(id)?;
+        let ws = wm.tree.parent(node)?;
+        wm.tree.get(ws).focus.iter().position(|&n| n == node)
+    };
+    let mut floating: Vec<(usize, mouse::Hit)> = Vec::new();
+    let mut tiled = Vec::new();
+    for p in &arr.windows {
+        let hit = mouse::Hit {
+            id: p.id,
+            rect: p.rect,
+            floating: p.floating,
+        };
+        if p.floating {
+            floating.push((focus_rank(p.id).unwrap_or(usize::MAX), hit));
+        } else {
+            tiled.push(hit);
+        }
+    }
+    floating.sort_by_key(|(rank, _)| *rank);
+    mouse::Snapshot {
+        hits: floating.into_iter().map(|(_, h)| h).chain(tiled).collect(),
+        modifier: wm.config.floating_modifier,
+        want_moves: wm.config.focus_follows_mouse,
+    }
 }
 
 pub struct App {
@@ -253,6 +284,12 @@ impl App {
             .filter(|(_, s)| s.process.as_ref().is_some_and(|p| p.wants_clicks()))
             .map(|(k, _)| k.clone())
             .collect()
+    }
+
+    /// Mouse hook events in order, then the latest coalesced move after them.
+    /// Dragging arrives in a later task; for now they are ignored.
+    pub fn on_mouse(&mut self, events: Vec<MouseEvent>, latest_move: Option<(i32, i32)>) {
+        let _ = (events, latest_move);
     }
 
     /// The watched modifier of Hide-mode bars went down or up: redraw only the bars.
@@ -568,6 +605,7 @@ impl App {
         } else if leaf.is_none() {
             self.park_foreground();
         }
+        mouse::set_snapshot(mouse_snapshot(&self.wm, &arr));
         let combos = self.wm.active_combos();
         if combos != self.last_combos {
             keyboard::set_combos(&combos);
@@ -608,6 +646,7 @@ impl App {
         ipc_server::broadcast_shutdown();
         events::uninstall();
         keyboard::uninstall();
+        mouse::uninstall();
         hidden::restore_all_hidden();
         for (_, mut st) in self.statuses.drain() {
             if let Some(p) = st.process.as_mut() {
@@ -647,6 +686,40 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn mouse_snapshot_puts_last_focused_floating_first() {
+        use i3win_core::tree::WindowInfo;
+        use i3win_core::wm::OutputInfo;
+        let mut config = default_config();
+        config.floating_modifier = Some(Modifiers::ALT);
+        config.focus_follows_mouse = false;
+        let out = OutputInfo {
+            name: "O1".into(),
+            rect: Rect::new(0, 0, 1000, 500),
+            scale: 1.0,
+            primary: false,
+        };
+        let mut wm = Wm::new(config, vec![out]);
+        for n in 1..=3 {
+            wm.manage(WindowInfo {
+                id: WindowId(n),
+                title: format!("w{n}"),
+                class: format!("c{n}"),
+                instance: format!("i{n}"),
+                rect: Rect::new(0, 0, 400, 300),
+                wants_float: n >= 2,
+            });
+        }
+        // 3 was managed (and focused) last, so it is above 2 despite being placed after it.
+        let s = mouse_snapshot(&wm, &wm.arrange());
+        let ids: Vec<(isize, bool)> = s.hits.iter().map(|h| (h.id.0, h.floating)).collect();
+        assert_eq!(ids, vec![(3, true), (2, true), (1, false)]);
+        wm.on_focus_changed(WindowId(2));
+        let s = mouse_snapshot(&wm, &wm.arrange());
+        assert_eq!(s.hits[0].id, WindowId(2));
+        assert_eq!(s.modifier, Some(Modifiers::ALT));
+        assert!(!s.want_moves);
+    }
     #[test]
     fn hidden_expected_is_ignored() {
         assert_eq!(

@@ -166,6 +166,9 @@ fn main() {
     if let Err(e) = win::keyboard::install() {
         log::error!("cannot install keyboard hook: {e}");
     }
+    if let Err(e) = win::mouse::install() {
+        log::error!("cannot install mouse hook: {e}");
+    }
     app::APP.with(|a| {
         if let Some(app) = a.borrow_mut().as_mut() {
             for ev in win::events::drain() {

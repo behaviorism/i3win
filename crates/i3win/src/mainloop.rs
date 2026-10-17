@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use i3win_core::tree::NodeId;
 
 use crate::app::{App, APP};
-use crate::win::{events, hidden, keyboard, window};
+use crate::win::{events, hidden, keyboard, mouse, window};
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -17,6 +17,8 @@ pub const WM_APP_KEY: u32 = WM_APP + 2;
 pub const WM_APP_MAIN: u32 = WM_APP + 3;
 /// The watched modifier of Hide-mode bars went down (wparam 1) or up (0).
 pub const WM_APP_MODS: u32 = WM_APP + 4;
+/// The mouse hook queued button events or a coalesced move (one pending at a time).
+pub const WM_APP_MOUSE: u32 = WM_APP + 5;
 
 #[derive(Debug)]
 pub enum MainMsg {
@@ -169,6 +171,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_MODS => {
             if !with_app(|app| app.on_modifier_state(wp.0 != 0)) {
+                repost(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
+        WM_APP_MOUSE => {
+            // Drain inside the closure: when the App is busy nothing is lost, the
+            // pending flag stays set and the repost delivers it later.
+            if !with_app(|app| {
+                let (events, latest_move) = mouse::drain();
+                app.on_mouse(events, latest_move);
+            }) {
                 repost(hwnd, msg, wp, lp);
             }
             LRESULT(0)

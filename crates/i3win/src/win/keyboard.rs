@@ -336,6 +336,12 @@ pub fn set_modifier_watch(mods: Option<Modifiers>) -> bool {
     })
 }
 
+/// Modifiers currently held per the hook's tracking (empty if the matcher is busy).
+/// Called from the mouse hook: no allocation, no Win32 calls.
+pub fn held_mods() -> Modifiers {
+    MATCHER.with(|m| m.try_borrow().map(|m| m.mods()).unwrap_or_default())
+}
+
 pub fn drain() -> Vec<(Option<KeyCombo>, bool, bool)> {
     QUEUE.with(|q| {
         q.try_borrow_mut()
