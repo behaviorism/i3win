@@ -86,7 +86,14 @@ pub enum Command {
     Move(Direction, Option<i32>),
     MoveToWorkspace(WorkspaceTarget),
     MoveWorkspaceToOutput(OutputTarget),
-    Workspace(WorkspaceTarget),
+    Workspace {
+        target: WorkspaceTarget,
+        no_auto_back_and_forth: bool,
+    },
+    RenameWorkspace {
+        old: Option<String>,
+        new: String,
+    },
     Split(SplitArg),
     Layout(LayoutArg),
     Fullscreen(Toggle),
@@ -519,8 +526,33 @@ fn parse_one(seg: &str) -> Result<Command, String> {
         },
         "move" => parse_move(args),
         "workspace" => {
-            let skip = usize::from(a(0) == Some("--no-auto-back-and-forth"));
-            Ok(Command::Workspace(parse_workspace_target(&args[skip..])?))
+            let no_auto_back_and_forth = a(0) == Some("--no-auto-back-and-forth");
+            let skip = usize::from(no_auto_back_and_forth);
+            Ok(Command::Workspace {
+                target: parse_workspace_target(&args[skip..])?,
+                no_auto_back_and_forth,
+            })
+        }
+        "rename" => {
+            if a(0) != Some("workspace") {
+                return Err(format!("bad rename argument: {}", a(0).unwrap_or("")));
+            }
+            let to = args
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, t)| !t.1 && t.0 == "to")
+                .map(|(i, _)| i)
+                .ok_or("rename workspace: missing 'to'")?;
+            let old = (to > 1).then(|| join(&args[1..to]));
+            let new = join(&args[to + 1..]);
+            if new.is_empty() {
+                return Err("rename workspace: missing new name".into());
+            }
+            if new.starts_with("__") {
+                return Err("Workspace names starting with __ are reserved".into());
+            }
+            Ok(Command::RenameWorkspace { old, new })
         }
         "split" => match a(0) {
             Some("h" | "horizontal") => Ok(Command::Split(SplitArg::Horizontal)),
@@ -604,6 +636,37 @@ fn parse_one(seg: &str) -> Result<Command, String> {
 mod tests {
     use super::*;
 
+    fn ws(target: WorkspaceTarget) -> Command {
+        Command::Workspace {
+            target,
+            no_auto_back_and_forth: false,
+        }
+    }
+    #[test]
+    fn rename_and_no_auto_flag_parse() {
+        assert_eq!(
+            one("rename workspace to \"5: mail\""),
+            Command::RenameWorkspace {
+                old: None,
+                new: "5: mail".into()
+            }
+        );
+        assert_eq!(
+            one("rename workspace \"a b\" to c"),
+            Command::RenameWorkspace {
+                old: Some("a b".into()),
+                new: "c".into()
+            }
+        );
+        assert!(parse_commands("rename workspace to __x").is_err());
+        assert_eq!(
+            one("workspace --no-auto-back-and-forth 1"),
+            Command::Workspace {
+                target: WorkspaceTarget::Name("1".into()),
+                no_auto_back_and_forth: true
+            }
+        );
+    }
     fn one(s: &str) -> Command {
         let g = parse_commands(s).unwrap();
         assert_eq!(g.len(), 1);
@@ -631,7 +694,7 @@ mod tests {
             let escaped = name.replace('\\', r"\\").replace('"', r#"\""#);
             assert_eq!(
                 one(&format!("workspace \"{escaped}\"")),
-                Command::Workspace(WorkspaceTarget::Name(name.into()))
+                ws(WorkspaceTarget::Name(name.into()))
             );
         }
     }
@@ -639,7 +702,7 @@ mod tests {
     fn single_backslash_before_other_char_stays_literal() {
         assert_eq!(
             one(r#"workspace "C:\Program Files""#),
-            Command::Workspace(WorkspaceTarget::Name(r"C:\Program Files".into()))
+            ws(WorkspaceTarget::Name(r"C:\Program Files".into()))
         );
     }
     #[test]
@@ -655,19 +718,19 @@ mod tests {
     fn workspace_variants() {
         assert_eq!(
             one("workspace 3:www"),
-            Command::Workspace(WorkspaceTarget::Name("3:www".into()))
+            ws(WorkspaceTarget::Name("3:www".into()))
         );
         assert_eq!(
             one("workspace number 3:www"),
-            Command::Workspace(WorkspaceTarget::Number(3))
+            ws(WorkspaceTarget::Number(3))
         );
         assert_eq!(
             one(r#"workspace "my ws""#),
-            Command::Workspace(WorkspaceTarget::Name("my ws".into()))
+            ws(WorkspaceTarget::Name("my ws".into()))
         );
         assert_eq!(
             one("workspace back_and_forth"),
-            Command::Workspace(WorkspaceTarget::BackAndForth)
+            ws(WorkspaceTarget::BackAndForth)
         );
         assert_eq!(
             one("move container to workspace number 4"),

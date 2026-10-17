@@ -283,7 +283,10 @@ mod tests {
             let groups = parse_commands(&click_command(name)).unwrap();
             assert_eq!(
                 groups[0].commands,
-                vec![Command::Workspace(WorkspaceTarget::Name(name.into()))]
+                vec![Command::Workspace {
+                    target: WorkspaceTarget::Name(name.into()),
+                    no_auto_back_and_forth: false
+                }]
             );
         }
     }

@@ -14,7 +14,7 @@ pub struct OutputInfo {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum IpcEvent {
-    /// change: "focus" | "init" | "empty" | "move"
+    /// change: "focus" | "init" | "empty" | "move" | "rename"
     Workspace {
         change: String,
         current: Option<String>,
@@ -76,7 +76,7 @@ pub struct Wm {
 pub const SCRATCH_OUTPUT: &str = "__i3";
 pub const SCRATCH_WORKSPACE: &str = "__i3_scratch";
 
-fn workspace_num(name: &str) -> Option<i32> {
+pub(crate) fn workspace_num(name: &str) -> Option<i32> {
     let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
 }
@@ -93,7 +93,8 @@ fn is_window_command(cmd: &Command) -> bool {
             | Command::ScratchpadShow
             | Command::Unmark(None)
             | Command::Gaps { .. }
-            | Command::Workspace(_)
+            | Command::Workspace { .. }
+            | Command::RenameWorkspace { .. }
             | Command::FocusOutput(_)
             | Command::MoveWorkspaceToOutput(_)
     )
@@ -639,7 +640,13 @@ impl Wm {
             Command::FocusOutput(t) => return self.focus_output(t),
             Command::MoveToWorkspace(t) => return self.move_to_workspace(target, t),
             Command::MoveWorkspaceToOutput(t) => return self.move_workspace_to_output(t),
-            Command::Workspace(t) => return self.switch_workspace(t),
+            Command::Workspace {
+                target,
+                no_auto_back_and_forth,
+            } => return self.workspace_command(target, *no_auto_back_and_forth),
+            Command::RenameWorkspace { old, new } => {
+                return self.rename_workspace(old.as_deref(), new)
+            }
             Command::Focus(d) => return self.focus_direction(target, *d),
             Command::FocusParent => self.focus_parent(target),
             Command::FocusChild => self.focus_child(target),

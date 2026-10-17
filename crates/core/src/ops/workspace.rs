@@ -1,7 +1,7 @@
 use crate::command::{OutputTarget, WorkspaceTarget};
 use crate::geom::{sanitize_floating, Direction, Rect};
 use crate::tree::{Layout, NodeId, NodeKind, ScratchState};
-use crate::wm::{IpcEvent, OutputInfo, Wm};
+use crate::wm::{workspace_num, IpcEvent, OutputInfo, Wm};
 
 fn sort_key(num: Option<i32>, name: &str) -> (bool, i32, String) {
     (num.is_none(), num.unwrap_or(0), name.to_string())
@@ -57,6 +57,12 @@ impl Wm {
     /// Output a newly created workspace `name` belongs on: the first existing
     /// output configured for it, else the focused output.
     pub(crate) fn output_for_new_workspace(&self, name: &str) -> NodeId {
+        self.configured_output(name)
+            .unwrap_or_else(|| self.focused_output())
+    }
+
+    /// First existing output that `workspace_output` assigns workspace `name` to.
+    fn configured_output(&self, name: &str) -> Option<NodeId> {
         self.config
             .workspace_outputs
             .iter()
@@ -68,7 +74,6 @@ impl Wm {
                         .find(|&n| self.output_name(n) == o)
                 })
             })
-            .unwrap_or_else(|| self.focused_output())
     }
 
     fn is_workspace_empty(&self, ws: NodeId) -> bool {
@@ -211,6 +216,93 @@ impl Wm {
                 self.create_workspace(out, name)
             }
         }
+    }
+
+    /// `workspace [--no-auto-back-and-forth] TARGET`: with
+    /// `workspace_auto_back_and_forth`, naming the focused workspace acts as
+    /// `workspace back_and_forth`.
+    pub(crate) fn workspace_command(
+        &mut self,
+        t: &WorkspaceTarget,
+        no_auto_back_and_forth: bool,
+    ) -> Result<(), String> {
+        if self.config.workspace_auto_back_and_forth && !no_auto_back_and_forth {
+            let cur = self.focused_workspace();
+            let is_current = match (t, &self.tree.get(cur).kind) {
+                (WorkspaceTarget::Name(s), NodeKind::Workspace { name, .. }) => s == name,
+                (WorkspaceTarget::Number(n), NodeKind::Workspace { num, .. }) => *num == Some(*n),
+                _ => false,
+            };
+            if is_current {
+                return self.switch_workspace(&WorkspaceTarget::BackAndForth);
+            }
+        }
+        self.switch_workspace(t)
+    }
+
+    /// `rename workspace [OLD] to NEW`.
+    pub(crate) fn rename_workspace(&mut self, old: Option<&str>, new: &str) -> Result<(), String> {
+        if new.starts_with("__") {
+            return Err("Workspace names starting with __ are reserved".into());
+        }
+        let (old_name, ws) = match old {
+            Some(o) => (
+                o.to_string(),
+                self.find_workspace(o)
+                    .ok_or_else(|| format!("Workspace {o} not found"))?,
+            ),
+            None => {
+                let ws = self.focused_workspace();
+                if ws == self.scratch {
+                    return Err("Workspace __i3_scratch not found".into());
+                }
+                (self.workspace_name(ws).to_string(), ws)
+            }
+        };
+        if self.find_workspace(new).is_some() {
+            return Err(format!("New workspace name \"{new}\" already in use"));
+        }
+        let was_focused = self.focused_workspace() == ws;
+        let src_out = self.tree.output_of(ws).ok_or("workspace has no output")?;
+        let dest_out = self.configured_output(new).unwrap_or(src_out);
+        let focus_idx = self.tree.get(src_out).focus.iter().position(|&c| c == ws);
+        if let NodeKind::Workspace { name, num } = &mut self.tree.get_mut(ws).kind {
+            *name = new.to_string();
+            *num = workspace_num(new);
+        }
+        if self.prev_workspace.as_deref() == Some(old_name.as_str()) {
+            self.prev_workspace = Some(new.to_string());
+        }
+        if dest_out == src_out {
+            self.tree.detach(ws);
+            self.attach_workspace_sorted(src_out, ws);
+            if let Some(i) = focus_idx {
+                let focus = &mut self.tree.get_mut(src_out).focus;
+                focus.retain(|&c| c != ws);
+                focus.insert(i.min(focus.len()), ws);
+            }
+        } else {
+            if self.tree.get(src_out).children.len() == 1 {
+                let mut n = 1;
+                while self.find_workspace(&n.to_string()).is_some() {
+                    n += 1;
+                }
+                self.create_workspace(src_out, &n.to_string());
+            }
+            let (from, to) = (self.output_rect(src_out), self.output_rect(dest_out));
+            self.tree.detach(ws);
+            self.attach_workspace_sorted(dest_out, ws);
+            self.shift_workspace_floating(ws, from, to);
+            if was_focused {
+                self.show_workspace(ws);
+            }
+        }
+        self.emit(IpcEvent::Workspace {
+            change: "rename".into(),
+            current: Some(new.to_string()),
+            old: None,
+        });
+        Ok(())
     }
 
     pub fn switch_workspace(&mut self, t: &WorkspaceTarget) -> Result<(), String> {
@@ -454,8 +546,8 @@ impl Wm {
 mod tests {
     use crate::config::Config;
     use crate::testutil::*;
-    use crate::tree::WindowId;
-    use crate::wm::Wm;
+    use crate::tree::{NodeKind, WindowId};
+    use crate::wm::{IpcEvent, Wm};
 
     #[test]
     fn switch_creates_and_removes_empty() {
@@ -519,6 +611,65 @@ mod tests {
         wm.run_command("focus output right");
         assert_eq!(wm.workspace_name(wm.focused_workspace()), "2");
         assert!(!wm.run_command("focus output right")[0].success);
+    }
+    #[test]
+    fn rename_workspace() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        assert!(wm.run_command("rename workspace to \"5: mail\"")[0].success);
+        let ws = wm.focused_workspace();
+        assert_eq!(wm.workspace_name(ws), "5: mail");
+        assert!(matches!(
+            wm.tree.get(ws).kind,
+            NodeKind::Workspace { num: Some(5), .. }
+        ));
+        wm.run_command("workspace 2");
+        assert!(wm.run_command("rename workspace \"5: mail\" to 7")[0].success);
+        assert!(wm.find_workspace("7").is_some());
+    }
+    #[test]
+    fn rename_to_existing_name_fails() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("workspace 2");
+        wm.manage(win(2));
+        let r = wm.run_command("rename workspace to 1");
+        assert!(!r[0].success);
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "2");
+        assert!(!wm.run_command("rename workspace nope to x")[0].success);
+        assert!(!wm.run_command("rename workspace to __x")[0].success);
+    }
+    #[test]
+    fn rename_updates_prev_workspace_and_emits() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("workspace 2");
+        wm.take_effects();
+        wm.run_command("rename workspace 1 to 9");
+        assert!(wm
+            .take_effects()
+            .contains(&crate::wm::Effect::Ipc(IpcEvent::Workspace {
+                change: "rename".into(),
+                current: Some("9".into()),
+                old: None
+            })));
+        wm.run_command("workspace back_and_forth");
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "9");
+    }
+    #[test]
+    fn auto_back_and_forth() {
+        let cfg = Config {
+            workspace_auto_back_and_forth: true,
+            ..Config::default()
+        };
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        wm.run_command("workspace 2");
+        wm.manage(win(2));
+        wm.run_command("workspace 2");
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
+        wm.run_command("workspace --no-auto-back-and-forth 1");
+        assert_eq!(wm.workspace_name(wm.focused_workspace()), "1");
     }
     #[test]
     fn move_workspace_to_output() {
