@@ -25,6 +25,8 @@ public class U {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, StringBuilder l);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
   [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint c, uint t);
+  [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint a, uint b, out RECT r, uint c);
+  public static RECT WorkArea(){ RECT r; SystemParametersInfo(0x30,0,out r,0); return r; }
   public struct RECT { public int L,T,R,B; public override string ToString(){ return "["+L+","+T+","+R+","+B+"]"; } }
   public static IntPtr Top(uint pid) {
     IntPtr f = IntPtr.Zero;
@@ -208,9 +210,9 @@ Start-Sleep -Milliseconds 400
 # ---- Plan 6: bar (default config, one bar)
 $bar = [U]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, 'i3win_bar', $null)
 Check 'plan6 bar window exists' ($bar -ne [IntPtr]::Zero)
-$maxBottom = ($h | ForEach-Object { [U]::Rect($_).B } | Measure-Object -Maximum).Maximum
+$wa = [U]::WorkArea()
 $br = [U]::Rect($bar)
-Check 'plan6 bar sits at the bottom, below the tiled windows' ([U]::IsWindowVisible($bar) -and $br.T -ge ($maxBottom - 2) -and $br.B -gt $br.T) "bar=$br maxBottom=$maxBottom"
+Check 'plan6 bar sits at the bottom of the work area' ([U]::IsWindowVisible($bar) -and $br.B -eq $wa.B -and $br.B -gt $br.T) "bar=$br workarea=$wa"
 $r = Msg -t get_bar_config
 Check 'plan6 get_bar_config lists bar-0' ($r.out -match '^\[\s*"bar-0"\s*\]$') $r.out
 $hb = [U]::Rect($h[0]); $heightBefore = $hb.B - $hb.T
