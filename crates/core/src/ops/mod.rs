@@ -1,4 +1,4 @@
-mod floating;
+pub(crate) mod floating;
 mod focus;
 mod gaps;
 mod layout_ops;

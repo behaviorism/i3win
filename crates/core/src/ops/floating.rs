@@ -1,7 +1,27 @@
 use crate::command::Toggle;
-use crate::geom::{sanitize_floating, Rect};
+use crate::config::Config;
+use crate::geom::{sanitize_floating, Rect, MIN_FLOAT_SIZE};
 use crate::tree::{NodeId, NodeKind, ScratchState};
 use crate::wm::{IpcEvent, Wm};
+
+/// Applies `floating_minimum_size` / `floating_maximum_size` (0 = no limit) on top
+/// of the hard `MIN_FLOAT_SIZE` floor.
+pub fn clamp_floating_size(cfg: &Config, w: i32, h: i32) -> (i32, i32) {
+    let one = |v: i32, min: i32, max: i32| {
+        let v = v.max(min);
+        let v = if max > 0 { v.min(max) } else { v };
+        v.max(MIN_FLOAT_SIZE)
+    };
+    let (min, max) = (cfg.floating_minimum_size, cfg.floating_maximum_size);
+    (one(w, min.0, max.0), one(h, min.1, max.1))
+}
+
+/// `sanitize_floating` plus the configured size limits.
+pub fn clamp_floating_rect(cfg: &Config, r: Rect) -> Rect {
+    let r = sanitize_floating(r);
+    let (w, h) = clamp_floating_size(cfg, r.w, r.h);
+    Rect { w, h, ..r }
+}
 
 fn want(t: &Toggle, current: bool) -> bool {
     match t {
@@ -54,14 +74,18 @@ impl Wm {
             if let NodeKind::Window(d) = &mut self.tree.get_mut(target).kind {
                 if d.floating_rect.is_none() {
                     let r = d.info.rect;
-                    d.floating_rect = Some(sanitize_floating(match out_rect {
-                        Some(o) => {
-                            // i64 math: 80% of the output without overflow.
-                            let cap = |v: i32| (i64::from(v) * 4 / 5) as i32;
-                            Rect::new(0, 0, r.w.min(cap(o.w)), r.h.min(cap(o.h))).centered_in(&o)
-                        }
-                        None => r,
-                    }));
+                    d.floating_rect = Some(clamp_floating_rect(
+                        &self.config,
+                        match out_rect {
+                            Some(o) => {
+                                // i64 math: 80% of the output without overflow.
+                                let cap = |v: i32| (i64::from(v) * 4 / 5) as i32;
+                                Rect::new(0, 0, r.w.min(cap(o.w)), r.h.min(cap(o.h)))
+                                    .centered_in(&o)
+                            }
+                            None => r,
+                        },
+                    ));
                 }
             }
             self.tree.attach_floating(ws, target);

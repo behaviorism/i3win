@@ -2,6 +2,12 @@ use crate::criteria::{parse_criteria, Criteria};
 use crate::geom::{Direction, Orientation};
 use crate::tree::Layout;
 
+/// A length in pixels or percent of the output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Len {
+    Px(i32),
+    Ppt(i32),
+}
 #[derive(Clone, Debug, PartialEq)]
 pub enum Toggle {
     Toggle,
@@ -88,6 +94,17 @@ pub enum Command {
     },
     /// Optional "N px" (floating only).
     Move(Direction, Option<i32>),
+    /// `move [window|container] [to] position X Y` (floating only).
+    MovePosition {
+        x: Len,
+        y: Len,
+    },
+    /// `move [absolute] position center`.
+    MoveCenter {
+        absolute: bool,
+    },
+    /// `move position mouse|cursor|pointer`.
+    MoveToPointer,
     MoveToWorkspace(WorkspaceTarget),
     MoveWorkspaceToOutput(OutputTarget),
     Workspace {
@@ -110,6 +127,11 @@ pub enum Command {
         axis: Orientation,
         px: Option<i32>,
         ppt: Option<i32>,
+    },
+    /// `resize set`: None (or 0) leaves that dimension unchanged.
+    ResizeSet {
+        w: Option<Len>,
+        h: Option<Len>,
     },
     Border(BorderArg),
     TitleFormat(String),
@@ -327,12 +349,82 @@ fn parse_int(s: &str) -> Result<i32, String> {
     s.parse::<i32>().map_err(|_| format!("bad number: {s}"))
 }
 
+/// Parses `N [px|ppt]` at `args[*i]`; advances `*i` past it.
+fn parse_len(args: &[Tok], i: &mut usize) -> Result<Len, String> {
+    let v = parse_int(args.get(*i).map(|t| t.0.as_str()).unwrap_or(""))?;
+    *i += 1;
+    Ok(match args.get(*i).map(|t| t.0.as_str()) {
+        Some("ppt") => {
+            *i += 1;
+            Len::Ppt(v)
+        }
+        Some("px") => {
+            *i += 1;
+            Len::Px(v)
+        }
+        _ => Len::Px(v),
+    })
+}
+
+fn parse_resize_set(args: &[Tok]) -> Result<Command, String> {
+    let (mut w, mut h) = (None, None);
+    let mut explicit: Option<usize> = None;
+    let mut next = 0;
+    let mut i = 0;
+    while let Some(tok) = args.get(i).map(|t| t.0.as_str()) {
+        match tok {
+            "width" => {
+                explicit = Some(0);
+                i += 1;
+            }
+            "height" => {
+                explicit = Some(1);
+                i += 1;
+            }
+            _ => {
+                let len = parse_len(args, &mut i)?;
+                let len = if matches!(len, Len::Px(0) | Len::Ppt(0)) {
+                    None
+                } else {
+                    Some(len)
+                };
+                match explicit.take().unwrap_or(next) {
+                    0 => w = len,
+                    1 => h = len,
+                    _ => return Err("resize set: too many arguments".into()),
+                }
+                next = 1;
+            }
+        }
+    }
+    if i == 0 {
+        return Err("resize set: missing size".into());
+    }
+    Ok(Command::ResizeSet { w, h })
+}
+
+/// Parses the part after `position` of a `move ... position` command.
+fn parse_move_position(args: &[Tok], absolute: bool) -> Result<Command, String> {
+    match args.first().map(|t| t.0.as_str()) {
+        Some("center") => return Ok(Command::MoveCenter { absolute }),
+        Some("mouse" | "cursor" | "pointer") => return Ok(Command::MoveToPointer),
+        _ => {}
+    }
+    let mut i = 0;
+    let x = parse_len(args, &mut i)?;
+    let y = parse_len(args, &mut i)?;
+    if i != args.len() {
+        return Err(format!("bad move position argument: {}", join(args)));
+    }
+    Ok(Command::MovePosition { x, y })
+}
+
 fn parse_resize(args: &[Tok]) -> Result<Command, String> {
     let a = |i: usize| args.get(i).map(|t| t.0.as_str());
     let grow = match a(0) {
         Some("grow") => true,
         Some("shrink") => false,
-        Some("set") => return Err("resize set: unsupported".into()),
+        Some("set") => return parse_resize_set(&args[1..]),
         o => return Err(format!("bad resize argument: {}", o.unwrap_or(""))),
     };
     let axis = match a(1) {
@@ -388,6 +480,14 @@ fn parse_move(args: &[Tok]) -> Result<Command, String> {
     let mut i = 0;
     if matches!(a(i), Some("container" | "window")) {
         i += 1;
+    }
+    let (mut j, mut absolute) = (i, false);
+    while matches!(a(j), Some("to" | "absolute")) {
+        absolute |= a(j) == Some("absolute");
+        j += 1;
+    }
+    if a(j) == Some("position") {
+        return parse_move_position(&args[j + 1..], absolute);
     }
     if a(i) == Some("workspace") && a(i + 1) == Some("to") {
         i += 2;
@@ -684,6 +784,53 @@ mod tests {
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].commands.len(), 1);
         g[0].commands[0].clone()
+    }
+    #[test]
+    fn parses_move_position_and_resize_set() {
+        assert_eq!(
+            one("move position 10 px 20 ppt"),
+            Command::MovePosition {
+                x: Len::Px(10),
+                y: Len::Ppt(20)
+            }
+        );
+        assert_eq!(
+            one("move window to position 5 6"),
+            Command::MovePosition {
+                x: Len::Px(5),
+                y: Len::Px(6)
+            }
+        );
+        assert_eq!(
+            one("move absolute position center"),
+            Command::MoveCenter { absolute: true }
+        );
+        assert_eq!(
+            one("move position center"),
+            Command::MoveCenter { absolute: false }
+        );
+        assert_eq!(one("move position cursor"), Command::MoveToPointer);
+        assert_eq!(
+            one("resize set width 30 ppt height 200 px"),
+            Command::ResizeSet {
+                w: Some(Len::Ppt(30)),
+                h: Some(Len::Px(200))
+            }
+        );
+        assert_eq!(
+            one("resize set 0 300"),
+            Command::ResizeSet {
+                w: None,
+                h: Some(Len::Px(300))
+            }
+        );
+        assert_eq!(
+            one("resize set height 40 ppt"),
+            Command::ResizeSet {
+                w: None,
+                h: Some(Len::Ppt(40))
+            }
+        );
     }
     #[test]
     fn exec_keeps_raw_rest() {

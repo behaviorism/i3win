@@ -1,8 +1,9 @@
 use crate::command::{parse_commands, BorderArg, Command, TitleIconArg, Toggle, WorkspaceTarget};
 use crate::config::{Border, Config, FocusOnActivation, PopupDuringFullscreen};
 use crate::criteria::select_matches;
-use crate::geom::{sanitize_floating, Rect};
+use crate::geom::Rect;
 use crate::keys::KeyCombo;
+use crate::ops::floating::clamp_floating_rect;
 use crate::tree::{Layout, NodeId, NodeKind, Tree, WindowData, WindowId, WindowInfo};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,6 +72,8 @@ pub struct Wm {
     pub(crate) scratch: NodeId,
     /// Scratchpad windows, least recently hidden first.
     pub(crate) scratch_order: Vec<NodeId>,
+    /// Mouse pointer position, set by the platform before each command.
+    pub pointer: Option<(i32, i32)>,
 }
 
 pub const SCRATCH_OUTPUT: &str = "__i3";
@@ -113,6 +116,7 @@ impl Wm {
             urgent_counter: 0,
             scratch: NodeId(0),
             scratch_order: Vec::new(),
+            pointer: None,
         };
         let outputs = if outputs.is_empty() {
             vec![OutputInfo {
@@ -428,8 +432,9 @@ impl Wm {
                 })
                 .unwrap_or(rect);
             if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
-                d.floating_rect = Some(sanitize_floating(
-                    sanitize_floating(rect).centered_in(&out_rect),
+                d.floating_rect = Some(clamp_floating_rect(
+                    &self.config,
+                    clamp_floating_rect(&self.config, rect).centered_in(&out_rect),
                 ));
             }
             self.tree.attach_floating(ws, node);
@@ -586,7 +591,7 @@ impl Wm {
             return;
         }
         if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
-            d.floating_rect = Some(sanitize_floating(rect));
+            d.floating_rect = Some(clamp_floating_rect(&self.config, rect));
         }
     }
 
@@ -700,6 +705,10 @@ impl Wm {
             Command::FocusFloating => self.focus_layer(target, Some(true)),
             Command::FocusTiling => self.focus_layer(target, Some(false)),
             Command::Move(d, px) => return self.move_direction(target, *d, *px),
+            Command::MovePosition { x, y } => return self.move_position(target, *x, *y),
+            Command::MoveCenter { absolute } => return self.move_center(target, *absolute),
+            Command::MoveToPointer => return self.move_to_pointer(target),
+            Command::ResizeSet { w, h } => return self.resize_set(target, *w, *h),
             Command::Split(a) => return self.split(target, a),
             Command::Layout(a) => return self.set_layout(target, a),
             Command::Resize {
@@ -1381,5 +1390,101 @@ mod tests {
         lone.class = "c2".into();
         wm.manage(lone); // matched, but alone on its workspace: takes focus
         assert_eq!(wm.focused_window(), Some(WindowId(4)));
+    }
+
+    #[test]
+    fn move_position_and_center() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("floating enable");
+        wm.run_command("move position 10 px 20 px");
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        let fr = |wm: &Wm| match &wm.tree.get(n).kind {
+            NodeKind::Window(d) => d.floating_rect.unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!((fr(&wm).x, fr(&wm).y), (10, 20));
+        wm.run_command("move position 50 ppt 0 ppt");
+        assert_eq!(fr(&wm).x, 500);
+        wm.run_command("move position center");
+        let r = fr(&wm);
+        assert_eq!(r.x + r.w / 2, 500);
+        wm.pointer = Some((600, 250));
+        wm.run_command("move position mouse");
+        let r = fr(&wm);
+        assert_eq!((r.x + r.w / 2, r.y + r.h / 2), (600, 250));
+        wm.pointer = Some((990, 490)); // near the corner: clamped inside the output
+        wm.run_command("move position mouse");
+        let r = fr(&wm);
+        assert_eq!((r.right(), r.bottom()), (1000, 500));
+    }
+
+    #[test]
+    fn move_position_on_tiled_is_noop_success() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        assert!(wm.run_command("move position 10 20")[0].success);
+        assert_eq!(ws_desc(&wm), "H[w1]");
+    }
+
+    #[test]
+    fn move_absolute_center_uses_all_outputs() {
+        let mut wm = Wm::new(
+            Config::default(),
+            vec![out("O1", 0, 1000), out("O2", 1000, 1000)],
+        );
+        wm.manage(win(1));
+        wm.run_command("floating enable");
+        wm.run_command("move absolute position center");
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        match &wm.tree.get(n).kind {
+            NodeKind::Window(d) => {
+                let r = d.floating_rect.unwrap();
+                assert_eq!(r.x + r.w / 2, 1000);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn resize_set_floating_and_tiled() {
+        let mut wm = Wm::new(
+            crate::config::parse_config("floating_maximum_size 600 x 400\n"),
+            vec![out("O1", 0, 1000)],
+        );
+        wm.manage(win(1));
+        wm.manage(win(2));
+        assert!(wm.run_command("resize set 30 ppt")[0].success);
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        assert!((wm.tree.get(n2).percent - 0.30).abs() < 1e-9);
+        wm.run_command("floating enable");
+        wm.run_command("resize set 900 px 900 px");
+        match &wm.tree.get(n2).kind {
+            NodeKind::Window(d) => {
+                let r = d.floating_rect.unwrap();
+                assert_eq!((r.w, r.h), (600, 400));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn floating_minimum_size_applies() {
+        let mut wm = Wm::new(
+            crate::config::parse_config("floating_minimum_size 200 x 150\n"),
+            vec![out("O1", 0, 1000)],
+        );
+        let mut w = win(1);
+        w.rect = Rect::new(0, 0, 60, 60);
+        w.wants_float = true;
+        wm.manage(w);
+        let n = wm.tree.window_node(WindowId(1)).unwrap();
+        match &wm.tree.get(n).kind {
+            NodeKind::Window(d) => {
+                let r = d.floating_rect.unwrap();
+                assert_eq!((r.w, r.h), (200, 150));
+            }
+            _ => unreachable!(),
+        }
     }
 }

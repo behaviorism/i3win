@@ -308,8 +308,17 @@ impl App {
         }
     }
 
+    /// Publishes the cursor position for `move position mouse`.
+    fn refresh_pointer(&mut self) {
+        let mut p = windows::Win32::Foundation::POINT::default();
+        // SAFETY: p is a valid out pointer for the synchronous call.
+        let ok = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p) };
+        self.wm.pointer = ok.ok().map(|()| (p.x, p.y));
+    }
+
     /// Handles a bound key combo. Does not flush.
     pub fn on_binding(&mut self, combo: KeyCombo) {
+        self.refresh_pointer();
         self.wm.binding_pressed(combo);
     }
 
@@ -349,6 +358,7 @@ impl App {
                 reply,
             } => return self.on_ipc(msg_type, &payload, &reply),
             MainMsg::RunCommand(c) => {
+                self.refresh_pointer();
                 self.wm.run_command(&c);
             }
             MainMsg::StatusClick {
@@ -374,6 +384,7 @@ impl App {
         payload: &str,
         reply: &std::sync::mpsc::Sender<String>,
     ) -> bool {
+        self.refresh_pointer();
         let path = self.config_path.display().to_string();
         let ctx = IpcContext {
             config_path: &path,

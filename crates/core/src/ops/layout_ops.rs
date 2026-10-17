@@ -1,5 +1,6 @@
-use crate::command::{LayoutArg, SplitArg};
-use crate::geom::{sanitize_floating, Orientation, MIN_FLOAT_SIZE};
+use crate::command::{LayoutArg, Len, SplitArg};
+use crate::geom::{Orientation, MIN_FLOAT_SIZE};
+use crate::ops::floating::clamp_floating_rect;
 use crate::tree::{Layout, NodeId, NodeKind};
 use crate::wm::Wm;
 
@@ -126,18 +127,7 @@ impl Wm {
             Orientation::Horizontal => Layout::SplitH,
             Orientation::Vertical => Layout::SplitV,
         };
-        let mut found = None;
-        let mut c = target;
-        while c != ws {
-            let Some(p) = self.tree.parent(c) else { break };
-            let pn = self.tree.get(p);
-            if pn.layout == want && pn.children.len() >= 2 && pn.children.contains(&c) {
-                found = Some((c, p));
-                break;
-            }
-            c = p;
-        }
-        let Some((c, p)) = found else {
+        let Some((c, p)) = self.resize_ancestor(target, ws, want) else {
             return Err("No container found to resize".into());
         };
         let mut delta = match (ppt, px) {
@@ -151,10 +141,88 @@ impl Wm {
         if !grow {
             delta = -delta;
         }
+        let new = self.tree.get(c).percent + delta;
+        self.set_child_percent(p, c, new)
+    }
+
+    /// `resize set W H`: absolute size. Floating windows get a frame size
+    /// (clamped to the configured limits); tiled ones get that share of their
+    /// splith (width) / splitv (height) ancestor.
+    pub fn resize_set(
+        &mut self,
+        target: NodeId,
+        w: Option<Len>,
+        h: Option<Len>,
+    ) -> Result<(), String> {
+        let (Some(ws), Some(out)) = (self.tree.workspace_of(target), self.output_rect_of(target))
+        else {
+            return Err("No container found to resize".into());
+        };
+        let px = |l: Len, size: i32| match l {
+            Len::Px(v) => v,
+            Len::Ppt(p) => (i64::from(p) * i64::from(size) / 100) as i32,
+        };
+        if self.tree.is_floating(target) {
+            if let NodeKind::Window(d) = &mut self.tree.get_mut(target).kind {
+                if let Some(r) = d.floating_rect.as_mut() {
+                    if let Some(l) = w {
+                        r.w = px(l, out.w);
+                    }
+                    if let Some(l) = h {
+                        r.h = px(l, out.h);
+                    }
+                    *r = clamp_floating_rect(&self.config, *r);
+                }
+            }
+            return Ok(());
+        }
+        let mut applied = false;
+        for (len, want, size) in [(w, Layout::SplitH, out.w), (h, Layout::SplitV, out.h)] {
+            let Some(len) = len else { continue };
+            let Some((c, p)) = self.resize_ancestor(target, ws, want) else {
+                continue;
+            };
+            let frac = match len {
+                Len::Ppt(p) => f64::from(p) / 100.0,
+                Len::Px(v) if size > 0 => f64::from(v) / f64::from(size),
+                Len::Px(_) => return Err("cannot resize: output has no size".into()),
+            };
+            self.set_child_percent(p, c, frac)?;
+            applied = true;
+        }
+        if applied || (w.is_none() && h.is_none()) {
+            Ok(())
+        } else {
+            Err("No container found to resize".into())
+        }
+    }
+
+    /// Nearest ancestor-or-self `c` of `target` whose parent `p` has layout
+    /// `want` and at least two children.
+    fn resize_ancestor(
+        &self,
+        target: NodeId,
+        ws: NodeId,
+        want: Layout,
+    ) -> Option<(NodeId, NodeId)> {
+        let mut c = target;
+        while c != ws {
+            let p = self.tree.parent(c)?;
+            let pn = self.tree.get(p);
+            if pn.layout == want && pn.children.len() >= 2 && pn.children.contains(&c) {
+                return Some((c, p));
+            }
+            c = p;
+        }
+        None
+    }
+
+    /// Gives child `c` of `p` the fraction `new`; siblings scale proportionally,
+    /// each staying at least 5%.
+    fn set_child_percent(&mut self, p: NodeId, c: NodeId, new: f64) -> Result<(), String> {
         let sibs = self.tree.get(p).children.clone();
         let n = sibs.len();
         let old = self.tree.get(c).percent;
-        let new = old + delta;
         if !new.is_finite()
             || new < MIN_PERCENT - EPS
             || new > 1.0 - MIN_PERCENT * (n as f64 - 1.0) + EPS
@@ -212,7 +280,7 @@ impl Wm {
         let actual = new_size - *size as i64;
         *pos = clamp_i32((*pos as i64).saturating_sub(actual / 2));
         *size = clamp_i32(new_size);
-        *r = sanitize_floating(*r);
+        *r = clamp_floating_rect(&self.config, *r);
         Ok(())
     }
 }

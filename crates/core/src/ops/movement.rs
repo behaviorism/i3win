@@ -1,4 +1,6 @@
-use crate::geom::{sanitize_floating, Direction};
+use crate::command::Len;
+use crate::geom::{Direction, Rect};
+use crate::ops::floating::clamp_floating_rect;
 use crate::tree::{Layout, NodeId, NodeKind};
 use crate::wm::{IpcEvent, Wm};
 
@@ -29,7 +31,7 @@ impl Wm {
                         Direction::Up => r.y = r.y.saturating_sub(d),
                         Direction::Down => r.y = r.y.saturating_add(d),
                     }
-                    *r = sanitize_floating(*r);
+                    *r = clamp_floating_rect(&self.config, *r);
                 }
             }
             self.emit_moved(n);
@@ -60,6 +62,86 @@ impl Wm {
             self.note_workspace_focus(old_focused_ws, ws2);
         }
         self.emit_moved(n);
+        Ok(())
+    }
+
+    /// Rect of the output that holds `n`.
+    pub(crate) fn output_rect_of(&self, n: NodeId) -> Option<Rect> {
+        let ws = self.tree.workspace_of(n)?;
+        let o = self.tree.output_of(ws)?;
+        match &self.tree.get(o).kind {
+            NodeKind::Output { rect, .. } => Some(*rect),
+            _ => None,
+        }
+    }
+
+    /// Sets the floating rect of `n` (clamped) and reports the move.
+    /// Does nothing for tiled nodes (i3 reports success there).
+    fn place_floating(&mut self, n: NodeId, f: impl FnOnce(Rect, Rect) -> Rect) {
+        if !self.tree.is_floating(n) {
+            return;
+        }
+        let Some(out) = self.output_rect_of(n) else {
+            return;
+        };
+        if let NodeKind::Window(w) = &mut self.tree.get_mut(n).kind {
+            if let Some(r) = w.floating_rect.as_mut() {
+                *r = clamp_floating_rect(&self.config, f(*r, out));
+            }
+        }
+        self.emit_moved(n);
+    }
+
+    pub fn move_position(&mut self, target: NodeId, x: Len, y: Len) -> Result<(), String> {
+        let at = |l: Len, origin: i32, size: i32| match l {
+            Len::Px(v) => origin.saturating_add(v),
+            Len::Ppt(p) => origin.saturating_add((i64::from(p) * i64::from(size) / 100) as i32),
+        };
+        self.place_floating(target, |r, o| Rect {
+            x: at(x, o.x, o.w),
+            y: at(y, o.y, o.h),
+            ..r
+        });
+        Ok(())
+    }
+
+    pub fn move_center(&mut self, target: NodeId, absolute: bool) -> Result<(), String> {
+        let area = if absolute {
+            let mut it = self
+                .outputs()
+                .into_iter()
+                .filter_map(|o| match &self.tree.get(o).kind {
+                    NodeKind::Output { rect, .. } => Some(*rect),
+                    _ => None,
+                });
+            it.next().map(|first| {
+                it.fold(first, |a, r| {
+                    let (x, y) = (a.x.min(r.x), a.y.min(r.y));
+                    Rect::new(
+                        x,
+                        y,
+                        a.right().max(r.right()) - x,
+                        a.bottom().max(r.bottom()) - y,
+                    )
+                })
+            })
+        } else {
+            None
+        };
+        self.place_floating(target, |r, o| r.centered_in(&area.unwrap_or(o)));
+        Ok(())
+    }
+
+    pub fn move_to_pointer(&mut self, target: NodeId) -> Result<(), String> {
+        let Some((px, py)) = self.pointer else {
+            return Err("pointer position unavailable".into());
+        };
+        self.place_floating(target, |r, o| {
+            // Clamp the top-left so the frame stays inside the output (when it fits).
+            let x = (px - r.w / 2).min(o.right() - r.w).max(o.x);
+            let y = (py - r.h / 2).min(o.bottom() - r.h).max(o.y);
+            Rect { x, y, ..r }
+        });
         Ok(())
     }
 
