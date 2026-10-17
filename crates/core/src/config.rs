@@ -1,6 +1,6 @@
 use crate::command::WorkspaceTarget;
 use crate::criteria::{parse_criteria, Criteria};
-use crate::keys::{parse_combo, KeyCombo};
+use crate::keys::{parse_combo, KeyCombo, Modifiers};
 use crate::tree::Layout;
 use std::collections::HashMap;
 
@@ -95,7 +95,151 @@ pub struct Config {
     pub gaps_outer: i32,
     pub colors: ClientColors,
     pub bar: Option<BarConfig>,
+    pub focus_follows_mouse: bool,
+    pub mouse_warping: MouseWarping,
+    pub floating_modifier: Option<Modifiers>,
+    pub tiling_drag: TilingDrag,
+    pub show_marks: bool,
+    pub focus_wrapping: FocusWrapping,
+    pub workspace_auto_back_and_forth: bool,
+    pub popup_during_fullscreen: PopupDuringFullscreen,
+    pub focus_on_window_activation: FocusOnActivation,
+    pub floating_minimum_size: (i32, i32),
+    pub floating_maximum_size: (i32, i32),
+    pub hide_edge_borders: HideEdgeBorders,
+    pub smart_borders: SmartBorders,
+    pub smart_gaps: SmartGaps,
+    pub no_focus: Vec<Criteria>,
     pub warnings: Vec<String>, // "line N: message"
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseWarping {
+    Output,
+    Container,
+    None,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TilingDrag {
+    pub modifier: bool,
+    pub titlebar: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusWrapping {
+    Yes,
+    No,
+    Force,
+    Workspace,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupDuringFullscreen {
+    Smart,
+    Ignore,
+    LeaveFullscreen,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusOnActivation {
+    Smart,
+    Urgent,
+    Focus,
+    None,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HideEdgeBorders {
+    None,
+    Vertical,
+    Horizontal,
+    Both,
+    Smart,
+    SmartNoGaps,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmartBorders {
+    Off,
+    On,
+    NoGaps,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmartGaps {
+    Off,
+    On,
+    InverseOuter,
+}
+
+fn parse_bool(key: &str, args: &str) -> Result<bool, String> {
+    match args {
+        "yes" | "true" | "on" | "enable" | "active" => Ok(true),
+        "no" | "false" | "off" | "disable" | "inactive" => Ok(false),
+        _ => Err(format!("{key}: invalid value '{args}'; keeping default")),
+    }
+}
+
+fn parse_modifiers(args: &str) -> Result<Modifiers, String> {
+    let mut mods = Modifiers::default();
+    for m in args.split('+') {
+        mods = mods
+            | match m.trim() {
+                "Mod1" => Modifiers::ALT,
+                "Mod4" => Modifiers::WIN,
+                "Shift" => Modifiers::SHIFT,
+                "Control" | "Ctrl" => Modifiers::CTRL,
+                other => {
+                    return Err(format!(
+                        "floating_modifier: unknown modifier '{other}'; keeping default"
+                    ))
+                }
+            };
+    }
+    Ok(mods)
+}
+
+/// Parses `W x H`, `WxH` or a single number (used for both). `-1` becomes 0
+/// (no limit) and `0` becomes `default` for that dimension.
+fn parse_size(key: &str, args: &str, default: (i32, i32)) -> Result<(i32, i32), String> {
+    let bad = || format!("{key}: invalid size '{args}'; keeping default");
+    let compact: String = args.split_whitespace().collect();
+    let (w, h) = match compact.split_once('x') {
+        Some((w, h)) => (w, h),
+        None => (compact.as_str(), compact.as_str()),
+    };
+    let dim = |s: &str, def: i32| -> Result<i32, String> {
+        match s.parse::<i32>().map_err(|_| bad())? {
+            -1 => Ok(0),
+            0 => Ok(def),
+            n if n > 0 => Ok(n),
+            _ => Err(bad()),
+        }
+    };
+    Ok((dim(w, default.0)?, dim(h, default.1)?))
+}
+
+fn parse_tiling_drag(args: &str) -> Result<TilingDrag, String> {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    if toks == ["off"] {
+        return Ok(TilingDrag {
+            modifier: false,
+            titlebar: false,
+        });
+    }
+    let mut drag = TilingDrag {
+        modifier: false,
+        titlebar: false,
+    };
+    for t in &toks {
+        match *t {
+            "modifier" => drag.modifier = true,
+            "titlebar" => drag.titlebar = true,
+            _ => {
+                return Err(format!(
+                    "tiling_drag: invalid value '{args}'; keeping default"
+                ))
+            }
+        }
+    }
+    if toks.is_empty() {
+        return Err("tiling_drag: missing value; keeping default".to_string());
+    }
+    Ok(drag)
 }
 
 fn c(hex: u32) -> Color {
@@ -303,6 +447,24 @@ pub fn parse_config(text: &str) -> Config {
         gaps_outer: 0,
         colors: ClientColors::default(),
         bar: None,
+        focus_follows_mouse: true,
+        mouse_warping: MouseWarping::Output,
+        floating_modifier: None,
+        tiling_drag: TilingDrag {
+            modifier: true,
+            titlebar: true,
+        },
+        show_marks: true,
+        focus_wrapping: FocusWrapping::Yes,
+        workspace_auto_back_and_forth: false,
+        popup_during_fullscreen: PopupDuringFullscreen::Smart,
+        focus_on_window_activation: FocusOnActivation::Smart,
+        floating_minimum_size: (75, 50),
+        floating_maximum_size: (0, 0),
+        hide_edge_borders: HideEdgeBorders::None,
+        smart_borders: SmartBorders::Off,
+        smart_gaps: SmartGaps::Off,
+        no_focus: Vec::new(),
         warnings: Vec::new(),
     };
     cfg.bindings.insert("default".to_string(), Vec::new());
@@ -592,6 +754,87 @@ fn top_level(
                 _ => return Err(format!("unsupported gaps form: {args}")),
             }
         }
+        "focus_follows_mouse" => cfg.focus_follows_mouse = parse_bool(kw, args)?,
+        "mouse_warping" => {
+            cfg.mouse_warping = match args {
+                "output" => MouseWarping::Output,
+                "container" => MouseWarping::Container,
+                "none" => MouseWarping::None,
+                _ => return Err(format!("mouse_warping: invalid value '{args}'")),
+            }
+        }
+        "floating_modifier" => cfg.floating_modifier = Some(parse_modifiers(args)?),
+        "tiling_drag" => cfg.tiling_drag = parse_tiling_drag(args)?,
+        "show_marks" => cfg.show_marks = parse_bool(kw, args)?,
+        "focus_wrapping" => {
+            cfg.focus_wrapping = match args {
+                "yes" | "true" | "on" => FocusWrapping::Yes,
+                "no" | "false" | "off" => FocusWrapping::No,
+                "force" => FocusWrapping::Force,
+                "workspace" => FocusWrapping::Workspace,
+                _ => return Err(format!("focus_wrapping: invalid value '{args}'")),
+            }
+        }
+        "workspace_auto_back_and_forth" => {
+            cfg.workspace_auto_back_and_forth = parse_bool(kw, args)?
+        }
+        "popup_during_fullscreen" => {
+            cfg.popup_during_fullscreen = match args {
+                "smart" => PopupDuringFullscreen::Smart,
+                "ignore" => PopupDuringFullscreen::Ignore,
+                "leave_fullscreen" => PopupDuringFullscreen::LeaveFullscreen,
+                _ => return Err(format!("popup_during_fullscreen: invalid value '{args}'")),
+            }
+        }
+        "focus_on_window_activation" => {
+            cfg.focus_on_window_activation = match args {
+                "smart" => FocusOnActivation::Smart,
+                "urgent" => FocusOnActivation::Urgent,
+                "focus" => FocusOnActivation::Focus,
+                "none" => FocusOnActivation::None,
+                _ => {
+                    return Err(format!(
+                        "focus_on_window_activation: invalid value '{args}'"
+                    ))
+                }
+            }
+        }
+        "floating_minimum_size" => cfg.floating_minimum_size = parse_size(kw, args, (75, 50))?,
+        "floating_maximum_size" => cfg.floating_maximum_size = parse_size(kw, args, (0, 0))?,
+        "hide_edge_borders" => {
+            cfg.hide_edge_borders = match args {
+                "none" => HideEdgeBorders::None,
+                "vertical" => HideEdgeBorders::Vertical,
+                "horizontal" => HideEdgeBorders::Horizontal,
+                "both" => HideEdgeBorders::Both,
+                "smart" => HideEdgeBorders::Smart,
+                "smart_no_gaps" => HideEdgeBorders::SmartNoGaps,
+                _ => return Err(format!("hide_edge_borders: invalid value '{args}'")),
+            }
+        }
+        "smart_borders" => {
+            cfg.smart_borders = match args {
+                "on" | "yes" | "true" => SmartBorders::On,
+                "off" | "no" | "false" => SmartBorders::Off,
+                "no_gaps" => SmartBorders::NoGaps,
+                _ => return Err(format!("smart_borders: invalid value '{args}'")),
+            }
+        }
+        "smart_gaps" => {
+            cfg.smart_gaps = match args {
+                "on" | "yes" | "true" => SmartGaps::On,
+                "off" | "no" | "false" => SmartGaps::Off,
+                "inverse_outer" => SmartGaps::InverseOuter,
+                _ => return Err(format!("smart_gaps: invalid value '{args}'")),
+            }
+        }
+        "no_focus" => {
+            let (crit, rest) = split_criteria(args)?;
+            if !rest.is_empty() {
+                return Err("no_focus: unexpected text after criteria".to_string());
+            }
+            cfg.no_focus.push(crit);
+        }
         "client.focused" => cfg.colors.focused = parse_class(args, cfg.colors.focused)?,
         "client.focused_inactive" => {
             cfg.colors.focused_inactive = parse_class(args, cfg.colors.focused_inactive)?
@@ -614,6 +857,100 @@ mod tests {
     use super::*;
     use crate::keys::Modifiers;
     use crate::tree::Layout;
+
+    #[test]
+    fn new_options_defaults() {
+        let c = parse_config("");
+        assert!(c.focus_follows_mouse);
+        assert_eq!(c.mouse_warping, MouseWarping::Output);
+        assert_eq!(c.floating_modifier, None);
+        assert_eq!(
+            c.tiling_drag,
+            TilingDrag {
+                modifier: true,
+                titlebar: true
+            }
+        );
+        assert!(c.show_marks);
+        assert_eq!(c.focus_wrapping, FocusWrapping::Yes);
+        assert!(!c.workspace_auto_back_and_forth);
+        assert_eq!(c.popup_during_fullscreen, PopupDuringFullscreen::Smart);
+        assert_eq!(c.focus_on_window_activation, FocusOnActivation::Smart);
+        assert_eq!(c.floating_minimum_size, (75, 50));
+        assert_eq!(c.floating_maximum_size, (0, 0));
+        assert_eq!(c.hide_edge_borders, HideEdgeBorders::None);
+        assert_eq!(c.smart_borders, SmartBorders::Off);
+        assert_eq!(c.smart_gaps, SmartGaps::Off);
+    }
+    #[test]
+    fn new_options_parse() {
+        let c = parse_config(
+            "set $mod Mod4\nfocus_follows_mouse no\nmouse_warping none\nfloating_modifier $mod\n\
+             tiling_drag titlebar\nshow_marks no\nfocus_wrapping workspace\n\
+             workspace_auto_back_and_forth yes\npopup_during_fullscreen leave_fullscreen\n\
+             focus_on_window_activation urgent\nfloating_minimum_size 100 x 80\n\
+             floating_maximum_size 800x600\nhide_edge_borders smart_no_gaps\n\
+             smart_borders no_gaps\nsmart_gaps inverse_outer\nno_focus [class=\"^x$\"]\n",
+        );
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert!(!c.focus_follows_mouse);
+        assert_eq!(c.mouse_warping, MouseWarping::None);
+        assert_eq!(c.floating_modifier, Some(Modifiers::WIN));
+        assert_eq!(
+            c.tiling_drag,
+            TilingDrag {
+                modifier: false,
+                titlebar: true
+            }
+        );
+        assert!(!c.show_marks);
+        assert_eq!(c.focus_wrapping, FocusWrapping::Workspace);
+        assert!(c.workspace_auto_back_and_forth);
+        assert_eq!(
+            c.popup_during_fullscreen,
+            PopupDuringFullscreen::LeaveFullscreen
+        );
+        assert_eq!(c.focus_on_window_activation, FocusOnActivation::Urgent);
+        assert_eq!(c.floating_minimum_size, (100, 80));
+        assert_eq!(c.floating_maximum_size, (800, 600));
+        assert_eq!(c.hide_edge_borders, HideEdgeBorders::SmartNoGaps);
+        assert_eq!(c.smart_borders, SmartBorders::NoGaps);
+        assert_eq!(c.smart_gaps, SmartGaps::InverseOuter);
+        assert_eq!(c.no_focus.len(), 1);
+        assert_eq!(
+            parse_config("tiling_drag off\n").tiling_drag,
+            TilingDrag {
+                modifier: false,
+                titlebar: false
+            }
+        );
+        assert_eq!(
+            parse_config("floating_minimum_size -1 x -1\n").floating_minimum_size,
+            (0, 0)
+        );
+        assert_eq!(
+            parse_config("floating_modifier Mod4+Shift\n").floating_modifier,
+            Some(Modifiers::WIN | Modifiers::SHIFT)
+        );
+        assert_eq!(
+            parse_config("floating_maximum_size -1 x -1\n").floating_maximum_size,
+            (0, 0)
+        );
+        assert_eq!(
+            parse_config("floating_minimum_size 0 x 0\n").floating_minimum_size,
+            (75, 50)
+        );
+        assert_eq!(
+            parse_config("smart_borders yes\n").smart_borders,
+            SmartBorders::On
+        );
+    }
+    #[test]
+    fn bad_new_option_values_warn_and_keep_default() {
+        let c = parse_config("focus_wrapping sideways\nmouse_warping x\n");
+        assert_eq!(c.warnings.len(), 2);
+        assert_eq!(c.focus_wrapping, FocusWrapping::Yes);
+    }
 
     #[test]
     fn defaults() {
