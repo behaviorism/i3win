@@ -20,12 +20,11 @@ pub const WM_APP_MAIN: u32 = WM_APP + 3;
 pub enum MainMsg {
     FocusNode(NodeId),
     RunCommand(String),
+    /// A click on a status block of bar `bar` (Task 6 routes by it).
     StatusClick {
-        name: Option<String>,
-        instance: Option<String>,
-        button: u8,
-        x: i32,
-        y: i32,
+        #[allow(dead_code)] // read once Task 6 routes clicks per bar
+        bar: String,
+        click: i3win_core::i3bar::Click,
     },
     /// Blocks from the status process of the given generation.
     StatusUpdate(u64, Vec<i3win_core::i3bar::Block>),

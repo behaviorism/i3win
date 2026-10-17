@@ -361,15 +361,9 @@ impl App {
                 self.refresh_pointer();
                 self.wm.run_command(&c);
             }
-            MainMsg::StatusClick {
-                name,
-                instance,
-                button,
-                x,
-                y,
-            } => {
+            MainMsg::StatusClick { bar: _, click } => {
                 if let Some(p) = self.status.as_mut() {
-                    p.click(name.as_deref(), instance.as_deref(), button, x, y);
+                    p.click(&click);
                 }
                 return false;
             }

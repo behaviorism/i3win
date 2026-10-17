@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 
-use i3win_core::i3bar::{Block, ClickWriter, StatusParser};
+use i3win_core::i3bar::{Block, Click, ClickWriter, StatusParser};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
@@ -157,18 +157,11 @@ impl StatusProcess {
     }
 
     /// Forwards a click to the process if it asked for click events; errors are ignored.
-    pub fn click(
-        &mut self,
-        name: Option<&str>,
-        instance: Option<&str>,
-        button: u8,
-        x: i32,
-        y: i32,
-    ) {
+    pub fn click(&mut self, click: &Click) {
         if !self.click_events.load(Ordering::SeqCst) {
             return;
         }
-        let line = self.writer.encode(name, instance, button, x, y);
+        let line = self.writer.encode(click);
         if let Some(tx) = self.stdin_tx.as_ref() {
             let _ = tx.send(line);
         }

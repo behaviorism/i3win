@@ -8,7 +8,7 @@ use i3win_core::arrange::{bar_height, Arrangement};
 use i3win_core::bar_model::workspace_buttons;
 use i3win_core::config::{BarPosition, Color, Font};
 use i3win_core::geom::Rect;
-use i3win_core::i3bar::Block;
+use i3win_core::i3bar::{Block, Click};
 use i3win_core::tree::NodeKind;
 use i3win_core::wm::Wm;
 use windows::core::{w, PCWSTR};
@@ -16,11 +16,14 @@ use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, DrawTextW, GetDC, GetTextExtentPoint32W, InvalidateRect, ReleaseDC,
-    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    TRANSPARENT,
+    ClientToScreen, DrawTextW, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
+    MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::bar_layout::{click_command, hit_test, layout_bar, BarLayout, ItemKind};
@@ -347,12 +350,52 @@ fn click(hwnd: HWND, data: &BarData, button: u8, lp: LPARAM) {
                 let _ = ClientToScreen(hwnd, &mut pt);
             }
             let block = data.blocks.get(*i);
+            let (mut ox, mut oy) = (0, 0);
+            // SAFETY: plain Win32 calls on our own window; `mi` is sized correctly.
+            unsafe {
+                let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                    ox = mi.rcMonitor.left;
+                    oy = mi.rcMonitor.top;
+                }
+            }
+            let key_down = |vk: VIRTUAL_KEY| {
+                // SAFETY: plain Win32 call.
+                unsafe { GetKeyState(vk.0 as i32) < 0 }
+            };
+            let mut modifiers = Vec::new();
+            if key_down(VK_SHIFT) {
+                modifiers.push("Shift".to_string());
+            }
+            if key_down(VK_CONTROL) {
+                modifiers.push("Control".to_string());
+            }
+            if key_down(VK_MENU) {
+                modifiers.push("Mod1".to_string());
+            }
+            if key_down(VK_LWIN) || key_down(VK_RWIN) {
+                modifiers.push("Mod4".to_string());
+            }
             mainloop::post(MainMsg::StatusClick {
-                name: block.and_then(|b| b.name.clone()),
-                instance: block.and_then(|b| b.instance.clone()),
-                button,
-                x: pt.x,
-                y: pt.y,
+                bar: "bar-0".to_string(),
+                click: Click {
+                    name: block.and_then(|b| b.name.clone()),
+                    instance: block.and_then(|b| b.instance.clone()),
+                    button,
+                    modifiers,
+                    x: pt.x,
+                    y: pt.y,
+                    relative_x: x - item.rect.x,
+                    relative_y: y - item.rect.y,
+                    output_x: pt.x - ox,
+                    output_y: pt.y - oy,
+                    width: item.rect.w,
+                    height: item.rect.h,
+                },
             });
         }
     }

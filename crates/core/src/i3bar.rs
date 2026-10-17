@@ -32,6 +32,48 @@ pub struct Block {
     /// Default 9 when drawing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub separator_block_width: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_width: Option<MinWidth>,
+    /// "left" (default), "center" or "right".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<String>,
+    /// "pango" or "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_top: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_right: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_bottom: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_left: Option<i32>,
+}
+
+/// i3bar `min_width`: a pixel count, or a text whose rendered width is used.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MinWidth {
+    Px(i32),
+    Text(String),
+}
+
+/// A click event as sent to the status process (i3bar protocol).
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Click {
+    pub name: Option<String>,
+    pub instance: Option<String>,
+    pub button: u8,
+    pub modifiers: Vec<String>,
+    pub x: i32,
+    pub y: i32,
+    pub relative_x: i32,
+    pub relative_y: i32,
+    pub output_x: i32,
+    pub output_y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -119,21 +161,8 @@ impl ClickWriter {
         ClickWriter { started: false }
     }
 
-    pub fn encode(
-        &mut self,
-        name: Option<&str>,
-        instance: Option<&str>,
-        button: u8,
-        x: i32,
-        y: i32,
-    ) -> String {
-        let obj = serde_json::json!({
-            "name": name,
-            "instance": instance,
-            "button": button,
-            "x": x,
-            "y": y,
-        });
+    pub fn encode(&mut self, c: &Click) -> String {
+        let obj = serde_json::to_string(c).unwrap_or_else(|_| "{}".into());
         let prefix = if self.started { "," } else { "[\n" };
         self.started = true;
         format!("{prefix}{obj}\n")
@@ -187,11 +216,76 @@ mod tests {
     #[test]
     fn click_writer_framing() {
         let mut w = ClickWriter::new();
-        assert_eq!(
-            w.encode(Some("cpu"), None, 1, 10, 5),
-            "[\n{\"button\":1,\"instance\":null,\"name\":\"cpu\",\"x\":10,\"y\":5}\n"
-        );
-        assert!(w.encode(None, None, 3, 0, 0).starts_with(",{"));
+        let c = Click {
+            name: Some("cpu".into()),
+            button: 1,
+            x: 10,
+            y: 5,
+            ..Default::default()
+        };
+        assert!(w.encode(&c).starts_with("[\n{"));
+        assert!(w.encode(&Click::default()).starts_with(",{"));
+    }
+
+    #[test]
+    fn new_block_fields_parse() {
+        let mut p = StatusParser::new();
+        p.feed_line(r#"{"version":1}"#);
+        p.feed_line("[");
+        let b = p.feed_line(r#"[{"full_text":"x","min_width":"100%","align":"center","markup":"pango","border_top":2},{"full_text":"y","min_width":50}]"#).unwrap();
+        assert_eq!(b[0].min_width, Some(MinWidth::Text("100%".into())));
+        assert_eq!(b[0].align.as_deref(), Some("center"));
+        assert_eq!(b[0].markup.as_deref(), Some("pango"));
+        assert_eq!(b[0].border_top, Some(2));
+        assert_eq!(b[1].min_width, Some(MinWidth::Px(50)));
+    }
+
+    #[test]
+    fn click_json_has_i3_fields() {
+        let mut w = ClickWriter::new();
+        let c = Click {
+            name: Some("cpu".into()),
+            instance: None,
+            button: 1,
+            modifiers: vec!["Shift".into()],
+            x: 10,
+            y: 20,
+            relative_x: 3,
+            relative_y: 4,
+            output_x: 10,
+            output_y: 5,
+            width: 50,
+            height: 18,
+        };
+        let s = w.encode(&c);
+        assert!(s.starts_with("[\n"));
+        let v: serde_json::Value =
+            serde_json::from_str(s.trim_start_matches("[\n").trim()).unwrap();
+        for k in [
+            "name",
+            "instance",
+            "button",
+            "modifiers",
+            "x",
+            "y",
+            "relative_x",
+            "relative_y",
+            "output_x",
+            "output_y",
+            "width",
+            "height",
+        ] {
+            assert!(v.get(k).is_some(), "missing {k}");
+        }
+        assert!(w.encode(&c).starts_with(','));
+    }
+
+    #[test]
+    fn click_deserializes_with_missing_fields() {
+        let c: Click = serde_json::from_str(r#"{"name":"a","button":3}"#).unwrap();
+        assert_eq!(c.name.as_deref(), Some("a"));
+        assert_eq!(c.button, 3);
+        assert!(c.modifiers.is_empty());
     }
 
     #[test]
