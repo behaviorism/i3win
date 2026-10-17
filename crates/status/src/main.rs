@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+mod i3status_conf;
 mod modules;
 
 use modules::*;
