@@ -347,7 +347,7 @@ pub fn send_dummy_key() {
                 wScan: 0,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: crate::win::keyboard::OWN_INPUT_TAG,
             },
         },
     };

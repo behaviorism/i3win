@@ -41,3 +41,9 @@ Every judgment call the controller made while running Plans 1-4, in order, with 
 - Ruling: fix I1, I2 plus cheap minors M1 bounded channel, M4 PIPE_BUSY retry, M6 global I3SOCK, M9 shared test lock, M10 failed-subscribe exit, stdout BrokenPipe, test literals; append IPC manual checks — cost if wrong: larger final diff.
 - Ruling: controller corrected the docs/manual-checks.md item 9 pipe paths (missing backslash) and documented the smoke-test caveat — one-line doc fix, no second fix wave allowed — cost if wrong: none.
 - Plan4: parked - I2 residual: ipc_roundtrip_and_events kills i3win on assertion failure without sending exit (windows on other workspaces stay hidden until next i3win start restores them from hidden.txt); its success-path exit uses read_frame().unwrap() and could panic if i3win exits before replying; the wait-then-kill wrapper landed on the wrong test - Ruling: backlog; mitigated by Plan 2 startup recovery and documented in manual check 12 - cost if wrong: user's windows hidden until they start i3win again.
+
+## Live verification (2026-10-17)
+
+- Ruling: the keyboard hook now ignores only injected keys tagged with OWN_INPUT_TAG (i3win's own dummy key); other injected input fires bindings — it previously ignored all injected input, which broke AutoHotkey remaps, on-screen keyboards, remote tools and automated testing — cost if wrong: a tool that injects Alt+key combos could trigger bindings.
+- Live results: both smoke tests pass (the tiling one needs a desktop with no other restored windows); scripts/live-checks.ps1 passes 45/45; panic recovery (I3WIN_PANIC_AFTER_SECS) restores hidden windows and logs the panic.
+- Parked item resolved: park_foreground — typing on an empty workspace did not reach a hidden Notepad in the live run.

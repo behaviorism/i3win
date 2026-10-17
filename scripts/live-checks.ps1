@@ -1,0 +1,213 @@
+# Live desktop checks for i3win: drives the WM with synthetic keystrokes and i3win-msg,
+# verifying results through Win32. Uses your ~/.config/i3win/config (Alt as $mod, default bindings).
+# It minimizes every window, opens and kills Notepads, and kills any running i3win.
+# Run: cargo build --workspace; powershell -ExecutionPolicy Bypass -File scripts\live-checks.ps1
+$ErrorActionPreference = 'Continue'
+$root = Split-Path -Parent $PSScriptRoot
+$exe = "$root\target\debug\i3win.exe"
+$msg = "$root\target\debug\i3win-msg.exe"
+$scratch = $env:TEMP
+$results = New-Object System.Collections.ArrayList
+
+Add-Type @"
+using System; using System.Text; using System.Runtime.InteropServices; using System.Collections.Generic;
+public class U {
+  public delegate bool P(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(P p, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint c);
+  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string w);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, StringBuilder l);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint c, uint t);
+  public struct RECT { public int L,T,R,B; public override string ToString(){ return "["+L+","+T+","+R+","+B+"]"; } }
+  public static IntPtr Top(uint pid) {
+    IntPtr f = IntPtr.Zero;
+    EnumWindows((h,l)=>{ uint p; GetWindowThreadProcessId(h,out p); if(p==pid && GetWindow(h,4)==IntPtr.Zero){ var s=new StringBuilder(64); GetClassName(h,s,64); if(s.ToString()=="Notepad"){ f=h; return false; } } return true; }, IntPtr.Zero);
+    return f;
+  }
+  public static List<string> OwnWindows(uint pid) {
+    var o = new List<string>();
+    EnumWindows((h,l)=>{ uint p; GetWindowThreadProcessId(h,out p); if(p==pid && IsWindowVisible(h)){ var s=new StringBuilder(64); GetClassName(h,s,64); RECT r; GetWindowRect(h,out r); o.Add(s+" "+r); } return true; }, IntPtr.Zero);
+    return o;
+  }
+  public static string EditText(IntPtr top) {
+    var e = FindWindowEx(top, IntPtr.Zero, "Edit", null);
+    var s = new StringBuilder(4096); SendMessage(e, 0x0D, (IntPtr)4096, s); return s.ToString();
+  }
+  public static string Cls(IntPtr h){ var s=new StringBuilder(128); GetClassName(h,s,128); return s.ToString(); }
+  public static RECT Rect(IntPtr h){ RECT r; GetWindowRect(h,out r); return r; }
+  public static void Key(byte vk, bool up){ keybd_event(vk,(byte)MapVirtualKey(vk,0), up?2u:0u, UIntPtr.Zero); }
+}
+"@
+
+function Check($name, $ok, $detail = '') {
+  $s = if ($ok) { 'PASS' } else { 'FAIL' }
+  $line = "$s  $name  $detail"
+  [void]$results.Add($line); Write-Output $line
+}
+function Combo([byte[]]$mods, [byte]$vk) {
+  foreach ($m in $mods) { [U]::Key($m, $false); Start-Sleep -Milliseconds 20 }
+  [U]::Key($vk, $false); Start-Sleep -Milliseconds 20; [U]::Key($vk, $true)
+  Start-Sleep -Milliseconds 20
+  [array]::Reverse($mods); foreach ($m in $mods) { [U]::Key($m, $true); Start-Sleep -Milliseconds 20 }
+  Start-Sleep -Milliseconds 350
+}
+function Type-Text($t) { foreach ($c in $t.ToUpper().ToCharArray()) { [U]::Key([byte][char]$c, $false); [U]::Key([byte][char]$c, $true); Start-Sleep -Milliseconds 30 }; Start-Sleep -Milliseconds 300 }
+$ALT = [byte]0xA4; $SHIFT = [byte]0xA0
+function Fg { [U]::GetForegroundWindow() }
+function Msg { $o = & $msg @args 2>&1 | Out-String; return @{ out = $o.Trim(); code = $LASTEXITCODE } }
+function StatusCount { @(Get-Process i3win-status -ErrorAction SilentlyContinue).Count }
+function Start-Wm { $p = Start-Process $exe -PassThru; Start-Sleep -Milliseconds 1500; return $p }
+
+# ---- start
+(New-Object -ComObject Shell.Application).MinimizeAll(); Start-Sleep 2
+Get-Process i3win, i3win-status -ErrorAction SilentlyContinue | Stop-Process -Force
+$wm = Start-Wm
+Check 'i3win starts' (-not $wm.HasExited)
+$bars = [U]::OwnWindows($wm.Id)
+Write-Output "i3win windows: $($bars -join ' | ')"
+Check 'one status process' ((StatusCount) -eq 1) "count=$(StatusCount)"
+
+# ---- 3 notepads tile
+$np = @(); $h = @()
+for ($i = 0; $i -lt 3; $i++) {
+  $p = Start-Process notepad -PassThru; $np += $p
+  $t = [IntPtr]::Zero; for ($k = 0; $k -lt 50 -and $t -eq [IntPtr]::Zero; $k++) { Start-Sleep -Milliseconds 100; $t = [U]::Top($p.Id) }
+  $h += $t
+}
+Start-Sleep 1
+$rects = $h | ForEach-Object { [U]::Rect($_) }
+Write-Output "rects: $($rects -join ' ')"
+$sorted = $rects | Sort-Object L
+$widths = $sorted | ForEach-Object { $_.R - $_.L }
+Check '3 notepads tile in 3 columns' (($sorted[0].R -le $sorted[1].L + 16) -and ($sorted[1].R -le $sorted[2].L + 16) -and (($widths | Measure-Object -Max).Maximum - ($widths | Measure-Object -Min).Minimum -le 4)) "widths=$($widths -join ',')"
+Check 'tiles share top/bottom' ((($rects | ForEach-Object T | Sort-Object -Unique).Count -eq 1) -and (($rects | ForEach-Object B | Sort-Object -Unique).Count -eq 1))
+$focusedIdx = [array]::IndexOf($h, (Fg))
+Check 'newest notepad focused' ((Fg) -eq $h[2]) "fg=$(Fg) cls=$([U]::Cls((Fg)))"
+
+# ---- focus follows keyboard
+Combo @($ALT) 0x4A   # Alt+j focus left
+$byL = $h | Sort-Object { [U]::Rect($_).L }
+Check 'Alt+j moves focus to middle column' ((Fg) -eq $byL[1]) "fg=$(Fg) cls=$([U]::Cls((Fg)))"
+Type-Text 'abc'
+Check 'typing lands in focused notepad' ([U]::EditText($byL[1]) -match 'abc') "text='$([U]::EditText($byL[1]))'"
+for ($i = 0; $i -lt 10; $i++) { Combo @($ALT) 0x4A }
+$fgAfter = Fg
+Check '10x Alt+j: focus still on a notepad' ($h -contains $fgAfter) "fg=$fgAfter cls=$([U]::Cls($fgAfter))"
+Combo @($ALT) 0xBA   # Alt+; focus right
+Check 'Alt+; focus right' ((Fg) -ne $fgAfter -and $h -contains (Fg))
+Check 'no menu/start after Alt' (@('Notepad') -contains [U]::Cls((Fg))) "cls=$([U]::Cls((Fg)))"
+
+# ---- workspaces
+$before = $h | ForEach-Object { [U]::Rect($_).ToString() }
+Combo @($ALT) 0x32   # Alt+2
+$vis = $h | Where-Object { [U]::IsWindowVisible($_) }
+Check 'Alt+2 hides notepads' (@($vis).Count -eq 0) "visible=$(@($vis).Count)"
+Type-Text 'zzz'
+Combo @($ALT) 0x31   # Alt+1
+Start-Sleep -Milliseconds 300
+$vis = $h | Where-Object { [U]::IsWindowVisible($_) }
+$after = $h | ForEach-Object { [U]::Rect($_).ToString() }
+Check 'Alt+1 shows them again' (@($vis).Count -eq 3)
+Check 'layout unchanged after round trip' ((Compare-Object $before $after) -eq $null) "before=$before after=$after"
+$leak = $h | Where-Object { [U]::EditText($_) -match 'zzz' }
+Check 'typing on empty ws2 did not reach hidden notepad' (@($leak).Count -eq 0)
+Check 'focus on a notepad after return' ($h -contains (Fg)) "cls=$([U]::Cls((Fg)))"
+
+# ---- layouts
+Combo @($ALT) 0x57   # Alt+w tabbed
+$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+Write-Output "tabbed visible=$($vis.Count) rects: $(($h | % { [U]::Rect($_) }) -join ' ')"
+Check 'tabbed shows one window' ($vis.Count -eq 1)
+Combo @($ALT) 0x53   # Alt+s stacking
+$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+Check 'stacked shows one window' ($vis.Count -eq 1)
+Combo @($ALT) 0x45   # Alt+e toggle split
+Start-Sleep -Milliseconds 300
+$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+Check 'split shows all three' ($vis.Count -eq 3) "rects: $(($h | % { [U]::Rect($_) }) -join ' ')"
+$f = Fg; $r0 = [U]::Rect($f)
+Combo @($ALT, $SHIFT) 0x20   # floating toggle
+$r1 = [U]::Rect($f)
+Check 'Alt+Shift+space floats window' ($r0.ToString() -ne $r1.ToString()) "$r0 -> $r1"
+Combo @($ALT, $SHIFT) 0x20
+Start-Sleep -Milliseconds 300
+Check 'toggle back re-tiles' (([U]::Rect($f)).ToString() -eq $r0.ToString()) "$r0 vs $([U]::Rect($f))"
+
+# ---- IPC
+foreach ($t in 'get_workspaces','get_outputs','get_tree','get_version','get_binding_modes','get_config','get_bar_config','get_marks') {
+  $r = Msg -t $t
+  $okJson = $true; try { $null = $r.out | ConvertFrom-Json } catch { $okJson = $false }
+  Check "ipc $t valid JSON" ($okJson -and $r.code -eq 0) ($r.out.Substring(0, [Math]::Min(80, $r.out.Length)))
+}
+$sub = Start-Process $msg -ArgumentList '-t subscribe -m "[\"window\",\"workspace\",\"tick\"]"' -PassThru -NoNewWindow -RedirectStandardOutput "$scratch\sub.txt"
+Start-Sleep -Milliseconds 700
+$r = Msg workspace 4
+Check 'ipc run_command workspace 4' ($r.out -match '"success":true') $r.out
+$r = Msg frob
+Check 'ipc bad command exits 2' ($r.code -eq 2) "code=$($r.code) $($r.out)"
+$p4 = Start-Process notepad -PassThru; Start-Sleep 1.5
+$h4 = [U]::Top($p4.Id)
+Combo @($ALT, $SHIFT) 0x51   # kill
+Start-Sleep 1
+Check 'Alt+Shift+q closes notepad' ($p4.HasExited)
+$null = Msg -t send_tick hello
+Start-Sleep -Milliseconds 500
+$null = Msg workspace 1
+Start-Sleep -Milliseconds 500
+$sub | Stop-Process -Force -ErrorAction SilentlyContinue
+$ev = Get-Content "$scratch\sub.txt" -Raw
+$iNew = $ev.IndexOf('"change":"new"'); $iFoc = $ev.IndexOf('"change":"focus"', [Math]::Max(0,$iNew))
+Check 'events: window new then focus' ($iNew -ge 0 -and $iFoc -gt $iNew)
+Check 'events: window close' ($ev -match '"change":"close"')
+Check 'events: workspace init/focus' ($ev -match '"change":"init"' -and $ev -match '"change":"focus"')
+Check 'events: tick hello' ($ev -match '"payload":"hello"')
+Write-Output "events (head): $($ev.Substring(0,[Math]::Min(600,$ev.Length)))"
+
+# ---- reload / status process
+for ($i = 0; $i -lt 5; $i++) { Combo @($ALT, $SHIFT) 0x43; Start-Sleep -Milliseconds 300 }
+Start-Sleep 1
+Check '5 reloads leave one status process' ((StatusCount) -eq 1) "count=$(StatusCount)"
+Check 'still running after reloads' (-not $wm.HasExited)
+
+# ---- crash recovery: taskkill on ws2
+Combo @($ALT) 0x32
+$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+Check 'ws2 hides before kill' ($vis.Count -eq 0)
+& taskkill /IM i3win.exe /F | Out-Null
+Start-Sleep 1
+$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+Check 'killed: notepads stay hidden' ($vis.Count -eq 0)
+Check 'killed: status process gone (job object)' ((StatusCount) -eq 0) "count=$(StatusCount)"
+$hiddenTxt = Get-Content "$env:LOCALAPPDATA\i3win\hidden.txt" -ErrorAction SilentlyContinue
+Check 'hidden.txt lists 3 windows' (@($hiddenTxt).Count -eq 3) ($hiddenTxt -join ';')
+$wm = Start-Wm
+Start-Sleep 1
+$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+Check 'restart: notepads reappear' ($vis.Count -eq 3)
+Write-Output "after restart rects: $(($h | % { [U]::Rect($_) }) -join ' ')"
+
+# ---- exit restores
+Combo @($ALT) 0x32
+Combo @($ALT, $SHIFT) 0x45   # exit
+Start-Sleep 1.5
+Check 'Alt+Shift+e exits' ($wm.HasExited)
+$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+Check 'exit: all windows visible' ($vis.Count -eq 3)
+Check 'exit: no status process' ((StatusCount) -eq 0)
+
+# ---- cleanup
+$np | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process i3win, i3win-status -ErrorAction SilentlyContinue | Stop-Process -Force
+(New-Object -ComObject Shell.Application).UndoMinimizeALL()
+Write-Output '----'
+$fail = @($results | Where-Object { $_ -like 'FAIL*' }).Count
+Write-Output "$($results.Count - $fail) passed, $fail failed"
+Write-Output '--log'
+Get-Content "$env:LOCALAPPDATA\i3win\i3win.log" -Tail 20

@@ -1,4 +1,8 @@
-# i3win manual checks (Plan 2)
+# i3win manual checks
+
+**Automated (2026-10-17):** `scripts/live-checks.ps1` covers Plan 2 items 1-3 (tiling, focus via Alt+j/Alt+;, keyboard focus follows, workspace hide/show, no typing into hidden windows, no menu on Alt release), 4 (tabbed/stacked/split/floating toggles; not tab clicks or dragging), 5 (kill; not the save prompt), 8, 9, 13; Plan 3 items 8 (one status process across reloads, none after exit/kill); Plan 4 items 1-5, 12. Item 10 (panic recovery) was verified by hand. Still manual: everything visual (colors, title bars, bar contents, DPI scaling, clicks, scrolling), multi-monitor, hung apps, Ctrl+C, and the remaining Plan 3/4 items.
+
+## Plan 2
 
 Prep: `cargo build --workspace` (required: it also builds i3win-status.exe, which the default config uses), close or minimize windows you don't want tiled, run `target\debug\i3win.exe` from a console.
 

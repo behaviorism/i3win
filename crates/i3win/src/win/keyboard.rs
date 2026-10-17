@@ -16,6 +16,9 @@ use crate::mainloop::{main_hwnd, WM_APP_KEY};
 
 const HC_ACTION: i32 = 0;
 const LLKHF_INJECTED: u32 = 0x10;
+/// `dwExtraInfo` tag on keys i3win injects itself. Only these are ignored; other injected
+/// input (AutoHotkey remaps, on-screen keyboards, remote tools) fires bindings like real keys.
+pub const OWN_INPUT_TAG: usize = 0x6933_7769;
 
 const MODIFIER_VKS: [(u16, Modifiers); 11] = [
     (0x12, Modifiers::ALT),
@@ -77,8 +80,8 @@ impl KeyMatcher {
         m
     }
 
-    pub fn on_key(&mut self, vk: u16, down: bool, injected: bool) -> KeyAction {
-        if injected {
+    pub fn on_key(&mut self, vk: u16, down: bool, own: bool) -> KeyAction {
+        if own {
             return KeyAction::Pass;
         }
         if modifier_of(vk).is_some() {
@@ -123,14 +126,14 @@ unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
     if code == HC_ACTION && lparam.0 != 0 {
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let vk = info.vkCode as u16;
-        let injected = info.flags.0 & LLKHF_INJECTED != 0;
+        let own = info.flags.0 & LLKHF_INJECTED != 0 && info.dwExtraInfo == OWN_INPUT_TAG;
         let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
         let action = MATCHER.with(|m| match m.try_borrow_mut() {
             Ok(mut m) => {
-                if down && !injected && modifier_of(vk).is_none() {
+                if down && !own && modifier_of(vk).is_none() {
                     m.resync(|v| GetAsyncKeyState(v as i32) < 0);
                 }
-                m.on_key(vk, down, injected)
+                m.on_key(vk, down, own)
             }
             Err(_) => KeyAction::Pass,
         });
@@ -254,7 +257,7 @@ mod tests {
         );
     }
     #[test]
-    fn injected_passes() {
+    fn own_injected_passes() {
         let mut k = m(&["Escape"]);
         assert_eq!(k.on_key(0x1B, true, true), KeyAction::Pass);
     }
