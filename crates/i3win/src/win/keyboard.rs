@@ -43,6 +43,9 @@ fn modifier_of(vk: u16) -> Option<Modifiers> {
 pub enum KeyAction {
     Pass,
     Swallow,
+    /// Swallowed press of a release-only binding under Alt/Win: the main loop must send the
+    /// menu-masking dummy key now, since the modifier may be released before the key.
+    Mask,
     Fire {
         combo: KeyCombo,
         mask_menu: bool,
@@ -139,6 +142,7 @@ impl KeyMatcher {
                         mask_menu,
                         release: false,
                     },
+                    None if mask_menu => KeyAction::Mask,
                     None => KeyAction::Swallow,
                 };
             }
@@ -166,7 +170,7 @@ impl KeyMatcher {
 
 thread_local! {
     static MATCHER: RefCell<KeyMatcher> = RefCell::new(KeyMatcher::new());
-    static QUEUE: RefCell<Vec<(KeyCombo, bool, bool)>> = const { RefCell::new(Vec::new()) };
+    static QUEUE: RefCell<Vec<(Option<KeyCombo>, bool, bool)>> = const { RefCell::new(Vec::new()) };
     static HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
 }
 
@@ -192,14 +196,18 @@ unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
             Err(_) => KeyAction::Pass,
         });
         match action {
-            KeyAction::Fire {
-                combo,
-                mask_menu,
-                release,
-            } => {
+            KeyAction::Fire { .. } | KeyAction::Mask => {
+                let item = match action {
+                    KeyAction::Fire {
+                        combo,
+                        mask_menu,
+                        release,
+                    } => (Some(combo), mask_menu, release),
+                    _ => (None, true, false),
+                };
                 let queued = QUEUE.with(|q| match q.try_borrow_mut() {
                     Ok(mut q) => {
-                        q.push((combo, mask_menu, release));
+                        q.push(item);
                         true
                     }
                     Err(_) => false,
@@ -246,7 +254,7 @@ pub fn set_combos(combos: &[(KeyCombo, bool)]) {
     });
 }
 
-pub fn drain() -> Vec<(KeyCombo, bool, bool)> {
+pub fn drain() -> Vec<(Option<KeyCombo>, bool, bool)> {
     QUEUE.with(|q| {
         q.try_borrow_mut()
             .map(|mut q| q.drain(..).collect())
@@ -349,7 +357,7 @@ mod tests {
         let mut k = KeyMatcher::new();
         k.set_combos(&[(parse_combo("Mod1+x").unwrap(), true)]);
         k.on_key(0xA4, true, false, 0, false);
-        assert_eq!(k.on_key(0x58, true, false, 0x2D, false), KeyAction::Swallow);
+        assert_eq!(k.on_key(0x58, true, false, 0x2D, false), KeyAction::Mask);
         assert!(matches!(
             k.on_key(0x58, false, false, 0x2D, false),
             KeyAction::Fire { release: true, .. }
@@ -366,5 +374,30 @@ mod tests {
         ));
         assert_eq!(k.on_key(0x41, true, false, 0x1F, false), KeyAction::Pass);
         assert_eq!(k.on_key(0x41, true, false, 0x1E, true), KeyAction::Pass);
+    }
+    #[test]
+    fn release_only_bare_key_swallows_without_mask() {
+        let mut k = KeyMatcher::new();
+        k.set_combos(&[(parse_combo("x").unwrap(), true)]);
+        assert_eq!(k.on_key(0x58, true, false, 0x2D, false), KeyAction::Swallow);
+        assert!(matches!(
+            k.on_key(0x58, false, false, 0x2D, false),
+            KeyAction::Fire { release: true, .. }
+        ));
+    }
+    #[test]
+    fn press_and_release_bindings_both_fire() {
+        let mut k = KeyMatcher::new();
+        let c = parse_combo("Mod1+x").unwrap();
+        k.set_combos(&[(c, false), (c, true)]);
+        k.on_key(0xA4, true, false, 0, false);
+        assert!(matches!(
+            k.on_key(0x58, true, false, 0x2D, false),
+            KeyAction::Fire { release: false, .. }
+        ));
+        assert!(matches!(
+            k.on_key(0x58, false, false, 0x2D, false),
+            KeyAction::Fire { release: true, .. }
+        ));
     }
 }

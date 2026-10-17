@@ -173,7 +173,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if mask_menu {
                         window::send_dummy_key();
                     }
-                    app.on_binding(combo, release);
+                    if let Some(combo) = combo {
+                        app.on_binding(combo, release);
+                    }
                 }
                 app.flush();
             }) {
