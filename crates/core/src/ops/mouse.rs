@@ -71,7 +71,265 @@ pub fn resize_from_corner(
     Rect::new(x, y, w, h)
 }
 
+/// Where on a tiled window a dragged window is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropZone {
+    Swap,
+    Side(Direction),
+}
+
+/// Center box (middle 30% of width and height) -> Swap; else the triangle
+/// formed by the rect's diagonals that contains the point.
+pub fn drop_zone(r: Rect, x: i32, y: i32) -> DropZone {
+    let (w, h) = (i64::from(r.w), i64::from(r.h));
+    // Offset from the center, doubled to stay in integers.
+    let dx = 2 * i64::from(x) - 2 * i64::from(r.x) - w;
+    let dy = 2 * i64::from(y) - 2 * i64::from(r.y) - h;
+    // |dx| <= 0.15 * w (offsets are doubled: 2 * 0.15 = 0.3).
+    if dx.abs() * 10 <= 3 * w && dy.abs() * 10 <= 3 * h {
+        return DropZone::Swap;
+    }
+    // Compare against the diagonals: |dx|/w vs |dy|/h.
+    if dx.abs() * h >= dy.abs() * w {
+        DropZone::Side(if dx < 0 {
+            Direction::Left
+        } else {
+            Direction::Right
+        })
+    } else {
+        DropZone::Side(if dy < 0 {
+            Direction::Up
+        } else {
+            Direction::Down
+        })
+    }
+}
+
+/// What a tiling drag would do if released at a point.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DropTarget {
+    Window(NodeId, DropZone),
+    Workspace(String),
+    Output(NodeId),
+    Nothing,
+}
+
+fn contains(r: Rect, x: i32, y: i32) -> bool {
+    x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+}
+
+fn split_layout(d: Direction) -> Layout {
+    match d {
+        Direction::Left | Direction::Right => Layout::SplitH,
+        Direction::Up | Direction::Down => Layout::SplitV,
+    }
+}
+
 impl Wm {
+    /// Whether `target` is a tiled, non-fullscreen window other than `dragged`
+    /// that `dragged` may be dropped onto.
+    fn is_drop_window(&self, dragged: NodeId, target: NodeId) -> bool {
+        self.tree.contains(dragged)
+            && self.tree.contains(target)
+            && dragged != target
+            && matches!(self.tree.get(target).kind, NodeKind::Window(_))
+            && !self.tree.get(target).fullscreen
+            && !self.tree.is_floating(target)
+            && !self.tree.is_ancestor(dragged, target)
+            && self
+                .tree
+                .workspace_of(target)
+                .is_some_and(|w| w != self.scratch)
+    }
+
+    /// Output rect, or the visible workspace's tiling area when it has one.
+    fn output_area(&self, output: NodeId) -> Option<Rect> {
+        self.node_rect(self.visible_workspace(output)).or_else(|| {
+            match &self.tree.get(output).kind {
+                NodeKind::Output { rect, .. } => Some(*rect),
+                _ => None,
+            }
+        })
+    }
+
+    /// Target under a screen point for a tiling drag of `dragged` (bar hits
+    /// are resolved by the platform into Workspace).
+    pub fn drop_target_at(&self, dragged: NodeId, x: i32, y: i32) -> DropTarget {
+        let outputs = self.outputs();
+        let arrangement = self.arrange();
+        let hit = arrangement.rects.iter().find(|(n, r)| {
+            contains(*r, x, y)
+                && matches!(self.tree.get(*n).kind, NodeKind::Window(_))
+                && !self.tree.is_floating(*n)
+                && self
+                    .tree
+                    .output_of(*n)
+                    .is_some_and(|o| outputs.contains(&o))
+        });
+        if let Some(&(n, r)) = hit {
+            if !self.is_drop_window(dragged, n) {
+                return DropTarget::Nothing;
+            }
+            return DropTarget::Window(n, drop_zone(r, x, y));
+        }
+        for o in outputs {
+            if let NodeKind::Output { rect, .. } = &self.tree.get(o).kind {
+                if contains(*rect, x, y) {
+                    return DropTarget::Output(o);
+                }
+            }
+        }
+        DropTarget::Nothing
+    }
+
+    /// Performs the drop; returns whether anything changed. Focus stays on
+    /// `dragged`.
+    pub fn drop_window(&mut self, dragged: NodeId, target: &DropTarget) -> bool {
+        if !self.tree.contains(dragged)
+            || !matches!(self.tree.get(dragged).kind, NodeKind::Window(_))
+            || self.tree.is_floating(dragged)
+        {
+            return false;
+        }
+        let Some(src) = self.tree.workspace_of(dragged) else {
+            return false;
+        };
+        match target {
+            DropTarget::Nothing => false,
+            DropTarget::Window(t, zone) => {
+                if !self.is_drop_window(dragged, *t) {
+                    return false;
+                }
+                let Some(dst) = self.tree.workspace_of(*t) else {
+                    return false;
+                };
+                let moved_windows = [dragged, *t];
+                match zone {
+                    DropZone::Swap => {
+                        self.tree.swap(dragged, *t);
+                        if self.tree.workspace_of(dragged) != Some(dst) {
+                            return false;
+                        }
+                        if src != dst {
+                            self.on_node_rehomed(dragged, Some(src), dst);
+                            self.on_node_rehomed(*t, Some(dst), src);
+                        }
+                    }
+                    DropZone::Side(d) => self.insert_beside(dragged, *t, *d),
+                }
+                if src != dst && !matches!(zone, DropZone::Swap) {
+                    self.on_node_rehomed(dragged, Some(src), dst);
+                }
+                self.finish_drop(dragged, src);
+                for n in moved_windows {
+                    if let Some(w) = self.tree.window_id(n) {
+                        self.emit_window("move", w);
+                    }
+                }
+                true
+            }
+            DropTarget::Workspace(name) => {
+                if name.starts_with("__") {
+                    return false;
+                }
+                let dest = self.find_or_create_workspace(name);
+                self.move_dragged(dragged, dest)
+            }
+            DropTarget::Output(o) => {
+                if !self.outputs().contains(o) {
+                    return false;
+                }
+                let dest = self.visible_workspace(*o);
+                self.move_dragged(dragged, dest)
+            }
+        }
+    }
+
+    /// Detaches `dragged` (with v1's removal cleanup) and inserts it next to
+    /// `t` according to `d`, or as the next tab when `t` sits in tabs.
+    fn insert_beside(&mut self, dragged: NodeId, t: NodeId, d: Direction) {
+        let old_parent = self.tree.parent(dragged);
+        self.tree.detach(dragged);
+        if let Some(p) = old_parent {
+            if matches!(self.tree.get(p).kind, NodeKind::Container) {
+                self.tree.cleanup(p);
+            }
+        }
+        let (Some(parent), Some(idx)) = (self.tree.parent(t), self.tree.index_in_parent(t)) else {
+            return;
+        };
+        let layout = self.tree.get(parent).layout;
+        if matches!(layout, Layout::Tabbed | Layout::Stacked) {
+            self.tree.attach(parent, dragged, Some(idx + 1));
+            return;
+        }
+        let after = matches!(d, Direction::Right | Direction::Down);
+        if layout == split_layout(d) {
+            self.tree
+                .attach(parent, dragged, Some(if after { idx + 1 } else { idx }));
+        } else {
+            let c = self.tree.wrap(t, split_layout(d));
+            self.tree
+                .attach(c, dragged, if after { None } else { Some(0) });
+        }
+    }
+
+    /// Focus `dragged`, and drop the source workspace if it was left empty
+    /// and hidden.
+    fn finish_drop(&mut self, dragged: NodeId, src: NodeId) {
+        self.focused_container = None;
+        let visible = self
+            .tree
+            .workspace_of(dragged)
+            .is_some_and(|w| self.is_visible(w));
+        if visible {
+            self.tree.set_focused(dragged);
+        } else {
+            self.focus_in_place(dragged);
+        }
+        self.remove_if_empty_hidden(src);
+    }
+
+    /// Moves `dragged` to the end of `dest` without following it.
+    fn move_dragged(&mut self, dragged: NodeId, dest: NodeId) -> bool {
+        if self.tree.workspace_of(dragged) == Some(dest) {
+            return false;
+        }
+        self.move_node_to_workspace(dragged, dest, true).is_ok()
+            && self.tree.workspace_of(dragged) == Some(dest)
+    }
+
+    /// Rect to preview for a target (the zone's half/whole target rect, or
+    /// the workspace area).
+    pub fn drop_preview_rect(&self, target: &DropTarget) -> Option<Rect> {
+        match target {
+            DropTarget::Nothing => None,
+            DropTarget::Output(o) => self.output_area(*o),
+            DropTarget::Workspace(name) => {
+                let o = self
+                    .find_workspace(name)
+                    .and_then(|w| self.tree.output_of(w))
+                    .unwrap_or_else(|| self.focused_output());
+                self.output_area(o)
+            }
+            DropTarget::Window(t, zone) => {
+                let r = self.node_rect(*t)?;
+                let in_tabs = self.tree.parent(*t).is_some_and(|p| {
+                    matches!(self.tree.get(p).layout, Layout::Tabbed | Layout::Stacked)
+                });
+                Some(match zone {
+                    DropZone::Side(d) if !in_tabs => match d {
+                        Direction::Left => Rect::new(r.x, r.y, r.w / 2, r.h),
+                        Direction::Right => Rect::new(r.x + r.w / 2, r.y, r.w - r.w / 2, r.h),
+                        Direction::Up => Rect::new(r.x, r.y, r.w, r.h / 2),
+                        Direction::Down => Rect::new(r.x, r.y + r.h / 2, r.w, r.h - r.h / 2),
+                    },
+                    _ => r,
+                })
+            }
+        }
+    }
+
     /// Rect of `node` in the current arrangement (tiled windows and
     /// containers: the layout rect before gaps/borders).
     pub fn node_rect(&self, node: NodeId) -> Option<Rect> {
@@ -203,6 +461,110 @@ mod tests {
             .map(|&c| wm.tree.get(c).percent)
             .sum();
         assert!((sum - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zones() {
+        let r = Rect::new(0, 0, 100, 100);
+        assert_eq!(drop_zone(r, 50, 50), DropZone::Swap);
+        assert_eq!(drop_zone(r, 5, 50), DropZone::Side(Direction::Left));
+        assert_eq!(drop_zone(r, 50, 95), DropZone::Side(Direction::Down));
+        assert_eq!(drop_zone(r, 10, 5), DropZone::Side(Direction::Up));
+        assert_eq!(drop_zone(r, 95, 30), DropZone::Side(Direction::Right));
+    }
+
+    #[test]
+    fn drop_sides_and_swap() {
+        let mut wm = test_wm();
+        wm.config.bars.clear();
+        for i in 1..=3 {
+            wm.manage(win(i));
+        }
+        let n = |wm: &Wm, i| wm.tree.window_node(WindowId(i)).unwrap();
+        assert!(wm.drop_window(
+            n(&wm, 3),
+            &DropTarget::Window(n(&wm, 1), DropZone::Side(Direction::Left))
+        ));
+        assert_eq!(ws_desc(&wm), "H[w3 w1 w2]");
+        assert!(wm.drop_window(n(&wm, 3), &DropTarget::Window(n(&wm, 2), DropZone::Swap)));
+        assert_eq!(ws_desc(&wm), "H[w2 w1 w3]");
+        assert!(wm.drop_window(
+            n(&wm, 3),
+            &DropTarget::Window(n(&wm, 1), DropZone::Side(Direction::Down))
+        ));
+        assert_eq!(ws_desc(&wm), "H[w2 V[w1 w3]]");
+        assert_eq!(wm.focused_window(), Some(WindowId(3)));
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn drop_into_tabbed_and_workspace() {
+        let mut wm = test_wm();
+        wm.config.bars.clear();
+        for i in 1..=3 {
+            wm.manage(win(i));
+        }
+        let n = |wm: &Wm, i| wm.tree.window_node(WindowId(i)).unwrap();
+        wm.run_command("[id=1] split v, layout tabbed");
+        assert!(wm.drop_window(
+            n(&wm, 3),
+            &DropTarget::Window(n(&wm, 1), DropZone::Side(Direction::Right))
+        ));
+        assert_eq!(ws_desc(&wm), "H[T[w1 w3] w2]");
+        assert!(wm.drop_window(n(&wm, 2), &DropTarget::Workspace("4".into())));
+        assert_eq!(wm.tree.describe(wm.find_workspace("4").unwrap()), "H[w2]");
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn drop_noop_cases() {
+        let mut wm = test_wm();
+        wm.config.bars.clear();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        assert!(!wm.drop_window(n1, &DropTarget::Window(n1, DropZone::Swap)));
+        assert!(!wm.drop_window(n1, &DropTarget::Nothing));
+        wm.run_command("[id=2] floating enable");
+        let c = wm.node_rect(n1).unwrap().center();
+        assert_eq!(wm.drop_target_at(n1, c.0, c.1), DropTarget::Nothing);
+        assert_eq!(
+            wm.drop_target_at(n2, c.0, c.1),
+            DropTarget::Window(n1, DropZone::Swap)
+        );
+    }
+
+    #[test]
+    fn drop_output_and_preview() {
+        let mut wm = Wm::new(
+            crate::config::Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        );
+        wm.config.bars.clear();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        let b = wm.outputs()[1];
+        assert_eq!(wm.drop_target_at(n2, 1500, 100), DropTarget::Output(b));
+        let area = wm.drop_preview_rect(&DropTarget::Output(b)).unwrap();
+        assert!(area.x >= 1000);
+        assert!(wm.drop_window(n2, &DropTarget::Output(b)));
+        assert_eq!(wm.tree.describe(wm.visible_workspace(b)), "H[w2]");
+        assert!(!wm.drop_window(n2, &DropTarget::Output(b)));
+        let r = wm.node_rect(n1).unwrap();
+        let left = wm
+            .drop_preview_rect(&DropTarget::Window(n1, DropZone::Side(Direction::Left)))
+            .unwrap();
+        assert_eq!(left, Rect::new(r.x, r.y, r.w / 2, r.h));
+        // Cross-output swap with a window on the other output.
+        wm.manage(win(3));
+        let n3 = wm.tree.window_node(WindowId(3)).unwrap();
+        let ws_b = wm.visible_workspace(b);
+        let t = wm.tree.get(ws_b).children[0];
+        assert!(wm.drop_window(n3, &DropTarget::Window(t, DropZone::Swap)));
+        check_invariants(&wm);
     }
 
     #[test]

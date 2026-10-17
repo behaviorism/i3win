@@ -209,7 +209,7 @@ impl Wm {
         }
     }
 
-    fn find_or_create_workspace(&mut self, name: &str) -> NodeId {
+    pub(crate) fn find_or_create_workspace(&mut self, name: &str) -> NodeId {
         match self.find_workspace(name) {
             Some(w) => w,
             None => {
@@ -323,6 +323,17 @@ impl Wm {
     }
 
     fn move_to_workspace_node(&mut self, target: NodeId, dest: NodeId) -> Result<(), String> {
+        self.move_node_to_workspace(target, dest, false)
+    }
+
+    /// Moves `target` to workspace `dest`; a tiled node goes next to the
+    /// focused tiled window, or (`append`) to the end of the workspace root.
+    pub(crate) fn move_node_to_workspace(
+        &mut self,
+        target: NodeId,
+        dest: NodeId,
+        append: bool,
+    ) -> Result<(), String> {
         if matches!(self.tree.get(target).kind, NodeKind::Workspace { .. }) {
             return Ok(());
         }
@@ -354,6 +365,8 @@ impl Wm {
             if let (Some(from), Some(to)) = (src_rect, dest_rect) {
                 self.shift_floating(target, from, to);
             }
+        } else if append {
+            self.tree.attach(dest, target, None);
         } else {
             self.insert_tiled(dest, target);
         }
