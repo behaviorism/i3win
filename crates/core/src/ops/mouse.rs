@@ -126,8 +126,13 @@ impl Wm {
             return false;
         }
         let (pc, ps) = (self.tree.get(c).percent, self.tree.get(s).percent);
-        let delta =
-            (f64::from(delta_px) / f64::from(total)).clamp(MIN_PERCENT - pc, ps - MIN_PERCENT);
+        let want_delta = f64::from(delta_px) / f64::from(total);
+        let lo = (MIN_PERCENT - pc).min(0.0);
+        let hi = (ps - MIN_PERCENT).max(0.0);
+        let delta = want_delta.clamp(lo, hi);
+        if !delta.is_finite() || delta.abs() < 1e-12 {
+            return false;
+        }
         self.tree.get_mut(c).percent = pc + delta;
         self.tree.get_mut(s).percent = ps - delta;
         true
@@ -171,6 +176,33 @@ mod tests {
         let v = wm.tree.parent(n3).unwrap();
         assert!((wm.tree.get(v).percent - 0.6).abs() < 1e-9);
         assert!(wm.resize_edge(n3, Direction::Up, 50));
+    }
+
+    #[test]
+    fn resize_edge_many_tiles_never_panics_or_grows_wrong_way() {
+        let mut wm = test_wm();
+        wm.config.bars.clear();
+        for i in 1..=25 {
+            wm.manage(win(i));
+        }
+        let ws = wm.focused_workspace();
+        let n = |i: isize, wm: &Wm| wm.tree.window_node(WindowId(i)).unwrap();
+        let (a, b) = (n(3, &wm), n(4, &wm));
+        let pa = wm.tree.get(a).percent;
+        assert!(pa < 0.05);
+        let _ = wm.resize_edge(a, Direction::Right, -30);
+        assert!(wm.tree.get(a).percent <= pa + 1e-12);
+        let _ = wm.resize_edge(a, Direction::Right, 30);
+        let _ = wm.resize_edge(b, Direction::Left, 30);
+        let _ = wm.resize_edge(b, Direction::Left, -30);
+        let sum: f64 = wm
+            .tree
+            .get(ws)
+            .children
+            .iter()
+            .map(|&c| wm.tree.get(c).percent)
+            .sum();
+        assert!((sum - 1.0).abs() < 1e-9);
     }
 
     #[test]
