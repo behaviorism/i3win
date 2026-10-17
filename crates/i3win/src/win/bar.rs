@@ -323,7 +323,6 @@ impl Bars {
 
     /// The workspace whose button lies under screen point `(x, y)` on a
     /// visible bar, if any (drop target for dragging windows onto buttons).
-    #[allow(dead_code)] // consumed by the drag-and-drop plan
     pub fn workspace_at(&self, x: i32, y: i32) -> Option<String> {
         self.windows.values().filter(|bw| bw.shown).find_map(|bw| {
             let r = bw.rect;

@@ -7,4 +7,5 @@ pub mod hidden;
 pub mod keyboard;
 pub mod monitors;
 pub mod mouse;
+pub mod overlay;
 pub mod window;

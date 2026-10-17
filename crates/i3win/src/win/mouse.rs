@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 
 use i3win_core::geom::Rect;
 use i3win_core::keys::Modifiers;
-use i3win_core::tree::WindowId;
+use i3win_core::tree::{NodeId, WindowId};
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -85,6 +85,16 @@ pub enum MouseEvent {
         x: i32,
         y: i32,
     },
+    /// A left-button drag on a title bar or tab passed the movement threshold;
+    /// (x, y) is where the button went down. Its moves and release follow as
+    /// `Move` and `Release { button: Left, .. }`.
+    TitlePress {
+        x: i32,
+        y: i32,
+        node: NodeId,
+    },
+    /// Escape during a drag: undo it.
+    Cancel,
 }
 
 #[derive(Debug)]
@@ -159,7 +169,7 @@ impl MouseMatcher {
         (self.dragging.is_some() || self.snapshot.want_moves).then_some(MouseEvent::Move { x, y })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // read by the drag state machine (Task 4)
+    #[cfg(test)]
     pub fn is_dragging(&self) -> bool {
         self.dragging.is_some()
     }
@@ -171,7 +181,11 @@ impl MouseMatcher {
 
     /// Ends a drag whose button-up was missed (the App saw the button no longer down):
     /// clears `dragging` and returns the Release at (x, y); `None` without a drag.
-    #[cfg_attr(not(test), allow(dead_code))] // used by the drag state machine (Task 4)
+    /// The button of the drag this matcher started, if any.
+    pub fn drag_button(&self) -> Option<Button> {
+        self.dragging
+    }
+
     pub fn force_release(&mut self, x: i32, y: i32) -> Option<MouseEvent> {
         let button = self.dragging.take()?;
         Some(MouseEvent::Release { button, x, y })
@@ -187,6 +201,8 @@ thread_local! {
     /// True while a WM_APP_MOUSE is posted and not yet drained.
     static MOUSE_PENDING: Cell<bool> = const { Cell::new(false) };
     static HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
+    /// The App has a drag in progress (set by the App; read by the keyboard hook).
+    static DRAG_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Posts one WM_APP_MOUSE unless one is already pending.
@@ -307,6 +323,44 @@ pub fn set_foreground_managed(managed: bool) {
             m.set_foreground_managed(managed);
         }
     });
+}
+
+/// Main thread: the App started (true) or ended (false) a drag.
+pub fn set_drag_active(active: bool) {
+    DRAG_ACTIVE.with(|d| d.set(active));
+}
+
+/// Whether the App has a drag in progress. Allocation-free (keyboard hook).
+pub fn is_dragging() -> bool {
+    DRAG_ACTIVE.with(|d| d.get())
+}
+
+/// Main thread (deco windows, keyboard hook): queues an event into the same path
+/// as the mouse hook's and wakes the main window.
+pub fn post_event(ev: MouseEvent) {
+    if queue(ev) {
+        wake();
+    }
+}
+
+/// Main thread (captured title-bar drag): a pointer move, coalesced like the hook's.
+pub fn post_move(x: i32, y: i32) {
+    LATEST_MOVE.with(|m| m.set(Some((x, y))));
+    wake();
+}
+
+/// The button of the hook drag in progress, if any.
+pub fn drag_button() -> Option<Button> {
+    MATCHER.with(|m| m.try_borrow().ok().and_then(|m| m.drag_button()))
+}
+
+/// Ends a hook drag whose button-up was missed; see `MouseMatcher::force_release`.
+pub fn force_release(x: i32, y: i32) -> Option<MouseEvent> {
+    MATCHER.with(|m| {
+        m.try_borrow_mut()
+            .ok()
+            .and_then(|mut m| m.force_release(x, y))
+    })
 }
 
 /// Button events in order (each preceded by the move it followed), then the latest

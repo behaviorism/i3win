@@ -12,19 +12,22 @@ use i3win_core::geom::Rect;
 use i3win_core::i3bar::Block;
 use i3win_core::ipc::{self, IpcContext, Request, EV_TICK};
 use i3win_core::keys::{KeyCombo, Modifiers};
-use i3win_core::tree::{NodeKind, WindowId};
+use i3win_core::tree::{NodeId, NodeKind, WindowId};
 use i3win_core::wm::{Effect, Wm};
+use i3win_core::DropTarget;
 
+use crate::drag::{self, Drag, DragKind, PercentSnapshot};
 use crate::ipc_server;
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
 use crate::reconcile::{self, Applied, WinOp};
 use crate::status::{cmd_args, exit_block, StatusProcess};
 use crate::win::bar::Bars;
-use crate::win::deco::Decos;
+use crate::win::deco::{self, Decos};
 use crate::win::events::{self, PlatformEvent};
 use crate::win::hidden::{self, HiddenStore, HideTracker};
-use crate::win::mouse::{self, MouseEvent};
+use crate::win::mouse::{self, Button, MouseEvent};
+use crate::win::overlay::Overlay;
 use crate::win::window::{self, Manage};
 use crate::win::{keyboard, monitors};
 
@@ -169,6 +172,36 @@ fn mouse_snapshot(wm: &Wm, arr: &Arrangement, foreground_managed: bool) -> mouse
     }
 }
 
+/// A mouse drag in progress.
+struct DragSession {
+    drag: Drag,
+    button: Button,
+    /// Started from a title bar or tab (the deco window holds the capture).
+    from_titlebar: bool,
+    /// Percents to restore on cancel (tiled resize only).
+    percents: PercentSnapshot,
+    /// The drop target last previewed (tiling drag only).
+    target: Option<DropTarget>,
+}
+
+/// Whether `button` is up right now (logical button, honoring swapped buttons).
+fn button_up(button: Button) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+    // SAFETY: plain Win32 queries.
+    unsafe {
+        let swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+        let vk = match (button, swapped) {
+            (Button::Left, false) | (Button::Right, true) => VK_LBUTTON,
+            (Button::Right, false) | (Button::Left, true) => VK_RBUTTON,
+            (Button::Middle, _) => VK_MBUTTON,
+        };
+        GetAsyncKeyState(i32::from(vk.0)) >= 0
+    }
+}
+
 pub struct App {
     pub wm: Wm,
     applied: Applied,
@@ -191,6 +224,10 @@ pub struct App {
     config_text: String,
     /// IPC pipe name, exported to exec'd children as I3SOCK.
     pipe_name: String,
+    drag: Option<DragSession>,
+    overlay: Overlay,
+    /// Time base for drag throttling.
+    epoch: Instant,
 }
 
 impl App {
@@ -237,6 +274,9 @@ impl App {
             config_text,
             pipe_name,
             statuses: HashMap::new(),
+            drag: None,
+            overlay: Overlay::default(),
+            epoch: Instant::now(),
         };
         app.restart_status();
         app
@@ -288,9 +328,162 @@ impl App {
     }
 
     /// Mouse hook events in order, then the latest coalesced move after them.
-    /// Dragging arrives in a later task; for now they are ignored.
+    /// Flushes once when anything changed.
     pub fn on_mouse(&mut self, events: Vec<MouseEvent>, latest_move: Option<(i32, i32)>) {
-        let _ = (events, latest_move);
+        let mut changed = false;
+        for ev in events {
+            changed |= self.on_mouse_event(ev);
+        }
+        if let Some((x, y)) = latest_move {
+            // Only the newest position is checked for a missed button-up: an older
+            // queued move may precede the real release in the same batch.
+            changed |= if self.release_missed(x, y) {
+                self.end_drag(x, y)
+            } else {
+                self.step_drag(x, y)
+            };
+        }
+        if changed {
+            self.flush();
+        }
+    }
+
+    /// Returns whether a flush is needed.
+    fn on_mouse_event(&mut self, ev: MouseEvent) -> bool {
+        match ev {
+            MouseEvent::Press {
+                button, x, y, id, ..
+            } => match self.wm.tree.window_node(id) {
+                Some(node) => {
+                    // A modifier-click focuses the window, as in i3.
+                    self.wm.focus_node(node);
+                    self.begin_drag(node, button, x, y, false);
+                    true
+                }
+                None => false,
+            },
+            MouseEvent::TitlePress { x, y, node } => {
+                self.begin_drag(node, Button::Left, x, y, true);
+                false
+            }
+            MouseEvent::Move { x, y } => self.step_drag(x, y),
+            MouseEvent::Release { button, x, y } => {
+                if self.drag.as_ref().is_some_and(|s| s.button == button) {
+                    self.end_drag(x, y)
+                } else {
+                    false
+                }
+            }
+            MouseEvent::Cancel => self.cancel_drag(),
+        }
+    }
+
+    fn begin_drag(&mut self, node: NodeId, button: Button, x: i32, y: i32, from_titlebar: bool) {
+        let started = if self.drag.is_none() && self.wm.tree.contains(node) {
+            drag::start_drag(&self.wm, node, button, x, y, from_titlebar)
+        } else {
+            None
+        };
+        let Some(d) = started else {
+            if from_titlebar {
+                deco::end_title_drag();
+            }
+            return;
+        };
+        let percents = match d.kind {
+            DragKind::ResizeTiled { .. } => drag::snapshot_percents(&self.wm, node),
+            _ => Vec::new(),
+        };
+        self.drag = Some(DragSession {
+            drag: d,
+            button,
+            from_titlebar,
+            percents,
+            target: None,
+        });
+        mouse::set_drag_active(true);
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The drop target under (x, y): a workspace button on a bar, else the core's pick.
+    fn drop_target_at(&self, node: NodeId, x: i32, y: i32) -> DropTarget {
+        match self.bars.workspace_at(x, y) {
+            Some(name) => DropTarget::Workspace(name),
+            None => self.wm.drop_target_at(node, x, y),
+        }
+    }
+
+    /// Applies a pointer move to the drag; returns whether a flush is needed.
+    fn step_drag(&mut self, x: i32, y: i32) -> bool {
+        let now = self.now_ms();
+        let Some(mut s) = self.drag.take() else {
+            return false;
+        };
+        let changed = if s.drag.kind == DragKind::Tiling {
+            s.drag.last = (x, y);
+            let t = self.drop_target_at(s.drag.node, x, y);
+            if s.target.as_ref() != Some(&t) {
+                match self.wm.drop_preview_rect(&t) {
+                    Some(r) => self
+                        .overlay
+                        .show(r, self.wm.config.colors.focused.indicator),
+                    None => self.overlay.hide(),
+                }
+                s.target = Some(t);
+            }
+            false
+        } else {
+            drag::drag_step(&mut self.wm, &mut s.drag, x, y, now)
+        };
+        self.drag = Some(s);
+        changed
+    }
+
+    /// Whether the drag's button (or the hook's) is no longer down although its
+    /// release never arrived; a stale hook drag is force-released.
+    fn release_missed(&mut self, x: i32, y: i32) -> bool {
+        if mouse::drag_button().is_some_and(button_up) {
+            let _ = mouse::force_release(x, y);
+        }
+        self.drag.as_ref().is_some_and(|s| button_up(s.button))
+    }
+
+    /// Ends the drag at (x, y): last move applied, tiling drag dropped.
+    fn end_drag(&mut self, x: i32, y: i32) -> bool {
+        let Some(mut s) = self.drag.take() else {
+            return false;
+        };
+        mouse::set_drag_active(false);
+        self.overlay.hide();
+        if s.from_titlebar {
+            deco::end_title_drag();
+        }
+        let target = if s.drag.kind == DragKind::Tiling {
+            Some(self.drop_target_at(s.drag.node, x, y))
+        } else {
+            // Not throttled: the final position always lands.
+            drag::drag_step(&mut self.wm, &mut s.drag, x, y, u64::MAX);
+            None
+        };
+        drag::finish_drag(&mut self.wm, &s.drag, target);
+        true
+    }
+
+    /// Escape: undoes the drag in progress.
+    fn cancel_drag(&mut self) -> bool {
+        let Some(s) = self.drag.take() else {
+            return false;
+        };
+        mouse::set_drag_active(false);
+        self.overlay.hide();
+        if s.from_titlebar {
+            deco::end_title_drag();
+        }
+        drag::cancel_drag(&mut self.wm, &s.drag, &s.percents);
+        true
     }
 
     /// The watched modifier of Hide-mode bars went down or up: redraw only the bars.
@@ -661,6 +854,7 @@ impl App {
         }
         self.bars.destroy_all();
         self.decos.destroy_all();
+        self.overlay.destroy();
         self.store.clear_file();
     }
 }

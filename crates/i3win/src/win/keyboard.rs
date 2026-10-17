@@ -13,10 +13,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::mainloop::{main_hwnd, WM_APP_KEY, WM_APP_MODS};
+use crate::win::mouse::{self, MouseEvent};
 
 const HC_ACTION: i32 = 0;
 const LLKHF_EXTENDED: u32 = 0x01;
 const LLKHF_INJECTED: u32 = 0x10;
+const VK_ESCAPE: u16 = 0x1B;
 /// `dwExtraInfo` tag on keys i3win injects itself. Only these are ignored; other injected
 /// input (AutoHotkey remaps, on-screen keyboards, remote tools) fires bindings like real keys.
 pub const OWN_INPUT_TAG: usize = 0x6933_7769;
@@ -206,6 +208,28 @@ thread_local! {
     static MATCHER: RefCell<KeyMatcher> = RefCell::new(KeyMatcher::new());
     static QUEUE: RefCell<Vec<(Option<KeyCombo>, bool, bool)>> = const { RefCell::new(Vec::new()) };
     static HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
+    /// An Escape key-down was swallowed to cancel a drag: swallow its repeats and key-up.
+    static ESC_SWALLOWED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Escape during a mouse drag cancels it; the key never reaches the window below.
+/// Returns true when the key is swallowed. Allocation-free.
+fn escape_cancels_drag(vk: u16, down: bool, own: bool) -> bool {
+    if own || vk != VK_ESCAPE {
+        return false;
+    }
+    if ESC_SWALLOWED.with(|e| e.get()) {
+        if !down {
+            ESC_SWALLOWED.with(|e| e.set(false));
+        }
+        return true;
+    }
+    if down && mouse::is_dragging() {
+        ESC_SWALLOWED.with(|e| e.set(true));
+        mouse::post_event(MouseEvent::Cancel);
+        return true;
+    }
+    false
 }
 
 /// Tells the main window the watched modifier's held state flipped.
@@ -230,6 +254,9 @@ unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
         let vk = info.vkCode as u16;
         let own = info.flags.0 & LLKHF_INJECTED != 0 && info.dwExtraInfo == OWN_INPUT_TAG;
         let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
+        if escape_cancels_drag(vk, down, own) {
+            return LRESULT(1);
+        }
         let flip = if own {
             None
         } else {
@@ -352,6 +379,22 @@ pub fn drain() -> Vec<(Option<KeyCombo>, bool, bool)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn escape_cancels_only_during_drag() {
+        use super::*;
+        mouse::set_drag_active(false);
+        assert!(!escape_cancels_drag(VK_ESCAPE, true, false));
+        assert!(!escape_cancels_drag(VK_ESCAPE, false, false));
+        mouse::set_drag_active(true);
+        assert!(!escape_cancels_drag(VK_ESCAPE, true, true)); // own input passes
+        assert!(!escape_cancels_drag(0x41, true, false));
+        assert!(escape_cancels_drag(VK_ESCAPE, true, false));
+        mouse::set_drag_active(false); // the App cancelled the drag
+        assert!(escape_cancels_drag(VK_ESCAPE, true, false)); // repeat swallowed
+        assert!(escape_cancels_drag(VK_ESCAPE, false, false)); // key-up swallowed
+        assert!(!escape_cancels_drag(VK_ESCAPE, true, false));
+        assert_eq!(mouse::drain().0, vec![MouseEvent::Cancel]);
+    }
     #[test]
     fn resync_releases_watched_modifier() {
         let mut k = KeyMatcher::new();
