@@ -3,7 +3,7 @@ use crate::criteria::{parse_criteria, Criteria};
 use crate::keycodes::x11_keycode_to_scancode;
 use crate::keys::{parse_combo, scancode_combo, split_combo, KeyCombo, Modifiers};
 use crate::tree::Layout;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color(pub u8, pub u8, pub u8);
@@ -226,6 +226,8 @@ pub struct Config {
     pub smart_borders: SmartBorders,
     pub smart_gaps: SmartGaps,
     pub no_focus: Vec<Criteria>,
+    /// Mode names declared with `--pango_markup`; the bar draws them as markup.
+    pub mode_markup: HashSet<String>,
     pub warnings: Vec<String>, // "line N: message"
 }
 
@@ -607,6 +609,7 @@ pub fn parse_config(text: &str) -> Config {
         smart_borders: SmartBorders::Off,
         smart_gaps: SmartGaps::Off,
         no_focus: Vec::new(),
+        mode_markup: HashSet::new(),
         warnings: Vec::new(),
     };
     cfg.bindings.insert("default".to_string(), Vec::new());
@@ -919,7 +922,15 @@ fn top_level(
             let name = args
                 .strip_suffix('{')
                 .ok_or_else(|| "mode: expected `{` on the same line".to_string())?;
+            let name = name.trim();
+            let (pango, name) = match name.strip_prefix("--pango_markup") {
+                Some(rest) if rest.starts_with(char::is_whitespace) => (true, rest.trim_start()),
+                _ => (false, name),
+            };
             let name = unquote(name);
+            if pango {
+                cfg.mode_markup.insert(name.clone());
+            }
             cfg.bindings.entry(name.clone()).or_default();
             stack.push(Block::Mode(name));
         }
@@ -1330,6 +1341,16 @@ output primary
     fn longest_variable_first() {
         let c = parse_config("set $m Mod1\nset $mod Mod4\nbindsym $mod+a nop\n");
         assert_eq!(c.bindings["default"][0].combo.mods, Modifiers::WIN);
+    }
+    #[test]
+    fn mode_pango_markup_flag() {
+        let c = parse_config(
+            "mode --pango_markup \"<b>resize</b>\" {\nbindsym Escape mode default\n}\n",
+        );
+        assert!(c.mode_markup.contains("<b>resize</b>"));
+        assert!(c.bindings.contains_key("<b>resize</b>"));
+        let c = parse_config("mode \"plain\" {\nbindsym Escape mode default\n}\n");
+        assert!(c.mode_markup.is_empty());
     }
     #[test]
     fn modes() {

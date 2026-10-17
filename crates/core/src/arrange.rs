@@ -18,6 +18,8 @@ pub enum DecoState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tab {
     pub title: String,
+    /// Whether `title` is markup.
+    pub markup: bool,
     pub state: DecoState,
     pub rect: Rect,
     pub node: NodeId,
@@ -32,6 +34,8 @@ pub enum Deco {
         /// left, top, right, bottom. With a normal (title) border top is 0 and the title bar sits there.
         borders: [i32; 4],
         title: String,
+        /// Whether `title` is markup.
+        markup: bool,
         state: DecoState,
         floating: bool,
         above: WindowId,
@@ -166,7 +170,8 @@ impl Ctx<'_> {
         }
     }
 
-    fn window_title(&self, node: NodeId) -> String {
+    /// The title text and whether it is markup.
+    fn window_title(&self, node: NodeId) -> (String, bool) {
         let n = self.tree.get(node);
         match &n.kind {
             NodeKind::Window(d) => format_title(
@@ -178,7 +183,7 @@ impl Ctx<'_> {
                 &n.marks,
                 self.config.show_marks,
             ),
-            _ => String::new(),
+            _ => (String::new(), false),
         }
     }
 
@@ -249,12 +254,15 @@ impl Ctx<'_> {
                                 };
                                 Rect::new(rect.x.saturating_add(before), rect.y, tw, th)
                             };
+                            let (title, markup) = if matches!(tree.get(c).kind, NodeKind::Window(_))
+                            {
+                                self.window_title(c)
+                            } else {
+                                (tree.describe(c), false)
+                            };
                             tabs.push(Tab {
-                                title: if matches!(tree.get(c).kind, NodeKind::Window(_)) {
-                                    self.window_title(c)
-                                } else {
-                                    tree.describe(c)
-                                },
+                                title,
+                                markup,
                                 state: self.state(c),
                                 rect: r,
                                 node: c,
@@ -330,7 +338,7 @@ impl Ctx<'_> {
             fullscreen: false,
         });
         if border != Border::None && (titled || sides.iter().any(|&s| s > 0)) {
-            let title = self.window_title(node);
+            let (title, markup) = self.window_title(node);
             let state = self.state(node);
             self.out.decos.push(Deco::Frame {
                 key: node,
@@ -338,6 +346,7 @@ impl Ctx<'_> {
                 title_rect,
                 borders: sides,
                 title,
+                markup,
                 state,
                 floating,
                 above: id,
@@ -584,6 +593,7 @@ mod tests {
             title_rect: Some(Rect::new(0, 0, 500, 20)),
             borders: [2, 0, 2, 2],
             title: "w1".into(),
+            markup: false,
             state: DecoState::Unfocused,
             floating: false,
             above: WindowId(1),

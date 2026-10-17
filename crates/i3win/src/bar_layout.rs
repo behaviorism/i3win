@@ -42,6 +42,8 @@ pub struct BarLayout {
     pub background: Color,
     pub statusline: Color,
     pub separator_color: Color,
+    /// The padded content area (bar-relative) that items and separators live in.
+    pub content: Rect,
 }
 
 pub struct BarStyle<'a> {
@@ -53,6 +55,8 @@ pub struct BarStyle<'a> {
     pub strip_name: bool,
     pub workspace_min_width: i32,
     pub separator_symbol: Option<&'a str>,
+    /// Whether the mode indicator text is markup (`mode --pango_markup`).
+    pub mode_markup: bool,
     /// top, right, bottom, left in px.
     pub padding: [i32; 4],
 }
@@ -81,7 +85,14 @@ pub fn display_name(name: &str, num: Option<i32>, strip_numbers: bool, strip_nam
     name.to_string()
 }
 
-fn triple_item(kind: ItemKind, rect: Rect, text: &str, t: &BarColorTriple, text_x: i32) -> BarItem {
+fn triple_item(
+    kind: ItemKind,
+    rect: Rect,
+    text: &str,
+    t: &BarColorTriple,
+    text_x: i32,
+    markup: bool,
+) -> BarItem {
     BarItem {
         kind,
         rect,
@@ -89,7 +100,7 @@ fn triple_item(kind: ItemKind, rect: Rect, text: &str, t: &BarColorTriple, text_
         fg: t.text,
         bg: Some(t.background),
         border: Some(t.border),
-        markup: false,
+        markup,
         borders: [1, 1, 1, 1],
         text_x,
     }
@@ -132,19 +143,21 @@ pub fn layout_bar(
     let mut items = Vec::new();
     let mut x = pl;
 
-    let mut left = |kind: ItemKind, text: &str, min_w: i32, t: &BarColorTriple, x: &mut i32| {
-        let tw = measure(text, false).max(0);
-        let w = tw.saturating_add(pad.saturating_mul(2)).max(min_w);
-        let text_x = x.saturating_add((w - tw) / 2);
-        items.push(triple_item(
-            kind,
-            Rect::new(*x, top, w, item_h),
-            text,
-            t,
-            text_x,
-        ));
-        *x = x.saturating_add(w).saturating_add(gap1);
-    };
+    let mut left =
+        |kind: ItemKind, text: &str, markup: bool, min_w: i32, t: &BarColorTriple, x: &mut i32| {
+            let tw = measure(text, markup).max(0);
+            let w = tw.saturating_add(pad.saturating_mul(2)).max(min_w);
+            let text_x = x.saturating_add((w - tw) / 2);
+            items.push(triple_item(
+                kind,
+                Rect::new(*x, top, w, item_h),
+                text,
+                t,
+                text_x,
+                markup,
+            ));
+            *x = x.saturating_add(w).saturating_add(gap1);
+        };
     if style.show_buttons {
         let min_w = s(style.workspace_min_width).max(0);
         for b in buttons {
@@ -163,11 +176,25 @@ pub fn layout_bar(
                 style.strip_numbers,
                 style.strip_name,
             );
-            left(ItemKind::Workspace(b.name.clone()), &text, min_w, t, &mut x);
+            left(
+                ItemKind::Workspace(b.name.clone()),
+                &text,
+                false,
+                min_w,
+                t,
+                &mut x,
+            );
         }
     }
     if let Some(m) = mode.filter(|m| style.show_mode && *m != "default") {
-        left(ItemKind::Mode, m, 0, &colors.binding_mode, &mut x);
+        left(
+            ItemKind::Mode,
+            m,
+            style.mode_markup,
+            0,
+            &colors.binding_mode,
+            &mut x,
+        );
     }
     let left_end = x;
 
@@ -233,6 +260,7 @@ pub fn layout_bar(
                     text,
                     &colors.urgent_workspace,
                     text_x,
+                    markup,
                 )
             } else {
                 BarItem {
@@ -279,6 +307,12 @@ pub fn layout_bar(
         background,
         statusline,
         separator_color,
+        content: Rect::new(
+            pl,
+            top,
+            content_right.saturating_sub(pl).max(0),
+            item_h.max(0),
+        ),
     }
 }
 
@@ -336,6 +370,7 @@ mod tests {
             strip_name: false,
             workspace_min_width: 0,
             separator_symbol: None,
+            mode_markup: false,
             padding: [0; 4],
         }
     }
@@ -378,6 +413,17 @@ mod tests {
         assert_eq!(l.items[1].rect, Rect::new(18, 0, 17, 22));
         assert_eq!(l.items[1].bg, Some(c.focused_workspace.background));
         assert_eq!(l.items[0].bg, Some(c.inactive_workspace.background));
+    }
+    #[test]
+    fn mode_markup_is_measured_and_flagged() {
+        let st = BarStyle {
+            mode_markup: true,
+            ..style()
+        };
+        let l = layout_bar(1000, 22, 1.0, &[], Some("<b>ab</b>"), &[], &st, &m);
+        assert!(l.items[0].markup);
+        // 2 visible chars x 10 px + 2 x 5 px padding.
+        assert_eq!(l.items[0].rect.w, 30);
     }
     #[test]
     fn mode_indicator_after_buttons() {

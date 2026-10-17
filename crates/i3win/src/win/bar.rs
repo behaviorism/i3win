@@ -9,16 +9,16 @@ use i3win_core::bar_model::workspace_buttons;
 use i3win_core::config::{BarPosition, Font};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::{Block, Click};
+use i3win_core::markup::parse_markup;
 use i3win_core::tree::NodeKind;
 use i3win_core::wm::Wm;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, DrawTextW, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
-    MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+    ClientToScreen, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
+    MonitorFromWindow, ReleaseDC, SelectObject, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -118,25 +118,31 @@ fn set_data(hwnd: HWND, data: &BarData) {
 }
 
 /// Width in pixels of `text` in `font` at `scale`, measured on a screen DC.
-fn measure_text(font: &Font, scale: f32, text: &str) -> i32 {
-    let hfont = gdi::font(&font.family, font.size_pt, scale);
-    let wide: Vec<u16> = text.encode_utf16().collect();
-    let mut size = SIZE::default();
+/// With `markup`, `text` is parsed and measured run by run.
+fn measure_text(font: &Font, scale: f32, text: &str, markup: bool) -> i32 {
     // SAFETY: the screen DC is released and the previous font restored.
     unsafe {
         let hdc = GetDC(None);
         if hdc.is_invalid() {
             return 0;
         }
-        let old = SelectObject(hdc, hfont);
-        let ok = GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool();
-        SelectObject(hdc, old);
-        ReleaseDC(None, hdc);
-        if ok {
-            size.cx
+        let width = if markup {
+            gdi::measure_runs(hdc, &parse_markup(text), font, scale)
         } else {
-            0
-        }
+            let hfont = gdi::font(&font.family, font.size_pt, scale);
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let mut size = SIZE::default();
+            let old = SelectObject(hdc, hfont);
+            let ok = GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool();
+            SelectObject(hdc, old);
+            if ok {
+                size.cx
+            } else {
+                0
+            }
+        };
+        ReleaseDC(None, hdc);
+        width
     }
 }
 
@@ -190,6 +196,7 @@ impl Bars {
                 strip_name: bar.strip_workspace_name,
                 workspace_min_width: bar.workspace_min_width,
                 separator_symbol: bar.separator_symbol.as_deref(),
+                mode_markup: wm.config.mode_markup.contains(&wm.mode),
                 padding: bar.padding,
             };
             let layout = layout_bar(
@@ -200,13 +207,7 @@ impl Bars {
                 mode,
                 blocks,
                 &style,
-                &|t, markup| {
-                    if markup {
-                        measure_text(&font, scale, &i3win_core::markup::plain_text(t))
-                    } else {
-                        measure_text(&font, scale, t)
-                    }
-                },
+                &|t, markup| measure_text(&font, scale, t, markup),
             );
             let data = BarData {
                 layout,
@@ -302,55 +303,63 @@ fn wheel_steps(acc: &mut i32, delta: i32) -> i32 {
     steps
 }
 
-fn to_rect(r: Rect) -> RECT {
-    RECT {
-        left: r.x,
-        top: r.y,
-        right: r.right(),
-        bottom: r.bottom(),
-    }
-}
-
 fn paint(hwnd: HWND, data: &BarData) {
     let font = gdi::font(&data.font.family, data.font.size_pt, data.scale);
     let s3 = (3.0 * data.scale).round() as i32;
     gdi::paint_buffered(hwnd, |hdc, client| {
         gdi::fill(hdc, client, data.layout.background);
         for item in &data.layout.items {
+            let r = item.rect;
             if let Some(bg) = item.bg {
-                gdi::fill(hdc, item.rect, bg);
+                gdi::fill(hdc, r, bg);
             }
             if let Some(b) = item.border {
-                gdi::outline(hdc, item.rect, b);
+                let [l, t, rt, bt] = item.borders;
+                gdi::fill(hdc, Rect::new(r.x, r.y, l, r.h), b);
+                gdi::fill(hdc, Rect::new(r.right() - rt, r.y, rt, r.h), b);
+                gdi::fill(hdc, Rect::new(r.x, r.y, r.w, t), b);
+                gdi::fill(hdc, Rect::new(r.x, r.bottom() - bt, r.w, bt), b);
             }
-            let text = if item.markup {
-                i3win_core::markup::plain_text(&item.text)
-            } else {
-                item.text.clone()
-            };
-            let mut wide: Vec<u16> = text.encode_utf16().collect();
-            let mut rc = to_rect(item.rect);
-            rc.left = item.text_x;
-            // SAFETY: `wide` and `rc` outlive the calls; the old font is restored.
-            unsafe {
-                let old = SelectObject(hdc, font);
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, gdi::colorref(item.fg));
-                DrawTextW(
+            let text_area = Rect::new(
+                item.text_x,
+                r.y,
+                (r.right() - item.borders[2] - item.text_x).max(0),
+                r.h,
+            );
+            if item.markup {
+                gdi::draw_runs(
                     hdc,
-                    &mut wide,
-                    &mut rc,
-                    DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
+                    item.text_x,
+                    r.inset(
+                        item.borders[0],
+                        item.borders[1],
+                        item.borders[2],
+                        item.borders[3],
+                    ),
+                    &parse_markup(&item.text),
+                    item.fg,
+                    &data.font,
+                    data.scale,
                 );
-                SelectObject(hdc, old);
+            } else {
+                gdi::draw_text(hdc, text_area, &item.text, item.fg, font);
             }
         }
+        let content = data.layout.content;
         for sep in &data.layout.separators {
-            gdi::fill(
-                hdc,
-                Rect::new(sep.x, s3, 1, (client.h - 2 * s3).max(0)),
-                data.layout.separator_color,
-            );
+            let color = data.layout.separator_color;
+            match &sep.symbol {
+                Some(sym) => {
+                    let w = measure_text(&data.font, data.scale, sym, false);
+                    let area = Rect::new(sep.x - w / 2, content.y, w, content.h);
+                    gdi::draw_text(hdc, area, sym, color, font);
+                }
+                None => gdi::fill(
+                    hdc,
+                    Rect::new(sep.x, content.y + s3, 1, (content.h - 2 * s3).max(0)),
+                    color,
+                ),
+            }
         }
     });
 }

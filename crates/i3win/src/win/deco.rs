@@ -6,14 +6,15 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use i3win_core::arrange::{Arrangement, Deco, Tab};
-use i3win_core::config::{ClientColors, Config, Font};
+use i3win_core::config::{ClientColors, Color, Config, Font};
 use i3win_core::geom::Rect;
+use i3win_core::markup::parse_markup;
 use i3win_core::tree::{NodeId, WindowId};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{InvalidateRect, HBRUSH};
+use windows::Win32::Graphics::Gdi::{InvalidateRect, HBRUSH, HDC, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -263,6 +264,31 @@ fn window_icon(id: WindowId, deco: HWND) -> Option<HICON> {
     (raw != 0).then_some(HICON(raw as *mut _))
 }
 
+/// Draws a title as markup runs or plain text.
+fn draw_title(
+    hdc: HDC,
+    r: Rect,
+    title: &str,
+    markup: bool,
+    fg: Color,
+    font: HFONT,
+    data: &DecoData,
+) {
+    if markup {
+        gdi::draw_runs(
+            hdc,
+            r.x,
+            r,
+            &parse_markup(title),
+            fg,
+            &data.font,
+            data.scale,
+        );
+    } else {
+        gdi::draw_text(hdc, r, title, fg, font);
+    }
+}
+
 fn paint(hwnd: HWND, data: &DecoData) {
     let font = gdi::font(&data.font.family, data.font.size_pt, data.scale);
     let inset = (4.0 * data.scale).round() as i32;
@@ -270,6 +296,7 @@ fn paint(hwnd: HWND, data: &DecoData) {
         Deco::Frame {
             title_rect,
             title,
+            markup,
             state,
             icon,
             ..
@@ -307,7 +334,7 @@ fn paint(hwnd: HWND, data: &DecoData) {
                         text = text.inset(used, 0, 0, 0);
                     }
                 }
-                gdi::draw_text(hdc, text, title, cc.text, font);
+                draw_title(hdc, text, title, *markup, cc.text, font, data);
             }
         }
         Deco::TabBar { rect, tabs, .. } => {
@@ -316,7 +343,15 @@ fn paint(hwnd: HWND, data: &DecoData) {
                 let r = Rect::new(t.rect.x - rect.x, t.rect.y - rect.y, t.rect.w, t.rect.h);
                 gdi::fill(hdc, r, cc.background);
                 gdi::outline(hdc, r, cc.border);
-                gdi::draw_text(hdc, r.inset(inset, 0, inset, 0), &t.title, cc.text, font);
+                draw_title(
+                    hdc,
+                    r.inset(inset, 0, inset, 0),
+                    &t.title,
+                    t.markup,
+                    cc.text,
+                    font,
+                    data,
+                );
             }
         }
     });
@@ -373,12 +408,14 @@ mod tests {
         let tabs = vec![
             Tab {
                 title: "a".into(),
+                markup: false,
                 state: DecoState::Unfocused,
                 rect: Rect::new(100, 0, 50, 20),
                 node: NodeId(1),
             },
             Tab {
                 title: "b".into(),
+                markup: false,
                 state: DecoState::Focused,
                 rect: Rect::new(150, 0, 50, 20),
                 node: NodeId(2),
