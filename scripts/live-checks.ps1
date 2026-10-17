@@ -205,6 +205,28 @@ Check 'plan5 gaps inner current set 20 changes rects' ($null -ne (Compare-Object
 $null = Msg gaps inner current set 0
 Start-Sleep -Milliseconds 400
 
+# ---- Plan 6: bar (default config, one bar)
+$bar = [U]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, 'i3win_bar', $null)
+Check 'plan6 bar window exists' ($bar -ne [IntPtr]::Zero)
+$maxBottom = ($h | ForEach-Object { [U]::Rect($_).B } | Measure-Object -Maximum).Maximum
+$br = [U]::Rect($bar)
+Check 'plan6 bar sits at the bottom, below the tiled windows' ([U]::IsWindowVisible($bar) -and $br.T -ge ($maxBottom - 2) -and $br.B -gt $br.T) "bar=$br maxBottom=$maxBottom"
+$r = Msg -t get_bar_config
+Check 'plan6 get_bar_config lists bar-0' ($r.out -match '^\[\s*"bar-0"\s*\]$') $r.out
+$hb = [U]::Rect($h[0]); $heightBefore = $hb.B - $hb.T
+$null = Msg bar mode hide
+Start-Sleep -Milliseconds 700
+$bar = [U]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, 'i3win_bar', $null)
+Check 'plan6 bar mode hide hides the bar' (($bar -eq [IntPtr]::Zero) -or -not [U]::IsWindowVisible($bar))
+$hb = [U]::Rect($h[0])
+Check 'plan6 bar mode hide grows the Notepads' (($hb.B - $hb.T) -gt $heightBefore) "before=$heightBefore after=$($hb.B - $hb.T)"
+$null = Msg bar mode dock
+Start-Sleep -Milliseconds 700
+$bar = [U]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, 'i3win_bar', $null)
+Check 'plan6 bar mode dock restores the bar' (($bar -ne [IntPtr]::Zero) -and [U]::IsWindowVisible($bar))
+$hb = [U]::Rect($h[0])
+Check 'plan6 bar mode dock restores the Notepad height' (($hb.B - $hb.T) -eq $heightBefore) "before=$heightBefore after=$($hb.B - $hb.T)"
+
 # ---- crash recovery: taskkill on ws2
 Combo @($ALT) 0x32
 $vis = @($h | Where-Object { [U]::IsWindowVisible($_) })

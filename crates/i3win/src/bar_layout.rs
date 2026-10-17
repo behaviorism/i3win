@@ -1,7 +1,7 @@
 //! Pure bar layout: positions workspace buttons, the mode indicator and status
 //! blocks, with text measurement injected so it is testable without GDI.
 use i3win_core::bar_model::WorkspaceButton;
-use i3win_core::config::{parse_color, BarColorTriple, BarColors, Color};
+use i3win_core::config::{parse_color, BarBinding, BarColorTriple, BarColors, Color};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::{Block, MinWidth};
 
@@ -335,6 +335,15 @@ pub fn hit_test(layout: &BarLayout, x: i32, y: i32) -> Option<&BarItem> {
     })
 }
 
+/// The command bound to mouse `button` (i3 numbering) for a press or, when
+/// `release` is set, a release.
+pub fn bar_binding_for(bindings: &[BarBinding], button: u8, release: bool) -> Option<&str> {
+    bindings
+        .iter()
+        .find(|b| b.button == button && b.release == release)
+        .map(|b| b.command.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,5 +663,24 @@ mod tests {
         assert_eq!(l.items[0].rect.x, 6);
         assert_eq!((l.items[0].rect.y, l.items[0].rect.h), (2, 15));
         assert_eq!(l.items[2].rect.right(), 400 - 4 - 4);
+    }
+
+    #[test]
+    fn bar_binding_lookup() {
+        let b = vec![
+            BarBinding {
+                button: 4,
+                release: false,
+                command: "workspace prev".into(),
+            },
+            BarBinding {
+                button: 3,
+                release: true,
+                command: "nop".into(),
+            },
+        ];
+        assert_eq!(bar_binding_for(&b, 4, false), Some("workspace prev"));
+        assert_eq!(bar_binding_for(&b, 3, false), None);
+        assert_eq!(bar_binding_for(&b, 3, true), Some("nop"));
     }
 }

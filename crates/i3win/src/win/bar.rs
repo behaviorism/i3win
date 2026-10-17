@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use i3win_core::arrange::{bar_applies, bar_height_of, Arrangement};
 use i3win_core::bar_model::workspace_buttons;
-use i3win_core::config::{BarMode, BarPosition, Font, HiddenState};
+use i3win_core::config::{BarBinding, BarMode, BarPosition, Font, HiddenState};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::{Block, Click};
 use i3win_core::markup::parse_markup;
@@ -26,7 +26,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::bar_layout::{click_command, hit_test, layout_bar, BarLayout, BarStyle, ItemKind};
+use crate::bar_layout::{
+    bar_binding_for, click_command, hit_test, layout_bar, BarLayout, BarStyle, ItemKind,
+};
 use crate::mainloop::{self, MainMsg};
 use crate::win::gdi;
 
@@ -39,6 +41,8 @@ pub struct BarData {
     pub font: Font,
     pub scale: f32,
     pub blocks: Vec<Block>,
+    /// The bar's `bindsym button<N>` entries, so the window proc needs no `App`.
+    pub bindings: Vec<BarBinding>,
 }
 
 struct BarWindow {
@@ -238,6 +242,7 @@ impl Bars {
                     font: font.clone(),
                     scale,
                     blocks: bar_blocks.clone(),
+                    bindings: bar.bindings.clone(),
                 };
                 let mut created = false;
                 if let Some(bw) = self.windows.get_mut(&key) {
@@ -337,6 +342,8 @@ impl Bars {
 thread_local! {
     /// Wheel delta not yet worth a full notch (touchpads send small deltas).
     static WHEEL_ACC: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// Same for the horizontal wheel.
+    static HWHEEL_ACC: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 /// Adds `delta` to the accumulator and returns whole notches: positive is wheel
@@ -501,25 +508,57 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 _ => 3,
             };
             if let Some(data) = ptr.as_ref() {
-                click(hwnd, data, button, lp);
+                match bar_binding_for(&data.bindings, button, false) {
+                    Some(cmd) => mainloop::post(MainMsg::RunCommand(cmd.into())),
+                    None => click(hwnd, data, button, lp),
+                }
             }
             LRESULT(0)
         }
-        WM_MOUSEWHEEL => {
+        WM_LBUTTONUP | WM_MBUTTONUP | WM_RBUTTONUP => {
+            let button = match msg {
+                WM_LBUTTONUP => 1,
+                WM_MBUTTONUP => 2,
+                _ => 3,
+            };
+            if let Some(cmd) = ptr
+                .as_ref()
+                .and_then(|d| bar_binding_for(&d.bindings, button, true))
+            {
+                mainloop::post(MainMsg::RunCommand(cmd.into()));
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let horizontal = msg == WM_MOUSEHWHEEL;
             let delta = ((wp.0 >> 16) & 0xffff) as i16 as i32;
-            let steps = WHEEL_ACC.with(|a| {
+            let acc_cell = if horizontal { &HWHEEL_ACC } else { &WHEEL_ACC };
+            let steps = acc_cell.with(|a| {
                 let mut acc = a.get();
                 let n = wheel_steps(&mut acc, delta);
                 a.set(acc);
                 n
             });
-            let cmd = if steps > 0 {
-                "workspace prev"
-            } else {
-                "workspace next"
+            // i3 numbering: 4 up, 5 down, 6 left, 7 right.
+            let button = match (horizontal, steps > 0) {
+                (false, true) => 4,
+                (false, false) => 5,
+                (true, true) => 7,
+                (true, false) => 6,
             };
-            for _ in 0..steps.unsigned_abs() {
-                mainloop::post(MainMsg::RunCommand(cmd.into()));
+            let bound = ptr
+                .as_ref()
+                .and_then(|d| bar_binding_for(&d.bindings, button, false));
+            // Unbound vertical wheel keeps the v1 workspace prev/next default.
+            let cmd = bound.or(match button {
+                4 => Some("workspace prev"),
+                5 => Some("workspace next"),
+                _ => None,
+            });
+            if let Some(cmd) = cmd {
+                for _ in 0..steps.unsigned_abs() {
+                    mainloop::post(MainMsg::RunCommand(cmd.into()));
+                }
             }
             LRESULT(0)
         }

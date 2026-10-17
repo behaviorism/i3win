@@ -67,3 +67,15 @@ Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 e
 3. `hide_edge_borders both` + reload -> borders on edges touching the screen edge are not drawn.
 4. `bindcode $mod+38 exec notepad` -> Alt+A opens Notepad on any keyboard layout (e.g. German, French AZERTY).
 5. `bindsym --release $mod+x exec notepad` -> Notepad opens on key up, not key down.
+
+## Plan 6: bar markup and layout
+
+1. A status script emitting `markup: "pango"` with `<b>` and colored `<span foreground="...">` renders bold / colored text in the bar.
+2. A block with `short_text` shows the short form on a narrow monitor (or when the bar is crowded).
+3. `min_width` + `align` on a block: the text is padded to the minimum width and aligned left/center/right as set.
+4. `separator_symbol " | "` draws that text between blocks instead of the separator line.
+5. `strip_workspace_numbers yes` with `workspace "1: mail"` -> the button reads `mail`.
+6. Two `bar {}` blocks stack (same edge: one above the other; different positions: one top, one bottom).
+7. `mode hide` -> the bar shows only while Win is held (or on urgency); `mode dock` keeps it visible.
+8. `bindsym button3 exec notepad` inside `bar {}` -> right-clicking the bar opens Notepad (and does not trigger the default click action); `bindsym --release button3 ...` fires on button release; `button4`/`button5` override the wheel's workspace prev/next; `button6`/`button7` fire on horizontal wheel left/right.
+9. `title_format "<b>%title</b>"` renders bold window titles in title bars.
