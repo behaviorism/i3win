@@ -1,5 +1,6 @@
 use crate::command::{parse_commands, BorderArg, Command, TitleIconArg, WorkspaceTarget};
 use crate::config::{Border, Config};
+use crate::criteria::select_matches;
 use crate::geom::{sanitize_floating, Rect};
 use crate::keys::KeyCombo;
 use crate::tree::{Layout, NodeId, NodeKind, Tree, WindowData, WindowId, WindowInfo};
@@ -64,6 +65,8 @@ pub struct Wm {
     pub(crate) effects: Vec<Effect>,
     /// Computer name (for `%machine` in title_format); set by the platform.
     pub machine: String,
+    /// Incremented each time a window becomes urgent (orders `urgent=latest|oldest`).
+    pub(crate) urgent_counter: u64,
 }
 
 fn workspace_num(name: &str) -> Option<i32> {
@@ -97,6 +100,7 @@ impl Wm {
             focused_container: None,
             effects: Vec::new(),
             machine: String::new(),
+            urgent_counter: 0,
         };
         let outputs = if outputs.is_empty() {
             vec![OutputInfo {
@@ -338,16 +342,12 @@ impl Wm {
         let id = info.id;
         let wants_float = info.wants_float;
         let rect = info.rect;
-        let (class, instance, title) = (
-            info.class.clone(),
-            info.instance.clone(),
-            info.title.clone(),
-        );
         let node = self.tree.new_node(
             NodeKind::Window(WindowData {
                 info,
                 floating_rect: None,
                 urgent: false,
+                urgent_since: 0,
             }),
             Layout::SplitH,
         );
@@ -380,7 +380,7 @@ impl Wm {
             .config
             .for_window
             .iter()
-            .filter(|(c, _)| c.matches(&class, &instance, &title))
+            .filter(|(c, _)| c.matches_node(self, node))
             .map(|(_, cmd)| cmd.clone())
             .collect();
         for text in cmds {
@@ -454,8 +454,11 @@ impl Wm {
             }
             self.emit_window("focus", id);
         } else {
+            self.urgent_counter += 1;
+            let seq = self.urgent_counter;
             if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
                 d.urgent = true;
+                d.urgent_since = seq;
             }
             if let Some(w) = self.focus_leaf_window() {
                 self.push_focus(w);
@@ -501,18 +504,7 @@ impl Wm {
         let before = self.focus_leaf_window();
         let mut results = Vec::new();
         for g in groups {
-            let matched: Option<Vec<NodeId>> = g.criteria.as_ref().map(|c| {
-                self.tree
-                    .windows_under(self.tree.root())
-                    .into_iter()
-                    .filter(|&n| match &self.tree.get(n).kind {
-                        NodeKind::Window(d) => {
-                            c.matches(&d.info.class, &d.info.instance, &d.info.title)
-                        }
-                        _ => false,
-                    })
-                    .collect()
-            });
+            let matched: Option<Vec<NodeId>> = g.criteria.as_ref().map(|c| select_matches(self, c));
             for cmd in &g.commands {
                 let mut targets = match &matched {
                     Some(t) => t.clone(),

@@ -58,6 +58,8 @@ pub struct WindowData {
     pub info: WindowInfo,
     pub floating_rect: Option<Rect>,
     pub urgent: bool,
+    /// Value of `Wm::urgent_counter` when the window last became urgent.
+    pub urgent_since: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -477,6 +479,7 @@ mod tests {
                 },
                 floating_rect: None,
                 urgent: false,
+                urgent_since: 0,
             }),
             Layout::SplitH,
         )
