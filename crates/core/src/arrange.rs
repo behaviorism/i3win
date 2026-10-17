@@ -520,7 +520,7 @@ mod tests {
         wm.config.default_border = Border::None;
         wm.manage(win(1));
         assert_eq!(bar_height(&wm.config, 1.0), Some(22));
-        assert_eq!(placement(&wm.arrange(), 1), Rect::new(0, 22, 1000, 478));
+        assert_eq!(placement(&wm.arrange(), 1), Rect::new(0, 0, 1000, 478));
     }
     #[test]
     fn fullscreen_covers_output_and_hides_rest() {

@@ -23,7 +23,10 @@ pub fn win(n: isize) -> WindowInfo {
 }
 
 pub fn test_wm() -> Wm {
-    Wm::new(Config::default(), vec![out("O1", 0, 1000)])
+    // Geometry tests assume 9pt titles (20px title bar), not i3's 8pt default.
+    let mut config = Config::default();
+    config.font.size_pt = 9.0;
+    Wm::new(config, vec![out("O1", 0, 1000)])
 }
 
 pub fn ws_desc(wm: &Wm) -> String {

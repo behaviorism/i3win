@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use i3win_core::arrange::DecoState;
-use i3win_core::config::{ClientColors, Color, ColorClass};
+use i3win_core::config::{resolve_font_family, ClientColors, Color, ColorClass};
 use i3win_core::geom::Rect;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
@@ -45,7 +45,7 @@ pub fn font(family: &str, size_pt: f32, scale: f32) -> HFONT {
             return HFONT(h as *mut _);
         }
         let height = -((size_pt * 96.0 / 72.0 * scale).round() as i32);
-        let mut face: Vec<u16> = family.encode_utf16().collect();
+        let mut face: Vec<u16> = resolve_font_family(family).encode_utf16().collect();
         face.truncate(31);
         face.push(0);
         // SAFETY: `face` is NUL-terminated and outlives the call.

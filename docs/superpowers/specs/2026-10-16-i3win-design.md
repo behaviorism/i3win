@@ -99,7 +99,7 @@ Lines are trimmed. `#` starts a comment (only at the beginning of a line). A tra
 - `bar { position top|bottom; status_command cmd; font ...; height N; workspace_buttons yes|no; colors { background, statusline, separator, focused_workspace b bg t, active_workspace, inactive_workspace, urgent_workspace, binding_mode } }`
 - Anything else: log a warning and skip it.
 
-i3win default bar position is `top`, because the Windows taskbar usually sits at the bottom. **[call]**
+Default bar position is `bottom`, as in i3 (v2 spec).
 
 Default config: the i3 default config, adapted. `$mod` is `Mod1` (Alt), because Win-key combinations collide with the OS and Win+L can't be intercepted at all. **[call]** `$mod+Return` runs `exec wt`, falling back to `cmd` if Windows Terminal isn't on PATH. `$mod+d` opens the Windows Run dialog.
 

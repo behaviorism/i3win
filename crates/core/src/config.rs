@@ -289,7 +289,7 @@ impl Default for BarColors {
 impl Default for BarConfig {
     fn default() -> Self {
         BarConfig {
-            position: BarPosition::Top,
+            position: BarPosition::Bottom,
             status_command: None,
             font: None,
             height: None,
@@ -301,6 +301,16 @@ impl Default for BarConfig {
 impl Default for Config {
     fn default() -> Self {
         parse_config("")
+    }
+}
+
+/// Maps i3's generic font family names to Windows font faces.
+pub fn resolve_font_family(name: &str) -> &str {
+    match name.to_ascii_lowercase().as_str() {
+        "monospace" => "Consolas",
+        "sans" | "sans-serif" => "Segoe UI",
+        "serif" => "Times New Roman",
+        _ => name,
     }
 }
 
@@ -434,8 +444,8 @@ pub fn parse_config(text: &str) -> Config {
         exec: Vec::new(),
         exec_always: Vec::new(),
         font: Font {
-            family: "Segoe UI".into(),
-            size_pt: 9.0,
+            family: "monospace".into(),
+            size_pt: 8.0,
         },
         default_border: Border::Normal(2),
         default_floating_border: Border::Normal(2),
@@ -958,13 +968,56 @@ mod tests {
         assert_eq!(
             c.font,
             Font {
-                family: "Segoe UI".into(),
-                size_pt: 9.0
+                family: "monospace".into(),
+                size_pt: 8.0
             }
         );
         assert_eq!(c.default_border, Border::Normal(2));
         assert!(c.bindings.contains_key("default") && c.bar.is_none());
         assert_eq!(c.colors.focused.background, Color(0x28, 0x55, 0x77));
+    }
+    #[test]
+    fn defaults_match_i3() {
+        let c = parse_config("bar {\n}\n");
+        assert_eq!(c.bar.as_ref().unwrap().position, BarPosition::Bottom);
+        assert_eq!(
+            c.font,
+            Font {
+                family: "monospace".into(),
+                size_pt: 8.0
+            }
+        );
+        assert_eq!(c.default_border, Border::Normal(2));
+    }
+    #[test]
+    fn font_family_aliases() {
+        assert_eq!(resolve_font_family("monospace"), "Consolas");
+        assert_eq!(resolve_font_family("Monospace"), "Consolas");
+        assert_eq!(resolve_font_family("sans"), "Segoe UI");
+        assert_eq!(resolve_font_family("sans-serif"), "Segoe UI");
+        assert_eq!(resolve_font_family("serif"), "Times New Roman");
+        assert_eq!(resolve_font_family("DejaVu Sans Mono"), "DejaVu Sans Mono");
+    }
+    #[test]
+    fn default_config_text_is_i3s() {
+        let t = default_config_text(true);
+        for line in [
+            "set $mod Mod1",
+            "font pango:monospace 8",
+            "floating_modifier $mod",
+            "tiling_drag modifier titlebar",
+            "focus_follows_mouse no",
+            "bindsym $mod+Return exec wt",
+            "bindsym $mod+Shift+e exit",
+            "bindsym $mod+r mode \"resize\"",
+            "status_command i3win-status",
+        ] {
+            assert!(t.contains(line), "missing: {line}");
+        }
+        assert!(!t.contains("position"));
+        assert!(default_config_text(false).contains("bindsym $mod+Return exec cmd"));
+        let c = parse_config(&t);
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
     }
     #[test]
     fn variables_and_bindsym() {
