@@ -82,6 +82,10 @@ pub enum Command {
     FocusTiling,
     FocusMatched,
     FocusOutput(OutputTarget),
+    FocusNext {
+        forward: bool,
+        sibling: bool,
+    },
     /// Optional "N px" (floating only).
     Move(Direction, Option<i32>),
     MoveToWorkspace(WorkspaceTarget),
@@ -516,6 +520,14 @@ fn parse_one(seg: &str) -> Result<Command, String> {
             Some("mode_toggle") => Ok(Command::FocusModeToggle),
             Some("floating") => Ok(Command::FocusFloating),
             Some("tiling") => Ok(Command::FocusTiling),
+            Some(w @ ("next" | "prev")) => Ok(Command::FocusNext {
+                forward: w == "next",
+                sibling: match args.get(1).map(|s| s.0.as_str()) {
+                    None => false,
+                    Some("sibling") => true,
+                    Some(o) => return Err(format!("bad focus {w} argument: {o}")),
+                },
+            }),
             Some("output") => {
                 let t = args.get(1).ok_or("focus output: missing target")?;
                 Ok(Command::FocusOutput(output_target(t)))
@@ -709,6 +721,13 @@ mod tests {
     fn focus_variants() {
         assert_eq!(one("focus left"), Command::Focus(Direction::Left));
         assert_eq!(one("focus"), Command::FocusMatched);
+        assert_eq!(
+            one("focus prev sibling"),
+            Command::FocusNext {
+                forward: false,
+                sibling: true
+            }
+        );
         assert_eq!(
             one("focus output DISPLAY2"),
             Command::FocusOutput(OutputTarget::Name("DISPLAY2".into()))

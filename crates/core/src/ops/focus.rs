@@ -1,3 +1,4 @@
+use crate::config::FocusWrapping;
 use crate::geom::Direction;
 use crate::tree::{NodeId, NodeKind};
 use crate::wm::Wm;
@@ -22,16 +23,32 @@ impl Wm {
             self.focus_in_place(floating[j]);
             return Ok(());
         }
+        let wrapping = self.config.focus_wrapping;
+        let mut outermost: Option<NodeId> = None;
         let mut cur = from;
         loop {
             if matches!(self.tree.get(cur).kind, NodeKind::Workspace { .. }) {
-                self.focus_adjacent_output(cur, dir);
+                let adjacent = wrapping != FocusWrapping::Workspace
+                    && self
+                        .tree
+                        .output_of(cur)
+                        .and_then(|o| self.output_in_direction(o, dir))
+                        .is_some();
+                if wrapping == FocusWrapping::No || adjacent {
+                    self.focus_adjacent_output(cur, dir);
+                } else if let Some(p) = outermost {
+                    self.wrap_focus(p, dir);
+                }
                 return Ok(());
             }
             let Some(p) = self.tree.parent(cur) else {
                 return Ok(());
             };
             if self.tree.get(p).layout.orientation() == dir.orientation() {
+                let multi = self.tree.get(p).children.len() >= 2;
+                if multi {
+                    outermost = Some(p);
+                }
                 if let Some(i) = self.tree.index_in_parent(cur) {
                     let sibling = if dir.is_forward() {
                         self.tree.get(p).children.get(i + 1)
@@ -45,8 +62,63 @@ impl Wm {
                         return Ok(());
                     }
                 }
+                if multi && wrapping == FocusWrapping::Force {
+                    self.wrap_focus(p, dir);
+                    return Ok(());
+                }
             }
             cur = p;
+        }
+    }
+
+    /// Focuses the focused tiling descendant of `p`'s first (forward) or
+    /// last (backward) child.
+    fn wrap_focus(&mut self, p: NodeId, dir: Direction) {
+        let children = &self.tree.get(p).children;
+        let target = if dir.is_forward() {
+            children.first()
+        } else {
+            children.last()
+        };
+        if let Some(&c) = target {
+            let f = self.tree.focused_tiling_descendant(c);
+            self.focus_in_place(f);
+        }
+    }
+
+    /// `focus next|prev [sibling]`: cycles through the focused node's
+    /// siblings, wrapping around.
+    pub fn focus_next(&mut self, from: NodeId, forward: bool, sibling: bool) {
+        self.focused_container = None;
+        let siblings: Vec<NodeId> = if self.tree.is_floating(from) {
+            match self.tree.workspace_of(from) {
+                Some(ws) => self.tree.get(ws).floating.clone(),
+                None => return,
+            }
+        } else {
+            match self.tree.parent(from) {
+                Some(p) => self.tree.get(p).children.clone(),
+                None => return,
+            }
+        };
+        let Some(i) = siblings.iter().position(|&n| n == from) else {
+            return;
+        };
+        let len = siblings.len();
+        let s = siblings[if forward {
+            (i + 1) % len
+        } else {
+            (i + len - 1) % len
+        }];
+        if sibling || self.tree.is_floating(s) {
+            self.focus_in_place(s);
+            if matches!(self.tree.get(s).kind, NodeKind::Container) {
+                let leaf = self.tree.focused_descendant(s);
+                self.focused_container = Some((s, leaf));
+            }
+        } else {
+            let f = self.tree.focused_tiling_descendant(s);
+            self.focus_in_place(f);
         }
     }
 
@@ -164,9 +236,70 @@ mod tests {
     fn focus_title(wm: &Wm) -> String {
         wm.tree.describe(wm.focused())
     }
+    fn wm_with(fw: &str) -> Wm {
+        let cfg = crate::config::parse_config(&format!("focus_wrapping {fw}\n"));
+        let mut wm = Wm::new(cfg, vec![out("O1", 0, 1000)]);
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.manage(win(3));
+        wm
+    }
+    #[test]
+    fn focus_wrapping_modes() {
+        let mut wm = wm_with("yes");
+        wm.run_command("focus right");
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        let mut wm = wm_with("no");
+        wm.run_command("focus right");
+        assert_eq!(wm.focused_window(), Some(WindowId(3)));
+        let mut wm = wm_with("workspace");
+        wm.run_command("focus right");
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+    }
+    #[test]
+    fn focus_wrapping_force_stays_in_parent() {
+        let mut wm = wm_with("force");
+        wm.run_command("split v");
+        wm.manage(win(4));
+        wm.run_command("focus down");
+        assert_eq!(wm.focused_window(), Some(WindowId(3)));
+    }
+    #[test]
+    fn focus_wrapping_yes_prefers_other_output() {
+        let cfg = crate::config::parse_config("focus_wrapping yes\n");
+        let mut wm = Wm::new(cfg, vec![out("A", 0, 1000), out("B", 1000, 1000)]);
+        wm.manage(win(1));
+        wm.run_command("focus right");
+        assert_eq!(wm.focused_output(), wm.outputs()[1]);
+    }
+    #[test]
+    fn focus_next_prev() {
+        let mut wm = wm_with("yes");
+        wm.run_command("focus next");
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        wm.run_command("focus prev");
+        assert_eq!(wm.focused_window(), Some(WindowId(3)));
+    }
+    #[test]
+    fn focus_next_sibling_selects_container() {
+        let mut wm = wm_with("yes");
+        let n3 = wm.tree.window_node(WindowId(3)).unwrap();
+        let c = wm.tree.wrap(n3, Layout::SplitV);
+        wm.tree
+            .set_focused(wm.tree.window_node(WindowId(1)).unwrap());
+        wm.run_command("focus next sibling");
+        assert_eq!(wm.focused(), wm.tree.window_node(WindowId(2)).unwrap());
+        wm.run_command("focus next sibling");
+        assert_eq!(wm.focused(), c);
+        wm.run_command("focus prev");
+        assert_eq!(wm.focused_window(), Some(WindowId(2)));
+    }
     #[test]
     fn left_right_in_split() {
-        let mut wm = test_wm();
+        let mut wm = Wm::new(
+            crate::config::parse_config("focus_wrapping no\n"),
+            vec![out("O1", 0, 1000)],
+        );
         wm.manage(win(1));
         wm.manage(win(2));
         wm.manage(win(3));

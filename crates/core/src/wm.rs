@@ -648,6 +648,7 @@ impl Wm {
                 return self.rename_workspace(old.as_deref(), new)
             }
             Command::Focus(d) => return self.focus_direction(target, *d),
+            Command::FocusNext { forward, sibling } => self.focus_next(target, *forward, *sibling),
             Command::FocusParent => self.focus_parent(target),
             Command::FocusChild => self.focus_child(target),
             Command::FocusModeToggle => self.focus_layer(target, None),
