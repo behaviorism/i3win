@@ -49,6 +49,9 @@ pub struct BarColors {
     pub inactive_workspace: BarColorTriple,
     pub urgent_workspace: BarColorTriple,
     pub binding_mode: BarColorTriple,
+    pub focused_background: Option<Color>,
+    pub focused_statusline: Option<Color>,
+    pub focused_separator: Option<Color>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarPosition {
@@ -67,6 +70,18 @@ pub enum BarMode {
     Hide,
     Invisible,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HiddenState {
+    #[default]
+    Hide,
+    Show,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BarBinding {
+    pub button: u8,
+    pub release: bool,
+    pub command: String,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct BarConfig {
     pub id: String,
@@ -78,6 +93,20 @@ pub struct BarConfig {
     pub height: Option<i32>,
     pub workspace_buttons: bool,
     pub colors: BarColors,
+    pub hidden_state: HiddenState,
+    /// Key that reveals a hidden bar; `None` for `modifier none`.
+    pub modifier: Option<Modifiers>,
+    pub separator_symbol: Option<String>,
+    pub strip_workspace_numbers: bool,
+    pub strip_workspace_name: bool,
+    pub binding_mode_indicator: bool,
+    /// Minimum workspace button width in px.
+    pub workspace_min_width: i32,
+    /// top, right, bottom, left in px.
+    pub padding: [i32; 4],
+    /// Whether the mode indicator text is pango markup.
+    pub mode_markup: bool,
+    pub bindings: Vec<BarBinding>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Border {
@@ -370,6 +399,9 @@ impl Default for BarColors {
             inactive_workspace: triple(0x333333, 0x222222, 0x888888),
             urgent_workspace: triple(0x2f343a, 0x900000, 0xffffff),
             binding_mode: triple(0x2f343a, 0x900000, 0xffffff),
+            focused_background: None,
+            focused_statusline: None,
+            focused_separator: None,
         }
     }
 }
@@ -385,6 +417,16 @@ impl Default for BarConfig {
             height: None,
             workspace_buttons: true,
             colors: BarColors::default(),
+            hidden_state: HiddenState::Hide,
+            modifier: Some(Modifiers::WIN),
+            separator_symbol: None,
+            strip_workspace_numbers: false,
+            strip_workspace_name: false,
+            binding_mode_indicator: true,
+            workspace_min_width: 0,
+            padding: [0; 4],
+            mode_markup: false,
+            bindings: Vec::new(),
         }
     }
 }
@@ -752,9 +794,82 @@ fn bar_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
                 _ => return Err(format!("bar: invalid workspace_buttons '{args}'")),
             }
         }
+        "hidden_state" => {
+            bar.hidden_state = match args {
+                "hide" => HiddenState::Hide,
+                "show" => HiddenState::Show,
+                _ => return Err(format!("bar: invalid hidden_state '{args}'")),
+            }
+        }
+        "modifier" => {
+            bar.modifier = if args == "none" {
+                None
+            } else {
+                Some(parse_modifiers(args).map_err(|_| format!("bar: invalid modifier '{args}'"))?)
+            }
+        }
+        "separator_symbol" => bar.separator_symbol = Some(unquote(args)).filter(|s| !s.is_empty()),
+        "strip_workspace_numbers" => bar.strip_workspace_numbers = bar_bool(kw, args)?,
+        "strip_workspace_name" => bar.strip_workspace_name = bar_bool(kw, args)?,
+        "binding_mode_indicator" => bar.binding_mode_indicator = bar_bool(kw, args)?,
+        "workspace_min_width" => {
+            bar.workspace_min_width = parse_px(args)
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| format!("bar: invalid workspace_min_width '{args}'"))?
+        }
+        "padding" => {
+            bar.padding =
+                parse_padding(args).ok_or_else(|| format!("bar: invalid padding '{args}'"))?
+        }
+        "tray_output" | "tray_padding" => {}
+        "bindsym" => {
+            let mut rest = args;
+            let mut release = false;
+            while first_token(rest).starts_with("--") {
+                release |= first_token(rest) == "--release";
+                rest = skip_tokens(rest, 1);
+            }
+            let button = first_token(rest)
+                .strip_prefix("button")
+                .and_then(|n| n.parse::<u8>().ok())
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| format!("bar bindsym: expected buttonN, got '{rest}'"))?;
+            let command = skip_tokens(rest, 1);
+            if command.is_empty() {
+                return Err("bar bindsym: missing command".to_string());
+            }
+            bar.bindings.push(BarBinding {
+                button,
+                release,
+                command: command.to_string(),
+            });
+        }
         _ => return Err(format!("unknown bar directive: {kw}")),
     }
     Ok(())
+}
+
+fn bar_bool(kw: &str, args: &str) -> Result<bool, String> {
+    parse_bool(kw, args).map_err(|e| format!("bar: {e}"))
+}
+
+fn parse_px(s: &str) -> Option<i32> {
+    s.strip_suffix("px").unwrap_or(s).trim().parse().ok()
+}
+
+/// CSS-style 1 to 4 value padding: top right bottom left.
+fn parse_padding(args: &str) -> Option<[i32; 4]> {
+    let v: Vec<i32> = args
+        .split_whitespace()
+        .map(parse_px)
+        .collect::<Option<_>>()?;
+    match v[..] {
+        [a] => Some([a, a, a, a]),
+        [v, h] => Some([v, h, v, h]),
+        [t, h, b] => Some([t, h, b, h]),
+        [t, r, b, l] => Some([t, r, b, l]),
+        _ => None,
+    }
 }
 
 fn bar_color_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
@@ -772,6 +887,9 @@ fn bar_color_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
         "inactive_workspace" => colors.inactive_workspace = parse_triple(args)?,
         "urgent_workspace" => colors.urgent_workspace = parse_triple(args)?,
         "binding_mode" => colors.binding_mode = parse_triple(args)?,
+        "focused_background" => colors.focused_background = Some(one(args)?),
+        "focused_statusline" => colors.focused_statusline = Some(one(args)?),
+        "focused_separator" => colors.focused_separator = Some(one(args)?),
         _ => return Err(format!("unknown bar colors directive: {kw}")),
     }
     Ok(())
@@ -1218,6 +1336,34 @@ output primary
         let c = parse_config("mode \"resize\" {\n bindsym Escape mode \"default\"\n}\n");
         assert_eq!(c.bindings["resize"][0].command, "mode \"default\"");
     }
+    #[test]
+    fn bar_options_parse() {
+        let c = parse_config("bar {\nmode hide\nhidden_state show\nmodifier Mod1\nseparator_symbol \" | \"\nstrip_workspace_numbers yes\nbinding_mode_indicator no\nworkspace_min_width 40\npadding 2px 4px\ntray_output primary\nbindsym button4 workspace prev\nbindsym --release button3 nop\ncolors {\nfocused_background #111111\n}\n}\n");
+        let b = &c.bars[0];
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert_eq!(b.mode, BarMode::Hide);
+        assert_eq!(b.hidden_state, HiddenState::Show);
+        assert_eq!(b.modifier, Some(Modifiers::ALT));
+        assert_eq!(b.separator_symbol.as_deref(), Some(" | "));
+        assert!(b.strip_workspace_numbers && !b.binding_mode_indicator);
+        assert_eq!(b.workspace_min_width, 40);
+        assert_eq!(b.padding, [2, 4, 2, 4]);
+        assert_eq!(b.bindings.len(), 2);
+        assert!(b.bindings[1].release);
+        assert_eq!(b.bindings[0].button, 4);
+        assert_eq!(b.colors.focused_background, Some(Color(0x11, 0x11, 0x11)));
+    }
+
+    #[test]
+    fn bar_padding_forms_and_modifier_none() {
+        assert_eq!(parse_padding("3"), Some([3; 4]));
+        assert_eq!(parse_padding("1 2 3"), Some([1, 2, 3, 2]));
+        assert_eq!(parse_padding("1 2 3 4px"), Some([1, 2, 3, 4]));
+        assert_eq!(parse_padding("1 2 3 4 5"), None);
+        let c = parse_config("bar {\nmodifier none\n}\n");
+        assert_eq!(c.bars[0].modifier, None);
+    }
+
     #[test]
     fn bar_block() {
         let c = parse_config("bar {\n position bottom\n status_command i3win-status --x\n colors {\n background #111111\n focused_workspace #010203 #040506 #070809\n }\n}\n");

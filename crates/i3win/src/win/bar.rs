@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use i3win_core::arrange::{bar_applies, bar_height_of, Arrangement};
 use i3win_core::bar_model::workspace_buttons;
-use i3win_core::config::{BarPosition, Color, Font};
+use i3win_core::config::{BarPosition, Font};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::{Block, Click};
 use i3win_core::tree::NodeKind;
@@ -17,7 +17,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, DrawTextW, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
-    MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX,
+    MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor, DT_LEFT, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -26,7 +26,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::bar_layout::{click_command, hit_test, layout_bar, BarLayout, ItemKind};
+use crate::bar_layout::{click_command, hit_test, layout_bar, BarLayout, BarStyle, ItemKind};
 use crate::mainloop::{self, MainMsg};
 use crate::win::gdi;
 
@@ -34,8 +34,6 @@ use crate::win::gdi;
 #[derive(Clone, Debug, PartialEq)]
 pub struct BarData {
     pub layout: BarLayout,
-    pub background: Color,
-    pub separator: Color,
     pub font: Font,
     pub scale: f32,
     pub blocks: Vec<Block>,
@@ -183,21 +181,35 @@ impl Bars {
             live.insert(name.clone());
             let r = bar_rect(o, bar.position, h);
             let buttons = workspace_buttons(wm, out);
+            let style = BarStyle {
+                colors: &bar.colors,
+                focused_output: buttons.iter().any(|b| b.focused),
+                show_buttons: bar.workspace_buttons,
+                show_mode: bar.binding_mode_indicator,
+                strip_numbers: bar.strip_workspace_numbers,
+                strip_name: bar.strip_workspace_name,
+                workspace_min_width: bar.workspace_min_width,
+                separator_symbol: bar.separator_symbol.as_deref(),
+                padding: bar.padding,
+            };
             let layout = layout_bar(
                 r.w,
                 r.h,
                 scale,
                 &buttons,
-                bar.workspace_buttons,
                 mode,
                 blocks,
-                &bar.colors,
-                &|t| measure_text(&font, scale, t),
+                &style,
+                &|t, markup| {
+                    if markup {
+                        measure_text(&font, scale, &i3win_core::markup::plain_text(t))
+                    } else {
+                        measure_text(&font, scale, t)
+                    }
+                },
             );
             let data = BarData {
                 layout,
-                background: bar.colors.background,
-                separator: bar.colors.separator,
                 font: font.clone(),
                 scale,
                 blocks: blocks.to_vec(),
@@ -303,7 +315,7 @@ fn paint(hwnd: HWND, data: &BarData) {
     let font = gdi::font(&data.font.family, data.font.size_pt, data.scale);
     let s3 = (3.0 * data.scale).round() as i32;
     gdi::paint_buffered(hwnd, |hdc, client| {
-        gdi::fill(hdc, client, data.background);
+        gdi::fill(hdc, client, data.layout.background);
         for item in &data.layout.items {
             if let Some(bg) = item.bg {
                 gdi::fill(hdc, item.rect, bg);
@@ -311,8 +323,14 @@ fn paint(hwnd: HWND, data: &BarData) {
             if let Some(b) = item.border {
                 gdi::outline(hdc, item.rect, b);
             }
-            let mut wide: Vec<u16> = item.text.encode_utf16().collect();
+            let text = if item.markup {
+                i3win_core::markup::plain_text(&item.text)
+            } else {
+                item.text.clone()
+            };
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
             let mut rc = to_rect(item.rect);
+            rc.left = item.text_x;
             // SAFETY: `wide` and `rc` outlive the calls; the old font is restored.
             unsafe {
                 let old = SelectObject(hdc, font);
@@ -322,16 +340,16 @@ fn paint(hwnd: HWND, data: &BarData) {
                     hdc,
                     &mut wide,
                     &mut rc,
-                    DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+                    DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
                 );
                 SelectObject(hdc, old);
             }
         }
-        for &x in &data.layout.separators {
+        for sep in &data.layout.separators {
             gdi::fill(
                 hdc,
-                Rect::new(x, s3, 1, (client.h - 2 * s3).max(0)),
-                data.separator,
+                Rect::new(sep.x, s3, 1, (client.h - 2 * s3).max(0)),
+                data.layout.separator_color,
             );
         }
     });

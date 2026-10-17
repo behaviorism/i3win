@@ -79,13 +79,14 @@ pub fn title_height(font: &Font, scale: f32) -> i32 {
 }
 
 pub fn bar_height_of(bar: &BarConfig, config: &Config, scale: f32) -> i32 {
-    match bar.height {
+    let base = match bar.height {
         Some(h) => scaled(h as f32, scale),
         None => {
             let font = bar.font.as_ref().unwrap_or(&config.font);
             title_height(font, scale) + scaled(2.0, scale)
         }
-    }
+    };
+    base + scaled(bar.padding[0] as f32, scale) + scaled(bar.padding[2] as f32, scale)
 }
 
 /// Whether `bar` is shown on the output (`primary` / `nonprimary` are

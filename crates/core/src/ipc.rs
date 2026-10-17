@@ -2,8 +2,9 @@
 //! plus the JSON replies and events built from the window manager state.
 
 use crate::arrange::Arrangement;
-use crate::config::{BarColorTriple, BarMode, BarPosition, Color};
+use crate::config::{BarColorTriple, BarMode, BarPosition, Color, HiddenState};
 use crate::geom::{Orientation, Rect};
+use crate::keys::Modifiers;
 use crate::tree::{NodeId, NodeKind, WindowId};
 use crate::wm::{CommandResult, IpcEvent, Wm};
 use serde_json::{json, Value};
@@ -343,9 +344,9 @@ pub fn bar_config_json(wm: &Wm, payload: &str) -> Value {
         "background": color_str(c.background),
         "statusline": color_str(c.statusline),
         "separator": color_str(c.separator),
-        "focused_background": color_str(c.background),
-        "focused_statusline": color_str(c.statusline),
-        "focused_separator": color_str(c.separator),
+        "focused_background": color_str(c.focused_background.unwrap_or(c.background)),
+        "focused_statusline": color_str(c.focused_statusline.unwrap_or(c.statusline)),
+        "focused_separator": color_str(c.focused_separator.unwrap_or(c.separator)),
     });
     let triples: [(&str, &BarColorTriple); 5] = [
         ("focused_workspace", &c.focused_workspace),
@@ -368,20 +369,30 @@ pub fn bar_config_json(wm: &Wm, payload: &str) -> Value {
         BarMode::Hide => "hide",
         BarMode::Invisible => "invisible",
     };
+    let modifier = match bar.modifier {
+        None => "none",
+        Some(m) if m == Modifiers::ALT => "Mod1",
+        Some(m) if m == Modifiers::SHIFT => "Shift",
+        Some(m) if m == Modifiers::CTRL => "Control",
+        Some(_) => "Mod4",
+    };
     json!({
         "id": bar.id,
         "mode": mode,
-        "hidden_state": "hide",
+        "hidden_state": match bar.hidden_state {
+            HiddenState::Hide => "hide",
+            HiddenState::Show => "show",
+        },
         "position": position,
         "status_command": bar.status_command,
         "font": format!("pango:{} {}", font.family, font.size_pt),
         "workspace_buttons": bar.workspace_buttons,
-        "binding_mode_indicator": true,
-        "strip_workspace_numbers": false,
-        "strip_workspace_name": false,
-        "separator_symbol": null,
+        "binding_mode_indicator": bar.binding_mode_indicator,
+        "strip_workspace_numbers": bar.strip_workspace_numbers,
+        "strip_workspace_name": bar.strip_workspace_name,
+        "separator_symbol": bar.separator_symbol,
         "verbose": false,
-        "modifier": "Mod4",
+        "modifier": modifier,
         "outputs": bar.outputs,
         "tray_output": null,
         "colors": colors,
