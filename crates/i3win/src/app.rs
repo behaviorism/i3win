@@ -234,7 +234,7 @@ pub struct App {
     pipe_name: String,
     drag: Option<DragSession>,
     /// DWM frame of a tiled window at the start of its native move/size loop.
-    move_start: HashMap<WindowId, (Rect, u64)>,
+    move_start: HashMap<WindowId, (Rect, u64, Option<WindowId>)>,
     hover: HoverState,
     /// The latest pointer position seen by the hover logic.
     hover_pos: Option<(i32, i32)>,
@@ -522,7 +522,7 @@ impl App {
         let expired: Vec<WindowId> = self
             .move_start
             .iter()
-            .filter(|(id, (_, at))| hover::freeze_expired(**id, *at, now, fg))
+            .filter(|(id, (_, at, sfg))| hover::freeze_expired(**id, *at, now, *sfg, fg))
             .map(|(id, _)| *id)
             .collect();
         for id in &expired {
@@ -761,7 +761,8 @@ impl App {
             return;
         }
         if let Some(r) = window::frame_rect(id) {
-            self.move_start.insert(id, (r, self.now_ms()));
+            self.move_start
+                .insert(id, (r, self.now_ms(), window::foreground()));
             self.applied.frozen.insert(id);
             mainloop::arm_freeze_timer();
         }
@@ -773,7 +774,8 @@ impl App {
         self.applied.frozen.remove(&id);
         // Snap back unless the tree changes below (a changed tree re-places anyway).
         reconcile::invalidate(&mut self.applied, id);
-        let (Some((start, _)), Some(end)) = (self.move_start.remove(&id), window::frame_rect(id))
+        let (Some((start, _, _)), Some(end)) =
+            (self.move_start.remove(&id), window::frame_rect(id))
         else {
             return;
         };
@@ -842,6 +844,11 @@ impl App {
                 payload,
                 reply,
             } => return self.on_ipc(msg_type, &payload, &reply),
+            // The wheel over a tab row: like RunCommand but never warps the pointer.
+            MainMsg::WheelFocus(c) => {
+                self.refresh_pointer();
+                self.wm.run_command(&c);
+            }
             MainMsg::RunCommand(c) => {
                 self.refresh_pointer();
                 self.warp_pending = true;
@@ -1041,6 +1048,7 @@ impl App {
             if let Some((x, y)) = target {
                 window::set_cursor_pos(x, y);
                 self.hover.ignore_until_move_from = Some((x, y));
+                self.hover_pos = Some((x, y));
                 self.hover.candidate = None;
             }
         }

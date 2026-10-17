@@ -75,6 +75,8 @@ pub fn arm_hover_timer() {
 pub enum MainMsg {
     FocusNode(NodeId),
     RunCommand(String),
+    /// A command from the wheel over a tab row (no pointer warp).
+    WheelFocus(String),
     /// A click on a status block of bar `bar`.
     StatusClick {
         bar: String,

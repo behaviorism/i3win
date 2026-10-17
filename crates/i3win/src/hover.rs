@@ -90,15 +90,17 @@ pub fn warp_target(
 }
 
 /// Whether a window frozen by a native move/size loop must be thawed: no END
-/// arrived and the foreground moved to another window, or the freeze is too old.
+/// arrived and the foreground moved to a window that is neither the frozen one nor
+/// the foreground at START, or the freeze is too old.
 pub fn freeze_expired(
     frozen: WindowId,
     started_ms: u64,
     now_ms: u64,
+    start_foreground: Option<WindowId>,
     foreground: Option<WindowId>,
 ) -> bool {
     now_ms.saturating_sub(started_ms) >= FREEZE_TIMEOUT_MS
-        || foreground.is_some_and(|f| f != frozen)
+        || foreground.is_some_and(|f| f != frozen && Some(f) != start_foreground)
 }
 
 #[cfg(test)]
@@ -232,10 +234,14 @@ mod tests {
     #[test]
     fn freeze_expiry() {
         let w = WindowId(1);
-        assert!(!freeze_expired(w, 0, 5_000, Some(w)));
-        assert!(!freeze_expired(w, 0, 5_000, None));
-        assert!(freeze_expired(w, 0, 5_000, Some(WindowId(2))));
-        assert!(freeze_expired(w, 0, 10_000, Some(w)));
-        assert!(freeze_expired(w, 1_000, 11_000, None));
+        let o = Some(WindowId(2));
+        assert!(!freeze_expired(w, 0, 5_000, None, Some(w)));
+        assert!(!freeze_expired(w, 0, 5_000, None, None));
+        assert!(freeze_expired(w, 0, 5_000, None, o));
+        assert!(freeze_expired(w, 0, 10_000, None, Some(w)));
+        assert!(freeze_expired(w, 1_000, 11_000, None, None));
+        // The foreground at START (the dragged window not foreground yet) is not a change.
+        assert!(!freeze_expired(w, 0, 5_000, o, o));
+        assert!(freeze_expired(w, 0, 5_000, o, Some(WindowId(3))));
     }
 }
