@@ -259,13 +259,13 @@ Check 'exit: no status process' ((StatusCount) -eq 0)
 $statusExe = "$root\target\debug\i3win-status.exe"
 $blocksConf = "$scratch\i3win-live-i3blocks.conf"
 [IO.File]::WriteAllText($blocksConf, "[t]`ncommand=echo hi`ninterval=1`n")
-$sp = Start-Process $statusExe -ArgumentList '-c', $blocksConf -PassThru -WindowStyle Hidden -RedirectStandardOutput "$scratch\i3win-live-status.out" -RedirectStandardInput "$scratch\i3win-live-status.in"
+$sp = Start-Process $statusExe -ArgumentList '-c', $blocksConf -PassThru -WindowStyle Hidden -RedirectStandardOutput "$scratch\i3win-live-status.out"
 Start-Sleep -Milliseconds 2500
 Stop-Process -Id $sp.Id -Force -ErrorAction SilentlyContinue
 $sout = Get-Content "$scratch\i3win-live-status.out" -Raw -ErrorAction SilentlyContinue
 Check 'status: i3bar header' ($sout -like '*{"version":1,"click_events":true}*')
 Check 'status: command block output' ($sout -like '*"full_text":"hi"*')
-Remove-Item $blocksConf, "$scratch\i3win-live-status.out", "$scratch\i3win-live-status.in" -ErrorAction SilentlyContinue
+Remove-Item $blocksConf, "$scratch\i3win-live-status.out" -ErrorAction SilentlyContinue
 
 # ---- cleanup
 $np | Stop-Process -Force -ErrorAction SilentlyContinue
