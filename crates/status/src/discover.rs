@@ -137,43 +137,14 @@ mod tests {
 
     #[test]
     fn detect_i3status_order_line_and_bare_keys() {
+        assert_eq!(detect_format("order += \"cpu_usage\"\n"), Format::I3Status);
         assert_eq!(
-            detect_format(
-                "order += \"cpu_usage\"
-"
-            ),
+            detect_format("# x\norder+=\"cpu_usage\"\n"),
             Format::I3Status
         );
-        assert_eq!(
-            detect_format(
-                "# x
-order+=\"cpu_usage\"
-"
-            ),
-            Format::I3Status
-        );
-        assert_eq!(
-            detect_format(
-                "my key=1
-"
-            ),
-            Format::I3Status
-        );
-        assert_eq!(
-            detect_format(
-                "shell=bash
-[a]
-"
-            ),
-            Format::I3Blocks
-        );
-        assert_eq!(
-            detect_format(
-                "  interval = 5
-"
-            ),
-            Format::I3Blocks
-        );
+        assert_eq!(detect_format("my key=1\n"), Format::I3Status);
+        assert_eq!(detect_format("shell=bash\n[a]\n"), Format::I3Blocks);
+        assert_eq!(detect_format("  interval = 5\n"), Format::I3Blocks);
     }
 
     #[test]

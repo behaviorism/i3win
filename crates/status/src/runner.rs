@@ -12,6 +12,8 @@ use i3win_core::i3bar::{Block, Click};
 
 /// Minimum time between two printed lines (writer coalescing).
 pub const WRITE_GAP: f64 = 0.05;
+/// Most output kept from one non-persist run; the rest is dropped.
+pub const MAX_RUN_OUTPUT: usize = 1024 * 1024;
 
 pub enum Slot {
     Module(Box<dyn Module>),
@@ -26,6 +28,8 @@ pub struct CommandSlot {
     pub running: bool,
     pub next_due: Option<f64>,
     pub signal: Option<u32>,
+    /// Sequence number of the latest run; messages from older runs are stale.
+    pub run: u64,
 }
 
 impl CommandSlot {
@@ -42,6 +46,7 @@ impl CommandSlot {
             running: false,
             next_due: Some(0.0),
             signal: section.get("signal").and_then(|s| s.trim().parse().ok()),
+            run: 0,
             section,
         }
     }
@@ -95,11 +100,23 @@ impl Schedule {
         self.commands_where(|c| !c.running && c.next_due.is_some_and(|t| t <= now))
     }
 
-    pub fn on_started(&mut self, i: usize) {
-        if let Some(c) = self.command_mut(i) {
-            c.running = true;
-            c.next_due = None;
+    /// Marks slot `i` running and returns the new run's sequence number.
+    pub fn on_started(&mut self, i: usize) -> u64 {
+        match self.command_mut(i) {
+            Some(c) => {
+                c.running = true;
+                c.next_due = None;
+                c.run += 1;
+                c.run
+            }
+            None => 0,
         }
+    }
+
+    /// True when a message tagged `run` belongs to slot `i`'s running run
+    /// (output arriving after that run finished is stale).
+    pub fn is_current(&self, i: usize, run: u64) -> bool {
+        self.command(i).is_some_and(|c| c.running && c.run == run)
     }
 
     pub fn on_finished(&mut self, i: usize, now: f64) {
@@ -193,6 +210,17 @@ pub fn persist_line_block(section: &Section, format: OutFormat, line: &str) -> B
     }
     add_label(&mut b, section);
     b
+}
+
+/// Adds one line of a non-persist run's output, keeping the total at most
+/// [`MAX_RUN_OUTPUT`] bytes (later lines are dropped). `size` is the running
+/// total for this run.
+pub fn push_capped(pending: &mut Vec<String>, size: &mut usize, line: String) {
+    let cost = line.len() + 1;
+    if *size + cost <= MAX_RUN_OUTPUT {
+        *size += cost;
+        pending.push(line);
+    }
 }
 
 /// What a persist block's process gets on stdin for a click (i3blocks 1.5):
@@ -289,6 +317,7 @@ mod tests {
             running: false,
             next_due: Some(0.0),
             signal: Some(3),
+            run: 0,
         })
     }
 
@@ -346,6 +375,36 @@ mod tests {
         assert_eq!(s.refresh_all(), vec![0]);
         s.on_started(0);
         assert_eq!(s.refresh_all(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn output_after_finish_is_stale() {
+        let mut s = Schedule {
+            slots: vec![cmd_slot(Interval::Secs(1.0))],
+            blocks: vec![Block::new("")],
+        };
+        let r1 = s.on_started(0);
+        assert!(s.is_current(0, r1));
+        s.on_finished(0, 0.0);
+        assert!(!s.is_current(0, r1)); // late output of a finished run
+        let r2 = s.on_started(0);
+        assert_ne!(r1, r2);
+        assert!(!s.is_current(0, r1)); // old run's output during the new run
+        assert!(s.is_current(0, r2));
+        assert!(!s.is_current(5, r2));
+    }
+
+    #[test]
+    fn run_output_is_capped() {
+        let mut pending = Vec::new();
+        let mut size = 0;
+        let big = "x".repeat(MAX_RUN_OUTPUT / 2);
+        push_capped(&mut pending, &mut size, big.clone());
+        push_capped(&mut pending, &mut size, big.clone()); // would exceed: dropped
+        push_capped(&mut pending, &mut size, "tail".into());
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[1], "tail");
+        assert!(size <= MAX_RUN_OUTPUT);
     }
 
     #[test]

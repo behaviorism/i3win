@@ -1,7 +1,7 @@
 //! Spawning block commands: hidden window, piped stdout, all children in one
 //! kill-on-close Job Object so they die with i3win-status.
 
-use std::io;
+use std::io::{self, BufRead};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -14,6 +14,47 @@ use windows::Win32::System::JobObjects::{
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Longest output line kept (as v1); the rest of a longer line is dropped.
+pub const MAX_LINE: usize = 64 * 1024;
+
+/// Reads one line (without its `\r\n`/`\n`), keeping at most `cap` bytes and
+/// discarding the rest of an over-long line. `None` at end of input.
+pub fn read_line_capped<R: BufRead>(r: &mut R, cap: usize) -> Option<String> {
+    let mut buf = Vec::new();
+    let mut any = false;
+    loop {
+        let (used, done) = {
+            let chunk = match r.fill_buf() {
+                Ok(c) => c,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => &[],
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            any = true;
+            let (part, done) = match chunk.iter().position(|&b| b == b'\n') {
+                Some(n) => (&chunk[..n], true),
+                None => (chunk, false),
+            };
+            let room = cap.saturating_sub(buf.len());
+            buf.extend_from_slice(&part[..part.len().min(room)]);
+            (part.len() + usize::from(done), done)
+        };
+        r.consume(used);
+        if done {
+            break;
+        }
+    }
+    if !any {
+        return None;
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
 
 /// A Job Object that kills every process in it when its last handle closes
 /// (that is, when i3win-status exits). The handle is intentionally never
@@ -78,6 +119,19 @@ pub fn spawn_block(
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn lines_are_capped() {
+        let text = format!("short\r\n{}\nlast", "y".repeat(100));
+        let mut r = io::BufReader::with_capacity(16, text.as_bytes());
+        assert_eq!(read_line_capped(&mut r, 10).as_deref(), Some("short"));
+        assert_eq!(read_line_capped(&mut r, 10), Some("y".repeat(10)));
+        assert_eq!(read_line_capped(&mut r, 10).as_deref(), Some("last"));
+        assert_eq!(read_line_capped(&mut r, 10), None);
+        let mut empty = io::BufReader::new("\n".as_bytes());
+        assert_eq!(read_line_capped(&mut empty, 10).as_deref(), Some(""));
+        assert_eq!(read_line_capped(&mut empty, 10), None);
+    }
 
     #[test]
     fn spawn_echo_with_env() {

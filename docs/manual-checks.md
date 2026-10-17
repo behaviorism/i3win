@@ -79,3 +79,7 @@ Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 e
 7. `mode hide` -> the bar shows only while Win is held (or on urgency); `mode dock` keeps it visible.
 8. `bindsym button3 exec notepad` inside `bar {}` -> right-clicking the bar opens Notepad (and does not trigger the default click action); `bindsym --release button3 ...` fires on button release; `button4`/`button5` override the wheel's workspace prev/next; `button6`/`button7` fire on horizontal wheel left/right. A bound wheel button fires once per notch.
 9. `title_format "<b>%title</b>"` renders bold window titles in title bars.
+
+## Plan 7: i3win-status
+
+1. Known difference: under `cmd` (the default shell) a missing command makes cmd.exe exit with code 1, so the block shows `Error: Command 'CMD' exited unexpectedly with code 1` rather than i3blocks' `not found or missing dependency` text.

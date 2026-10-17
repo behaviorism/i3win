@@ -13,7 +13,8 @@ use i3status_conf::{get, module_props, parse_i3status, Value, DEFAULT_I3STATUS_C
 use i3win_core::i3bar::{Block, Click};
 use runner::{
     config_error_block, module_interval, persist_click_line, persist_line_block, plain_line,
-    render_line, run_block, slot_for_click, ClickAction, Coalescer, CommandSlot, Schedule, Slot,
+    push_capped, render_line, run_block, slot_for_click, ClickAction, Coalescer, CommandSlot,
+    Schedule, Slot,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -27,9 +28,13 @@ const TICK: Duration = Duration::from_millis(100);
 
 enum Event {
     Tick,
-    Output(usize, String),
-    Exited(usize, i32),
+    /// (slot, run, line)
+    Output(usize, u64, String),
+    /// (slot, run, exit code)
+    Exited(usize, u64, i32),
     Click(Click),
+    /// stdin closed: the bar went away.
+    Quit,
     /// Sent by `--signal N` delivery (Task 8).
     #[allow(dead_code)]
     Signal(u32),
@@ -189,27 +194,33 @@ fn load(args: &Args) -> (Setup, PathBuf) {
     (setup, dir)
 }
 
-/// Reads a child's stdout line by line, then reports its exit code.
-fn read_child(i: usize, mut child: std::process::Child, tx: Sender<Event>) {
+/// How long a finished child's buffered output may take to drain before the
+/// run is reported finished.
+const DRAIN: Duration = Duration::from_millis(150);
+
+/// Watches one run: a reader thread forwards stdout lines; this thread waits
+/// for the process to exit (not for stdout EOF, which a background grandchild
+/// holding the pipe could delay forever), lets the reader drain briefly, then
+/// reports the exit code.
+fn watch_child(i: usize, run: u64, mut child: std::process::Child, tx: Sender<Event>) {
+    let (done_tx, done_rx) = channel::<()>();
     if let Some(out) = child.stdout.take() {
-        let mut r = BufReader::new(out);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match r.read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let line = String::from_utf8_lossy(&buf);
-                    let line = line.trim_end_matches(['\r', '\n']).to_string();
-                    if tx.send(Event::Output(i, line)).is_err() {
-                        return;
-                    }
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(out);
+            while let Some(line) = process::read_line_capped(&mut r, process::MAX_LINE) {
+                if tx.send(Event::Output(i, run, line)).is_err() {
+                    break;
                 }
             }
-        }
+            let _ = done_tx.send(());
+        });
+    } else {
+        drop(done_tx);
     }
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-    let _ = tx.send(Event::Exited(i, code));
+    let _ = done_rx.recv_timeout(DRAIN);
+    let _ = tx.send(Event::Exited(i, run, code));
 }
 
 /// Parses i3bar click lines from stdin (skipping the leading `[` and `,`).
@@ -220,7 +231,11 @@ fn read_clicks(tx: Sender<Event>) {
     loop {
         buf.clear();
         match r.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => {
+                // The bar is gone.
+                let _ = tx.send(Event::Quit);
+                return;
+            }
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
                 let t = line.trim().trim_start_matches(['[', ',']).trim();
@@ -243,6 +258,8 @@ struct Runner {
     module_next: Vec<f64>,
     /// Output collected during the current run of each non-persist slot.
     pending: Vec<Vec<String>>,
+    /// Bytes in `pending[i]`.
+    pending_size: Vec<usize>,
     /// Click line feeds of running persist slots.
     stdin: Vec<Option<Sender<String>>>,
     script_dir: PathBuf,
@@ -276,8 +293,9 @@ impl Runner {
             c.command().to_string()
         };
         let (prog, args, raw) = shell_command(shell, &cmdline);
-        self.sched.on_started(i);
+        let run = self.sched.on_started(i);
         self.pending[i].clear();
+        self.pending_size[i] = 0;
         match process::spawn_block(&prog, &args, raw, &env, self.job, persist) {
             Ok(mut child) => {
                 if let Some(mut stdin) = child.stdin.take() {
@@ -292,12 +310,12 @@ impl Runner {
                     });
                 }
                 let tx = self.tx.clone();
-                std::thread::spawn(move || read_child(i, child, tx));
+                std::thread::spawn(move || watch_child(i, run, child, tx));
             }
             Err(e) => {
                 eprintln!("i3win-status: cannot start `{prog}`: {e}");
                 // What sh reports for a command it cannot find.
-                let _ = self.tx.send(Event::Exited(i, 127));
+                let _ = self.tx.send(Event::Exited(i, run, 127));
             }
         }
     }
@@ -319,7 +337,10 @@ impl Runner {
         }
     }
 
-    fn output(&mut self, i: usize, line: String) {
+    fn output(&mut self, i: usize, run: u64, line: String) {
+        if !self.sched.is_current(i, run) {
+            return; // late output of a finished run
+        }
         let Some(c) = self.sched.command(i) else {
             return;
         };
@@ -327,11 +348,14 @@ impl Runner {
             let b = persist_line_block(&c.section, c.format, &line);
             self.set_block(i, b);
         } else {
-            self.pending[i].push(line);
+            push_capped(&mut self.pending[i], &mut self.pending_size[i], line);
         }
     }
 
-    fn exited(&mut self, i: usize, code: i32) {
+    fn exited(&mut self, i: usize, run: u64, code: i32) {
+        if !self.sched.is_current(i, run) {
+            return;
+        }
         let Some(c) = self.sched.command(i) else {
             return;
         };
@@ -343,6 +367,7 @@ impl Runner {
             run_block(&c.section, c.format, &self.pending[i].join("\n"), code)
         };
         self.pending[i].clear();
+        self.pending_size[i] = 0;
         self.stdin[i] = None;
         self.sched.on_finished(i, self.now());
         self.set_block(i, b);
@@ -367,11 +392,13 @@ impl Runner {
         }
     }
 
-    fn handle(&mut self, ev: Event) {
+    /// Handles one event; false means quit.
+    fn handle(&mut self, ev: Event) -> bool {
         match ev {
+            Event::Quit => return false,
             Event::Tick => self.tick(),
-            Event::Output(i, line) => self.output(i, line),
-            Event::Exited(i, code) => self.exited(i, code),
+            Event::Output(i, run, line) => self.output(i, run, line),
+            Event::Exited(i, run, code) => self.exited(i, run, code),
             Event::Click(c) => self.click(c),
             Event::Signal(sig) => {
                 for i in self.sched.on_signal(sig) {
@@ -384,6 +411,7 @@ impl Runner {
                 }
             }
         }
+        true
     }
 }
 
@@ -405,6 +433,7 @@ fn main() {
         interval: setup.interval,
         module_next: vec![0.0; n],
         pending: vec![Vec::new(); n],
+        pending_size: vec![0; n],
         stdin: vec![None; n],
         script_dir,
         job,
@@ -439,7 +468,11 @@ fn main() {
             1.0
         };
         match rx.recv_timeout(Duration::from_secs_f64(wait)) {
-            Ok(ev) => r.handle(ev),
+            Ok(ev) => {
+                if !r.handle(ev) {
+                    return; // the Job Object takes the children down
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
