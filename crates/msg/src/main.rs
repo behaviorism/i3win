@@ -188,9 +188,9 @@ mod tests {
     }
     #[test]
     fn type_and_socket() {
-        let p = parse_args(&a(&["-t", "get_tree", "-s", r"\.\pipe\x"])).unwrap();
+        let p = parse_args(&a(&["-t", "get_tree", "-s", r"\\.\pipe\x"])).unwrap();
         assert_eq!(p.msg_type, i3win_core::ipc::GET_TREE);
-        assert_eq!(p.socket.as_deref(), Some(r"\.\pipe\x"));
+        assert_eq!(p.socket.as_deref(), Some(r"\\.\pipe\x"));
     }
     #[test]
     fn monitor_needs_subscribe() {
