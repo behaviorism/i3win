@@ -64,6 +64,8 @@ pub struct Arrangement {
     pub hidden: Vec<WindowId>,
     pub decos: Vec<Deco>,
     pub fullscreen_outputs: Vec<String>,
+    /// Layout rect (before gaps and borders) of every placed tiled node.
+    pub rects: Vec<(NodeId, Rect)>,
 }
 
 /// Upper bound for gaps and borders so geometry math cannot overflow.
@@ -202,6 +204,7 @@ impl Ctx<'_> {
         let tree = self.tree;
         let n = tree.get(node);
         let th = self.th;
+        self.out.rects.push((node, rect));
         match &n.kind {
             NodeKind::Window(_) => {
                 let g = self.g;

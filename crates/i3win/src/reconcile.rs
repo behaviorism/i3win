@@ -78,6 +78,7 @@ mod tests {
             hidden: hidden.into_iter().map(WindowId).collect(),
             decos: vec![],
             fullscreen_outputs: vec![],
+            rects: vec![],
         }
     }
     fn managed(ids: &[isize]) -> HashSet<WindowId> {

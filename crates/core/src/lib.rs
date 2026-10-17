@@ -10,6 +10,7 @@ pub mod keycodes;
 pub mod keys;
 pub mod markup;
 mod ops;
+pub use ops::mouse::{corner_for_press, edges_for_press, resize_from_corner, Corner};
 #[cfg(test)]
 mod testutil;
 pub mod title;
