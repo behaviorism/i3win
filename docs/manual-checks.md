@@ -90,3 +90,14 @@ Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 e
 6. With only an `i3status.conf` present, changes to `order` and `format` apply after an i3win reload.
 7. Delete both `i3blocks.conf` and `i3status.conf`, reload -> i3win-status recreates `i3status.conf` with the default modules.
 8. Known pitfall: `shell=bash` may resolve to WSL's `bash.exe` (`C:\Windows\System32\bash.exe`) rather than Git Bash; to use Git Bash give a full path, e.g. `shell=C:\Program Files\Git\bin\bash.exe`. A full path to cmd (`shell=C:\Windows\System32\cmd.exe`) counts as the default cmd shell, with `$VAR` expansion.
+
+## Plan 8: mouse
+
+1. Drag a tiled Notepad by its native title bar onto another tiled window -> it drops there (swap or split per the drop zone).
+2. Drag a tiled Notepad's native border -> the neighboring tile resizes.
+3. A drop preview appears while Alt+dragging a tile (`floating_modifier Mod1`).
+4. Pressing Escape during a drag cancels it; the window returns to its original place.
+5. Alt+drag a window onto a bar workspace button -> the window moves to that workspace.
+6. Mouse wheel over a tabbed/stacked tab row cycles the tabs.
+7. `mouse_warping output` with two monitors: `focus output right` moves the cursor to the other monitor.
+8. With `focus_follows_mouse yes`, hovering over windows while a context menu is open never closes the menu.
