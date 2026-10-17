@@ -1,55 +1,500 @@
-#[allow(dead_code)]
 mod command_block;
-#[allow(dead_code)]
 mod discover;
-#[allow(dead_code)]
 mod format;
-#[allow(dead_code)]
 mod i3blocks_conf;
-#[allow(dead_code)]
 mod i3status_conf;
-#[allow(dead_code)]
 mod mods;
-mod modules;
+mod process;
+mod runner;
 
-use modules::*;
-use std::io::Write;
-use std::time::Duration;
+use command_block::{block_env, exit_code_block, expand_sh_vars, is_cmd_shell, shell_command};
+use discover::{detect_format, discover, Format};
+use i3status_conf::{get, module_props, parse_i3status, Value, DEFAULT_I3STATUS_CONF};
+use i3win_core::i3bar::{Block, Click};
+use runner::{
+    config_error_block, module_interval, persist_click_line, persist_line_block, plain_line,
+    render_line, run_block, slot_for_click, ClickAction, Coalescer, CommandSlot, Schedule, Slot,
+};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::HANDLE;
+
+/// i3status' default `general.interval`.
+const DEFAULT_INTERVAL: f64 = 5.0;
+const TICK: Duration = Duration::from_millis(100);
+
+enum Event {
+    Tick,
+    Output(usize, String),
+    Exited(usize, i32),
+    Click(Click),
+    /// Sent by `--signal N` delivery (Task 8).
+    #[allow(dead_code)]
+    Signal(u32),
+    /// Sent by `--refresh-all` delivery (Task 8).
+    #[allow(dead_code)]
+    RefreshAll,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Args {
+    config: Option<PathBuf>,
+}
+
+/// `-c PATH`; other arguments are ignored here.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
+    let mut a = Args::default();
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        if arg == "-c" {
+            a.config = it.next().map(PathBuf::from);
+        }
+    }
+    a
+}
+
+#[derive(Debug, PartialEq)]
+enum OutputMode {
+    I3Bar,
+    /// `output_format = "none"`: plain lines joined by this separator.
+    Plain(String),
+}
+
+struct Setup {
+    schedule: Schedule,
+    output: OutputMode,
+    interval: f64,
+}
+
+fn schedule_of(slots: Vec<Slot>) -> Schedule {
+    let blocks = slots
+        .iter()
+        .map(|s| match s {
+            Slot::Static(b) => b.clone(),
+            Slot::Command(c) => command_block::static_block(&c.section),
+            Slot::Module(m) => {
+                let mut b = Block::new("");
+                b.name = Some(m.name().to_string());
+                b.instance = m.instance().map(str::to_string);
+                b
+            }
+        })
+        .collect();
+    Schedule { slots, blocks }
+}
+
+fn error_slots(errors: &[(usize, String)]) -> Vec<Slot> {
+    errors
+        .iter()
+        .map(|(line, msg)| {
+            eprintln!("i3win-status: config line {line}: {msg}");
+            Slot::Static(config_error_block(*line))
+        })
+        .collect()
+}
+
+fn setup_i3status(text: &str) -> Setup {
+    let cfg = parse_i3status(text);
+    let mut slots = error_slots(&cfg.errors);
+    for m in &cfg.order {
+        let props = module_props(&cfg, m).cloned().unwrap_or_default();
+        slots.push(Slot::Module(mods::build_module(m, &props, &cfg.general)));
+    }
+    let interval = get(&cfg.general, "interval")
+        .and_then(Value::as_f64)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(DEFAULT_INTERVAL);
+    let output = match get(&cfg.general, "output_format").map(Value::as_str) {
+        Some(f) if f == "none" => OutputMode::Plain(
+            get(&cfg.general, "separator")
+                .map(Value::as_str)
+                .unwrap_or_else(|| " | ".to_string()),
+        ),
+        _ => OutputMode::I3Bar,
+    };
+    Setup {
+        schedule: schedule_of(slots),
+        output,
+        interval,
+    }
+}
+
+fn setup_i3blocks(text: &str) -> Setup {
+    let cfg = i3blocks_conf::parse_i3blocks(text);
+    let mut slots = error_slots(&cfg.errors);
+    for s in cfg.sections {
+        slots.push(match s.get("command") {
+            Some(c) if !c.trim().is_empty() => Slot::Command(CommandSlot::from_section(s)),
+            _ => Slot::Static(command_block::static_block(&s)),
+        });
+    }
+    Setup {
+        schedule: schedule_of(slots),
+        output: OutputMode::I3Bar,
+        interval: DEFAULT_INTERVAL,
+    }
+}
+
+fn read_lossy(path: &Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Finds, reads (or creates) the config. Returns the setup and the config's
+/// folder (`SCRIPT_DIR`).
+fn load(args: &Args) -> (Setup, PathBuf) {
+    let home = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let env_cfg = std::env::var("I3BLOCKS_CONFIG").ok();
+    let (path, fmt) = discover(
+        args.config.as_deref(),
+        env_cfg.as_deref(),
+        &home,
+        &|p: &Path| p.is_file(),
+    );
+    let path = std::path::absolute(&path).unwrap_or(path);
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let text = match read_lossy(&path) {
+        Ok(t) => t,
+        Err(_) if args.config.is_none() && !path.exists() => {
+            // Nothing found: write the default i3status config and use it.
+            let wrote = std::fs::create_dir_all(&dir)
+                .and_then(|_| std::fs::write(&path, DEFAULT_I3STATUS_CONF));
+            if let Err(e) = wrote {
+                eprintln!("i3win-status: cannot write {}: {e}", path.display());
+            }
+            DEFAULT_I3STATUS_CONF.to_string()
+        }
+        Err(e) => {
+            eprintln!("i3win-status: cannot read {}: {e}", path.display());
+            let mut b = Block::new(format!("config error: cannot read {}", path.display()));
+            b.color = Some("#FF0000".to_string());
+            let setup = Setup {
+                schedule: schedule_of(vec![Slot::Static(b)]),
+                output: OutputMode::I3Bar,
+                interval: DEFAULT_INTERVAL,
+            };
+            return (setup, dir);
+        }
+    };
+    let setup = match fmt.unwrap_or_else(|| detect_format(&text)) {
+        Format::I3Status => setup_i3status(&text),
+        Format::I3Blocks => setup_i3blocks(&text),
+    };
+    (setup, dir)
+}
+
+/// Reads a child's stdout line by line, then reports its exit code.
+fn read_child(i: usize, mut child: std::process::Child, tx: Sender<Event>) {
+    if let Some(out) = child.stdout.take() {
+        let mut r = BufReader::new(out);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match r.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    let line = line.trim_end_matches(['\r', '\n']).to_string();
+                    if tx.send(Event::Output(i, line)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+    let _ = tx.send(Event::Exited(i, code));
+}
+
+/// Parses i3bar click lines from stdin (skipping the leading `[` and `,`).
+fn read_clicks(tx: Sender<Event>) {
+    let stdin = std::io::stdin();
+    let mut r = stdin.lock();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                let t = line.trim().trim_start_matches(['[', ',']).trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if let Ok(c) = serde_json::from_str::<Click>(t) {
+                    if tx.send(Event::Click(c)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct Runner {
+    sched: Schedule,
+    interval: f64,
+    module_next: Vec<f64>,
+    /// Output collected during the current run of each non-persist slot.
+    pending: Vec<Vec<String>>,
+    /// Click line feeds of running persist slots.
+    stdin: Vec<Option<Sender<String>>>,
+    script_dir: PathBuf,
+    job: HANDLE,
+    tx: Sender<Event>,
+    start: Instant,
+    writer: Coalescer,
+}
+
+impl Runner {
+    fn now(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    fn set_block(&mut self, i: usize, b: Block) {
+        if self.sched.set_block(i, b) {
+            self.writer.dirty = true;
+        }
+    }
+
+    fn spawn(&mut self, i: usize, click: Option<&Click>) {
+        let Some(c) = self.sched.command(i) else {
+            return;
+        };
+        let persist = c.is_persist();
+        let env = block_env(&c.section, &self.script_dir, click);
+        let shell = c.section.get("shell").unwrap_or("");
+        let cmdline = if is_cmd_shell(shell) {
+            expand_sh_vars(c.command(), &env, std::process::id())
+        } else {
+            c.command().to_string()
+        };
+        let (prog, args, raw) = shell_command(shell, &cmdline);
+        self.sched.on_started(i);
+        self.pending[i].clear();
+        match process::spawn_block(&prog, &args, raw, &env, self.job, persist) {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let (tx, rx) = channel::<String>();
+                    self.stdin[i] = Some(tx);
+                    std::thread::spawn(move || {
+                        for line in rx {
+                            if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+                let tx = self.tx.clone();
+                std::thread::spawn(move || read_child(i, child, tx));
+            }
+            Err(e) => {
+                eprintln!("i3win-status: cannot start `{prog}`: {e}");
+                // What sh reports for a command it cannot find.
+                let _ = self.tx.send(Event::Exited(i, 127));
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        let now = self.now();
+        for i in 0..self.sched.slots.len() {
+            if now < self.module_next[i] {
+                continue;
+            }
+            if let Slot::Module(m) = &mut self.sched.slots[i] {
+                let b = m.render();
+                self.module_next[i] = now + module_interval(m.as_ref(), self.interval);
+                self.set_block(i, b);
+            }
+        }
+        for i in self.sched.due(now) {
+            self.spawn(i, None);
+        }
+    }
+
+    fn output(&mut self, i: usize, line: String) {
+        let Some(c) = self.sched.command(i) else {
+            return;
+        };
+        if c.is_persist() {
+            let b = persist_line_block(&c.section, c.format, &line);
+            self.set_block(i, b);
+        } else {
+            self.pending[i].push(line);
+        }
+    }
+
+    fn exited(&mut self, i: usize, code: i32) {
+        let Some(c) = self.sched.command(i) else {
+            return;
+        };
+        let b = if c.is_persist() {
+            let mut b = self.sched.blocks[i].clone();
+            exit_code_block(&mut b, c.command(), code);
+            b
+        } else {
+            run_block(&c.section, c.format, &self.pending[i].join("\n"), code)
+        };
+        self.pending[i].clear();
+        self.stdin[i] = None;
+        self.sched.on_finished(i, self.now());
+        self.set_block(i, b);
+        // A `repeat` block is due again at once.
+        for j in self.sched.due(self.now()) {
+            self.spawn(j, None);
+        }
+    }
+
+    fn click(&mut self, c: Click) {
+        let Some(i) = slot_for_click(&self.sched, c.name.as_deref(), c.instance.as_deref()) else {
+            return;
+        };
+        match self.sched.on_click(i) {
+            ClickAction::Spawn => self.spawn(i, Some(&c)),
+            ClickAction::SendToStdin => {
+                if let (Some(tx), Some(slot)) = (&self.stdin[i], self.sched.command(i)) {
+                    let _ = tx.send(persist_click_line(slot.format, &c));
+                }
+            }
+            ClickAction::Drop => {}
+        }
+    }
+
+    fn handle(&mut self, ev: Event) {
+        match ev {
+            Event::Tick => self.tick(),
+            Event::Output(i, line) => self.output(i, line),
+            Event::Exited(i, code) => self.exited(i, code),
+            Event::Click(c) => self.click(c),
+            Event::Signal(sig) => {
+                for i in self.sched.on_signal(sig) {
+                    self.spawn(i, None);
+                }
+            }
+            Event::RefreshAll => {
+                for i in self.sched.refresh_all() {
+                    self.spawn(i, None);
+                }
+            }
+        }
+    }
+}
 
 fn emit(out: &mut impl Write, text: &str) -> bool {
     writeln!(out, "{text}").is_ok() && out.flush().is_ok()
 }
 
 fn main() {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    if !emit(&mut out, r#"{"version":1,"click_events":false}"#) || !emit(&mut out, "[") {
+    let args = parse_args(std::env::args().skip(1));
+    let (setup, script_dir) = load(&args);
+    let job = process::create_kill_job().unwrap_or_else(|| {
+        eprintln!("i3win-status: cannot create job object; children may outlive us");
+        HANDLE::default()
+    });
+    let (tx, rx) = channel::<Event>();
+    let n = setup.schedule.slots.len();
+    let mut r = Runner {
+        sched: setup.schedule,
+        interval: setup.interval,
+        module_next: vec![0.0; n],
+        pending: vec![Vec::new(); n],
+        stdin: vec![None; n],
+        script_dir,
+        job,
+        tx: tx.clone(),
+        start: Instant::now(),
+        writer: Coalescer::default(),
+    };
+    r.writer.dirty = true;
+
+    let mut out = std::io::stdout();
+    if setup.output == OutputMode::I3Bar
+        && (!emit(&mut out, r#"{"version":1,"click_events":true}"#) || !emit(&mut out, "["))
+    {
         return;
     }
-    let mut prev = read_cpu_times();
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            while tx.send(Event::Tick).is_ok() {
+                std::thread::sleep(TICK);
+            }
+        });
+    }
+    std::thread::spawn(move || read_clicks(tx));
+
     let mut first = true;
+    r.tick();
     loop {
-        let now = read_cpu_times();
-        let pct = match (prev, now) {
-            (Some(p), Some(n)) => cpu_percent(p, n),
-            _ => 0.0,
+        let wait = if r.writer.dirty {
+            r.writer.wait(r.now())
+        } else {
+            1.0
         };
-        prev = now;
-        let mut blocks = vec![cpu_block(pct)];
-        if let Some(m) = read_mem_used_pct() {
-            blocks.push(mem_block(m));
+        match rx.recv_timeout(Duration::from_secs_f64(wait)) {
+            Ok(ev) => r.handle(ev),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
         }
-        if let Some(f) = read_disk_free("C:\\") {
-            blocks.push(disk_block("C:", f));
+        if r.writer.take(r.now()) {
+            let line = match &setup.output {
+                OutputMode::I3Bar => render_line(&r.sched.blocks, first),
+                OutputMode::Plain(sep) => plain_line(&r.sched.blocks, sep),
+            };
+            if !emit(&mut out, &line) {
+                return; // the bar went away
+            }
+            first = false;
         }
-        if let Some((p, ac)) = read_battery() {
-            blocks.push(battery_block(p, ac));
-        }
-        blocks.push(time_block(chrono::Local::now()));
-        if !emit(&mut out, &render_line(&blocks, first)) {
-            return;
-        }
-        first = false;
-        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn args_config_path() {
+        let a = parse_args(["-c".to_string(), r"C:\x.conf".to_string()]);
+        assert_eq!(a.config, Some(PathBuf::from(r"C:\x.conf")));
+        assert_eq!(parse_args(["--refresh-all".to_string()]), Args::default());
+        assert_eq!(parse_args(["-c".to_string()]), Args::default());
+    }
+
+    #[test]
+    fn i3blocks_setup_errors_first() {
+        let s = setup_i3blocks("[a]\nfull_text=x\nbad line\n[b]\ncommand=echo hi\ninterval=1\n");
+        let blocks = &s.schedule.blocks;
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].full_text, "config error line 3");
+        assert_eq!(blocks[0].color.as_deref(), Some("#FF0000"));
+        assert_eq!(blocks[1].full_text, "x");
+        assert!(matches!(s.schedule.slots[1], Slot::Static(_)));
+        assert!(matches!(s.schedule.slots[2], Slot::Command(_)));
+        assert_eq!(blocks[2].name.as_deref(), Some("b"));
+        assert_eq!(s.output, OutputMode::I3Bar);
+    }
+
+    #[test]
+    fn i3status_setup_modules_and_output_format() {
+        let s = setup_i3status(DEFAULT_I3STATUS_CONF);
+        assert_eq!(s.schedule.slots.len(), 5);
+        assert_eq!(s.interval, 1.0);
+        assert_eq!(s.schedule.blocks[2].name.as_deref(), Some("disk"));
+        assert_eq!(s.schedule.blocks[2].instance.as_deref(), Some("C:"));
+        let s = setup_i3status(
+            "general {\n output_format = \"none\"\n}\nbroken\norder += \"memory\"\n",
+        );
+        assert_eq!(s.output, OutputMode::Plain(" | ".into()));
+        assert_eq!(s.interval, DEFAULT_INTERVAL);
+        assert_eq!(s.schedule.blocks[0].full_text, "config error line 4");
+        assert!(matches!(s.schedule.slots[1], Slot::Module(_)));
     }
 }

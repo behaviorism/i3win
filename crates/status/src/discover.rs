@@ -8,8 +8,9 @@ pub enum Format {
     I3Blocks,
 }
 
-/// First non-comment, non-blank line: `[section]` or a `key=value` without
-/// `{` means i3blocks; anything else is i3status.
+/// First non-comment, non-blank line: `[section]`, or a `key=value` whose key
+/// is a bare identifier (no whitespace, no `+`) and with no `{`, means
+/// i3blocks; anything else (`general {`, `order += "x"`) is i3status.
 pub fn detect_format(text: &str) -> Format {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for raw in text.lines() {
@@ -17,8 +18,15 @@ pub fn detect_format(text: &str) -> Format {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.starts_with('[') || (line.contains('=') && !line.contains('{')) {
+        if line.starts_with('[') {
             return Format::I3Blocks;
+        }
+        if let Some((key, _)) = line.split_once('=') {
+            let key = key.trim();
+            let bare = !key.is_empty() && !key.contains(|c: char| c.is_whitespace() || c == '+');
+            if bare && !line.contains('{') {
+                return Format::I3Blocks;
+            }
         }
         return Format::I3Status;
     }
@@ -37,8 +45,12 @@ pub fn discover(
     if let Some(p) = cli {
         return (p.to_path_buf(), None);
     }
-    if let Some(e) = env_i3blocks {
-        return (PathBuf::from(e), Some(Format::I3Blocks));
+    // An empty variable counts as unset; a missing file falls through.
+    if let Some(e) = env_i3blocks.filter(|e| !e.is_empty()) {
+        let p = PathBuf::from(e);
+        if exists(&p) {
+            return (p, Some(Format::I3Blocks));
+        }
     }
     let cfg = home.join(".config");
     let candidates = [
@@ -120,6 +132,66 @@ mod tests {
         assert_eq!(
             discover(None, None, home, &status).1,
             Some(Format::I3Status)
+        );
+    }
+
+    #[test]
+    fn detect_i3status_order_line_and_bare_keys() {
+        assert_eq!(
+            detect_format(
+                "order += \"cpu_usage\"
+"
+            ),
+            Format::I3Status
+        );
+        assert_eq!(
+            detect_format(
+                "# x
+order+=\"cpu_usage\"
+"
+            ),
+            Format::I3Status
+        );
+        assert_eq!(
+            detect_format(
+                "my key=1
+"
+            ),
+            Format::I3Status
+        );
+        assert_eq!(
+            detect_format(
+                "shell=bash
+[a]
+"
+            ),
+            Format::I3Blocks
+        );
+        assert_eq!(
+            detect_format(
+                "  interval = 5
+"
+            ),
+            Format::I3Blocks
+        );
+    }
+
+    #[test]
+    fn env_empty_or_missing_falls_through() {
+        let home = Path::new("H");
+        let only = |p: &'static str| move |q: &Path| q == Path::new(p);
+        let i3s = r"H\.config\i3win\i3status.conf";
+        assert_eq!(
+            discover(None, Some(""), home, &only(i3s)),
+            (PathBuf::from(i3s), Some(Format::I3Status))
+        );
+        assert_eq!(
+            discover(None, Some("missing"), home, &only(i3s)),
+            (PathBuf::from(i3s), Some(Format::I3Status))
+        );
+        assert_eq!(
+            discover(None, Some("E"), home, &only("E")),
+            (PathBuf::from("E"), Some(Format::I3Blocks))
         );
     }
 

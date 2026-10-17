@@ -157,14 +157,22 @@ pub fn expand_sh_vars(cmd: &str, env: &[(String, String)], pid: u32) -> String {
     out
 }
 
+/// `cmd`/`cmd.exe` in any case, or empty (the default shell).
+pub fn is_cmd_shell(shell: &str) -> bool {
+    let s = shell.trim();
+    s.is_empty() || s.eq_ignore_ascii_case("cmd") || s.eq_ignore_ascii_case("cmd.exe")
+}
+
 /// Program, arguments, and whether the arguments are a raw command line.
 pub fn shell_command(shell: &str, cmd: &str) -> (String, Vec<String>, bool) {
-    match shell {
-        "cmd" => (
+    if is_cmd_shell(shell) {
+        return (
             "cmd".into(),
             vec!["/S".into(), "/C".into(), format!("\"{cmd}\"")],
             true,
-        ),
+        );
+    }
+    match shell {
         "pwsh" | "powershell" => (
             shell.into(),
             vec!["-NoProfile".into(), "-Command".into(), cmd.into()],
@@ -407,6 +415,18 @@ mod tests {
             ("bash".into(), vec!["-c".into(), "echo $X".into()], false)
         );
         assert_eq!(shell_command("pwsh", "Get-Date").1[1], "-Command");
+    }
+
+    #[test]
+    fn cmd_shell_aliases() {
+        for sh in ["", "CMD", "cmd.exe", "Cmd.EXE"] {
+            let (prog, args, raw) = shell_command(sh, "echo hi");
+            assert_eq!(prog, "cmd", "{sh}");
+            assert_eq!(args, vec!["/S", "/C", "\"echo hi\""], "{sh}");
+            assert!(raw, "{sh}");
+        }
+        assert!(is_cmd_shell(" cmd "));
+        assert!(!is_cmd_shell("bash"));
     }
 
     #[test]
