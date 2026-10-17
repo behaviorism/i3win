@@ -12,7 +12,7 @@ An i3 user should be able to bring their real i3 config, including the mouse hab
 ## Goals
 
 1. **Mouse**: move and resize windows with the mouse the i3 way (floating and tiled), focus follows mouse, mouse warping.
-2. **Status**: `i3win-status` reads an i3status-style config (modules, order, formats, colors, intervals) plus custom command blocks; the bar renders every i3bar block field that matters for looks.
+2. **Status**: `i3win-status` reads an i3status-style config (modules, order, formats, colors, intervals) or an i3blocks config (custom command blocks, owner's choice); the bar renders every i3bar block field that matters for looks.
 3. **Bar**: the i3 bar options v1 skipped, multiple `bar {}` blocks and hide mode.
 4. **Defaults match i3** (owner: "verify that the defaults match"): every built-in default and the generated default config follow i3's, see "Defaults".
 5. **Window commands and config**: marks, scratchpad, sticky, `border`, `title_format`, edge/smart borders and gaps, runtime gaps, workspace rename, and the remaining small config options and command forms.
@@ -102,7 +102,14 @@ Default `output`. When a keyboard command moves focus to a different output, the
 
 ### Config file
 
-`i3win-status` reads `%USERPROFILE%\.config\i3win\i3status.conf`, or `-c PATH`. If missing, it writes a default that reproduces v1's output (cpu, memory, disk C:, battery, time). Syntax is the i3status one:
+`i3win-status` picks its config in this order (first that exists wins):
+
+1. `-c PATH` (format detected from content: `[name]` sections = i3blocks, `name {` blocks = i3status)
+2. `I3BLOCKS_CONFIG` environment variable (i3blocks format)
+3. `%USERPROFILE%\.config\i3win\i3blocks.conf`, `%USERPROFILE%\.config\i3blocks\config`, `%USERPROFILE%\.i3blocks.conf` (i3blocks format)
+4. `%USERPROFILE%\.config\i3win\i3status.conf` (i3status format)
+
+If none exists, it writes `i3status.conf` with a default that reproduces v1's output (cpu, memory, disk C:, battery, time). i3status syntax:
 
 ```
 general {
@@ -143,20 +150,45 @@ Common per-module keys (i3status): `format`, `format_down`, `color_good/degraded
 
 Each module refreshes on the global `interval` (per-block `interval` overrides it **[call]**, an i3blocks-style extension).
 
-### Custom command blocks (extension) [call]
+### i3blocks config (custom blocks)
 
-The owner asked for "custom status bar blocks". i3 users get these from wrapper scripts or i3blocks; i3win-status supports them directly so no extra tool is needed:
+The owner asked for "custom status bar blocks" and chose i3blocks' config format, read by `i3win-status` itself (no separate program), so an i3blocks user can copy their config over. Behavior follows i3blocks 1.5 unless stated.
 
 ```
-order += "command weather"
-command weather {
-    command = "curl -s wttr.in/?format=1"
-    interval = 600
-    format = "%output"
-}
+# global properties: defaults for every block below
+separator_block_width=15
+shell=bash
+
+[cpu_usage]
+format=CPU %usage
+
+[weather]
+command=curl -s wttr.in/?format=1
+interval=600
+
+[disk]
+command=$SCRIPT_DIR/disk.sh
+DISK=C:
+LABEL=HDD
+
+[tztime local]
+format=%H:%M
 ```
 
-Runs on its own worker thread per block, through `cmd /S /C` (same quoting rule as v1 `exec`), hidden window, killed if it runs longer than `timeout` (default 10 s). The first line of stdout is `%output`. If the command prints a JSON object (i3blocks/i3bar block), its fields (`full_text`, `color`, ...) are used as is. Exit code 33 = urgent, nonzero = `color_bad` (i3blocks convention). `on_click = "cmd"` runs a command when the block is clicked, with `%button` substituted; this needs click events, so `i3win-status` now sends `click_events: true` and reads stdin. The bar side of click events already exists from v1 (any `status_command` that sends `click_events: true` in its header gets i3bar click JSON on stdin: `name`, `instance`, `button`, `modifiers`, `x`, `y`, `relative_x`, `relative_y`, `output_x`, `output_y`, `width`, `height`); v2 only adds any of those fields v1 omits.
+- **File syntax**: INI-like. `key=value` lines before the first section are global properties, inherited by every block (a block's own value wins). `[name]` starts a block; `#` comments; blank lines ignored. Duplicate names allowed.
+- **Built-in modules from i3blocks.conf** (i3win addition): a section with no `command=` whose name is an i3win-status module (`cpu_usage`, `disk C:`, `tztime local`, ...) shows that module, with the section's keys as the module's settings (same keys as in i3status.conf). A section with neither `command` nor a known module name shows its static `full_text` (i3blocks behavior).
+- **Properties** passed to the bar: `full_text`, `short_text`, `label` (prefixed to `full_text`), `color`, `background`, `border`, `border_top/right/bottom/left`, `min_width`, `align`, `urgent`, `name` (= section name), `instance`, `separator`, `separator_block_width`, `markup`.
+- **Custom properties as environment**: every property of the block (global and own, including unknown keys like `DISK`, `LABEL`) is set as an environment variable for its command, as i3blocks does. Also `SCRIPT_DIR` = folder of the config file, and `BLOCK_NAME`/`BLOCK_INSTANCE`/`name`/`instance`.
+- **Variable expansion**: before running, i3win-status expands `$VAR` and `${VAR}` in `command` from the block's environment (i3blocks gets this from `sh`; `cmd` would not do it). `$$` is a literal `$`. Unknown variables expand to empty. **[call]**
+- **Shell**: `shell=` property (i3win addition, may be global or per block): `cmd` (default; runs `cmd /S /C "COMMAND"` as v1 `exec`), or any other program, run as `PROGRAM -c "COMMAND"` (e.g. `bash`, `sh`, `pwsh` gets `-Command`). Hidden window. **[call]**
+- **`interval`**: N seconds; `once` (run at start only); `repeat` (rerun as soon as it exits); `persist` (keep running, every output line updates the block). No interval = run once at start and on clicks/signals (i3blocks).
+- **`format`**: `raw` (default): line 1 `full_text`, line 2 `short_text`, line 3 `color`; or `json`: each line is a JSON object whose keys update the block's properties.
+- **Exit codes**: 0 normal; 33 = `urgent`; any other nonzero = the block shows its output (or `command failed (N)` if empty) in `color_bad` red. **[call]**
+- **Timeout** for non-persist runs: 10 s (`timeout=` property, i3win addition), then the process tree is killed and the block shows `timeout`. **[call]**
+- **Clicks**: clicking a non-persist block reruns its command with the click in the environment, in both naming styles: `button`, `x`, `y`, `relative_x`, `relative_y`, `width`, `height`, `modifiers` (1.5) and `BLOCK_BUTTON`, `BLOCK_X`, `BLOCK_Y` (legacy). For `persist` blocks the click is written to the running process's stdin as one i3bar click JSON line instead.
+- **Signals**: `signal=N` property. Windows has no Unix signals, so `i3win-status --signal N` replaces `pkill -RTMIN+N i3blocks`: every running i3win-status reruns its blocks with that signal (persist blocks get nothing, as in i3blocks). `i3win-status --refresh-all` reruns every non-persist block (replaces `pkill -USR1 i3blocks`). Delivery: each running i3win-status owns a message-only window of class `i3win_status_sig`; the `--signal`/`--refresh-all` invocation finds them all with `FindWindowExW(HWND_MESSAGE, ...)` and posts a message, so every bar's instance refreshes. **[call]**
+- **Concurrency**: each running command has its own reader thread; outputs go to the single writer thread that prints i3bar lines (at most one line per 50 ms, coalesced). **[call]**
+- **Known difference**: commands inside scripts that only exist on Linux won't run on Windows; the config file itself carries over.
 
 ## Bar
 
@@ -282,7 +314,7 @@ Four plans, each shippable alone, in this order:
 
 1. **Plan 5: window commands, config and defaults** (mostly `i3win-core`): the Defaults section, marks, scratchpad, sticky, border/title_format/icons, edge/smart borders and gaps, runtime gaps, rename, focus options, criteria additions, move/resize forms, `--release`/`bindcode`, IPC additions.
 2. **Plan 6: bar and markup**: markup parser, block field rendering, short_text, bar config additions, multiple bars, hide mode, bar button bindings, bar commands.
-3. **Plan 7: i3win-status**: config parser, modules, custom command blocks, click handling.
+3. **Plan 7: i3win-status**: i3status and i3blocks config parsers, config discovery, modules, command blocks (env, expansion, shell, intervals, formats, clicks, signals).
 4. **Plan 8: mouse**: mouse hook, floating_modifier move/resize, tiling drag with overlay, native move/size handling, focus_follows_mouse, mouse_warping.
 
 ## Owner decisions
@@ -290,6 +322,7 @@ Four plans, each shippable alone, in this order:
 - Tray: left out.
 - `focus_follows_mouse`: copy i3 exactly (absent line = `yes`).
 - Defaults: match i3's.
+- Custom status blocks: built into `i3win-status`, using the i3blocks config format and its features (custom properties as environment, `$SCRIPT_DIR`, clicks in both naming styles, persist clicks on stdin, per-side borders, i3blocks config locations, signal and refresh-all replacements), plus a `shell=` option.
 
 ## What's left to the builder
 
