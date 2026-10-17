@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+mod command_block;
+#[allow(dead_code)]
 mod discover;
 #[allow(dead_code)]
 mod format;
