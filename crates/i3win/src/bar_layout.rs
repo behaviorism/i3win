@@ -344,6 +344,54 @@ pub fn bar_binding_for(bindings: &[BarBinding], button: u8, release: bool) -> Op
         .map(|b| b.command.as_str())
 }
 
+/// What a mouse button event on a bar does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BarAction {
+    /// Send a click event to the bar's status process.
+    StatusClick,
+    /// Run a `bindsym buttonN` command.
+    Command(String),
+    /// The built-in behavior (see `default_command`).
+    Default,
+    Nothing,
+}
+
+/// Routes a press, release or wheel notch (i3 button numbers) like i3bar: over a
+/// status block whose process asked for click events, the block gets it (a press
+/// is sent as a click; a release is consumed, since the protocol has no release
+/// clicks) and no binding or default runs. Otherwise `binding` (the bar's
+/// command for this button and direction) wins, then the default for presses.
+pub fn route_bar_button(
+    hit: Option<&ItemKind>,
+    wants_clicks: bool,
+    release: bool,
+    binding: Option<&str>,
+) -> BarAction {
+    if wants_clicks && matches!(hit, Some(ItemKind::Block(_))) {
+        return if release {
+            BarAction::Nothing
+        } else {
+            BarAction::StatusClick
+        };
+    }
+    match binding {
+        Some(cmd) => BarAction::Command(cmd.to_string()),
+        None if release => BarAction::Nothing,
+        None => BarAction::Default,
+    }
+}
+
+/// The built-in command for an unbound press: button 1 on a workspace button
+/// switches to it, and the vertical wheel anywhere walks workspaces.
+pub fn default_command(hit: Option<&ItemKind>, button: u8) -> Option<String> {
+    match (button, hit) {
+        (1, Some(ItemKind::Workspace(name))) => Some(click_command(name)),
+        (4, _) => Some("workspace prev".into()),
+        (5, _) => Some("workspace next".into()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,5 +730,67 @@ mod tests {
         assert_eq!(bar_binding_for(&b, 4, false), Some("workspace prev"));
         assert_eq!(bar_binding_for(&b, 3, false), None);
         assert_eq!(bar_binding_for(&b, 3, true), Some("nop"));
+    }
+
+    #[test]
+    fn block_clicks_go_to_status_when_wanted() {
+        let blk = ItemKind::Block(0);
+        // A binding for the button does not steal the block's click.
+        assert_eq!(
+            route_bar_button(Some(&blk), true, false, Some("nop")),
+            BarAction::StatusClick
+        );
+        assert_eq!(
+            route_bar_button(Some(&blk), true, false, None),
+            BarAction::StatusClick
+        );
+        // Releases over a clickable block are consumed, never bound.
+        assert_eq!(
+            route_bar_button(Some(&blk), true, true, Some("nop")),
+            BarAction::Nothing
+        );
+    }
+    #[test]
+    fn bindings_then_defaults_elsewhere() {
+        let blk = ItemKind::Block(0);
+        let ws = ItemKind::Workspace("1".into());
+        // Status did not ask for clicks: bindings apply over blocks too.
+        assert_eq!(
+            route_bar_button(Some(&blk), false, false, Some("nop")),
+            BarAction::Command("nop".into())
+        );
+        assert_eq!(
+            route_bar_button(Some(&blk), false, false, None),
+            BarAction::Default
+        );
+        assert_eq!(
+            route_bar_button(Some(&ws), true, false, Some("exec x")),
+            BarAction::Command("exec x".into())
+        );
+        assert_eq!(
+            route_bar_button(None, true, false, None),
+            BarAction::Default
+        );
+        assert_eq!(
+            route_bar_button(None, true, true, Some("nop")),
+            BarAction::Command("nop".into())
+        );
+        assert_eq!(route_bar_button(None, true, true, None), BarAction::Nothing);
+    }
+    #[test]
+    fn default_commands() {
+        let ws = ItemKind::Workspace("2".into());
+        assert_eq!(
+            default_command(Some(&ws), 1).as_deref(),
+            Some(r#"workspace "2""#)
+        );
+        assert_eq!(default_command(Some(&ws), 3), None);
+        assert_eq!(default_command(Some(&ItemKind::Block(0)), 1), None);
+        assert_eq!(default_command(None, 4).as_deref(), Some("workspace prev"));
+        assert_eq!(
+            default_command(Some(&ItemKind::Block(1)), 5).as_deref(),
+            Some("workspace next")
+        );
+        assert_eq!(default_command(None, 6), None);
     }
 }

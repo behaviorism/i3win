@@ -246,6 +246,15 @@ impl App {
             .collect()
     }
 
+    /// Ids of the bars whose status process asked for click events.
+    fn click_bars(&self) -> HashSet<String> {
+        self.statuses
+            .iter()
+            .filter(|(_, s)| s.process.as_ref().is_some_and(|p| p.wants_clicks()))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// The watched modifier of Hide-mode bars went down or up: redraw only the bars.
     pub fn on_modifier_state(&mut self, held: bool) {
         if self.modifier_held != held {
@@ -259,8 +268,13 @@ impl App {
         self.bars_dirty = false;
         let arr = self.wm.arrange();
         let blocks = self.all_blocks();
-        self.bars
-            .update(&self.wm, &arr, &blocks, self.modifier_held);
+        self.bars.update(
+            &self.wm,
+            &arr,
+            &blocks,
+            &self.click_bars(),
+            self.modifier_held,
+        );
     }
 
     fn try_manage_in(wm: &mut Wm, id: WindowId) {
@@ -523,9 +537,26 @@ impl App {
                 .find(|(o, _)| cx >= o.x && cx < o.right() && cy >= o.y && cy < o.bottom())
                 .map_or(1.0, |(_, s)| *s)
         });
+        // Before the bars: a new watch re-syncs `modifier_held` to its baseline.
+        let watch = self
+            .wm
+            .config
+            .bars
+            .iter()
+            .find(|b| self.wm.bar_state_of(&b.id).0 == BarMode::Hide)
+            .and_then(|b| b.modifier);
+        if watch != self.last_watch {
+            self.modifier_held = keyboard::set_modifier_watch(watch);
+            self.last_watch = watch;
+        }
         let blocks = self.all_blocks();
-        self.bars
-            .update(&self.wm, &arr, &blocks, self.modifier_held);
+        self.bars.update(
+            &self.wm,
+            &arr,
+            &blocks,
+            &self.click_bars(),
+            self.modifier_held,
+        );
         self.bars_dirty = false;
         // Focus last: focusing a still-hidden window fails.
         let leaf = self
@@ -541,20 +572,6 @@ impl App {
         if combos != self.last_combos {
             keyboard::set_combos(&combos);
             self.last_combos = combos;
-        }
-        let watch = self
-            .wm
-            .config
-            .bars
-            .iter()
-            .find(|b| self.wm.bar_state_of(&b.id).0 == BarMode::Hide)
-            .and_then(|b| b.modifier);
-        if watch != self.last_watch {
-            keyboard::set_modifier_watch(watch);
-            self.last_watch = watch;
-            if watch.is_none() {
-                self.modifier_held = false;
-            }
         }
     }
 

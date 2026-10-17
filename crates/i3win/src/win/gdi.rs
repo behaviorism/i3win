@@ -1,5 +1,5 @@
 //! Small GDI helpers shared by the decoration windows.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use i3win_core::arrange::DecoState;
@@ -29,9 +29,20 @@ pub fn colors_for(state: DecoState, cc: &ClientColors) -> ColorClass {
 /// family, size x10, scale x100, weight, italic, underline, strike.
 type FontKey = (String, i32, i32, i32, bool, bool, bool);
 
+/// Cached fonts kept before the cache is emptied (markup can ask for many sizes).
+const FONT_CACHE_MAX: usize = 256;
+
 thread_local! {
     /// Created fonts as raw handle values, freed by `free_fonts`.
     static FONTS: RefCell<HashMap<FontKey, isize>> = RefCell::new(HashMap::new());
+    /// Nesting depth of `paint_buffered`; cached fonts may be selected into a DC
+    /// or held by the painter meanwhile, so the cache is never emptied then.
+    static PAINTING: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Whether a full cache of `len` fonts is emptied before adding another.
+fn should_evict(len: usize, painting: bool) -> bool {
+    len >= FONT_CACHE_MAX && !painting
 }
 
 /// A cached regular-weight font for `family` at `size_pt` scaled by `scale`.
@@ -62,6 +73,11 @@ pub fn font_ex(
         let mut map = f.borrow_mut();
         if let Some(&h) = map.get(&key) {
             return HFONT(h as *mut _);
+        }
+        // Outside a paint no cached font is selected into a DC (every user restores
+        // the previous font right away), so the handles can be deleted safely.
+        if should_evict(map.len(), PAINTING.with(Cell::get) > 0) {
+            delete_fonts(&mut map);
         }
         let height = -((size_pt * 96.0 / 72.0 * scale).round() as i32);
         let mut face: Vec<u16> = resolve_font_family(family).encode_utf16().collect();
@@ -95,14 +111,16 @@ pub fn font_ex(
 
 /// Deletes every cached font.
 pub fn free_fonts() {
-    FONTS.with(|f| {
-        for (_, h) in f.borrow_mut().drain() {
-            // SAFETY: the handle came from CreateFontW and is no longer in use.
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(h as *mut _));
-            }
+    FONTS.with(|f| delete_fonts(&mut f.borrow_mut()));
+}
+
+fn delete_fonts(map: &mut HashMap<FontKey, isize>) {
+    for (_, h) in map.drain() {
+        // SAFETY: the handle came from CreateFontW and is no longer in use.
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(h as *mut _));
         }
-    });
+    }
 }
 
 fn to_rect(r: Rect) -> RECT {
@@ -226,8 +244,67 @@ pub fn measure_runs(hdc: HDC, runs: &[Run], base: &Font, scale: f32) -> i32 {
     })
 }
 
+/// Where to cut runs of `widths` starting at `x` so they end by `right`: `None`
+/// when they fit, else `(i, avail)`: draw runs before `i` whole, then as much of
+/// run `i` as fits in `avail` px followed by an ellipsis `ell[i]` px wide (the
+/// ellipsis measured in run `i`'s font).
+fn ellipsis_cut(widths: &[i32], ell: &[i32], x: i32, right: i32) -> Option<(usize, i32)> {
+    let total = widths.iter().fold(0i32, |a, w| a.saturating_add(*w));
+    if x.saturating_add(total) <= right {
+        return None;
+    }
+    let mut cx = x;
+    for (i, (w, e)) in widths.iter().zip(ell).enumerate() {
+        if cx.saturating_add(*w).saturating_add(*e) > right {
+            return Some((i, right.saturating_sub(*e).saturating_sub(cx).max(0)));
+        }
+        cx = cx.saturating_add(*w);
+    }
+    None
+}
+
+/// UTF-16 units of `wide` that fit in `max` px with the font selected into `hdc`,
+/// never splitting a surrogate pair.
+///
+/// # Safety
+/// `hdc` must be a valid DC.
+unsafe fn fit_prefix(hdc: HDC, wide: &[u16], max: i32) -> usize {
+    let mut fit = 0i32;
+    let mut size = SIZE::default();
+    let ok = GetTextExtentExPointW(
+        hdc,
+        PCWSTR(wide.as_ptr()),
+        wide.len() as i32,
+        max,
+        Some(&mut fit),
+        None,
+        &mut size,
+    )
+    .as_bool();
+    let mut n = if ok {
+        (fit.max(0) as usize).min(wide.len())
+    } else {
+        0
+    };
+    if n > 0 && (0xD800..0xDC00).contains(&wide[n - 1]) {
+        n -= 1;
+    }
+    n
+}
+
+/// Width of `wide` with the font selected into `hdc`.
+///
+/// # Safety
+/// `hdc` must be a valid DC.
+unsafe fn text_width(hdc: HDC, wide: &[u16]) -> i32 {
+    let mut size = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, wide, &mut size);
+    size.cx.max(0)
+}
+
 /// Draws `runs` starting at `x`, vertically centered in `r` (runs share a
-/// baseline) and clipped to `r`. A run's `bg` fills its text extent first.
+/// baseline) and clipped to `r`; runs too wide for `r` end in an ellipsis.
+/// A run's `bg` fills its text extent first.
 pub fn draw_runs(
     hdc: HDC,
     x: i32,
@@ -244,19 +321,45 @@ pub fn draw_runs(
     let ascent = laid.iter().map(|l| l.asc).max().unwrap_or(0);
     let descent = laid.iter().map(|l| l.h - l.asc).max().unwrap_or(0);
     let top = r.y + (r.h - (ascent + descent)) / 2;
+    const ELLIPSIS: [u16; 1] = [0x2026];
+    let widths: Vec<i32> = laid.iter().map(|l| l.w).collect();
     // SAFETY: the saved DC state (clip, font, colors) is restored at the end.
     unsafe {
         let saved = SaveDC(hdc);
         IntersectClipRect(hdc, r.x, r.y, r.right(), r.bottom());
         SetBkMode(hdc, TRANSPARENT);
+        let total = widths.iter().fold(0i32, |a, w| a.saturating_add(*w));
+        let cut = if x.saturating_add(total) > r.right() {
+            let ell: Vec<i32> = laid
+                .iter()
+                .map(|l| {
+                    SelectObject(hdc, l.font);
+                    text_width(hdc, &ELLIPSIS)
+                })
+                .collect();
+            ellipsis_cut(&widths, &ell, x, r.right())
+        } else {
+            None
+        };
         let mut cx = x;
-        for (run, l) in runs.iter().zip(&laid) {
+        for (i, (run, l)) in runs.iter().zip(&laid).enumerate() {
             let y = top + ascent - l.asc;
+            SelectObject(hdc, l.font);
+            SetTextColor(hdc, colorref(run.style.fg.unwrap_or(default_fg)));
+            if let Some((_, avail)) = cut.filter(|(c, _)| *c == i) {
+                let head = &l.wide[..fit_prefix(hdc, &l.wide, avail)];
+                let hw = text_width(hdc, head);
+                let ew = text_width(hdc, &ELLIPSIS);
+                if let Some(bg) = run.style.bg {
+                    fill(hdc, Rect::new(cx, y, hw.saturating_add(ew), l.h), bg);
+                }
+                let _ = TextOutW(hdc, cx, y, head);
+                let _ = TextOutW(hdc, cx.saturating_add(hw), y, &ELLIPSIS);
+                break;
+            }
             if let Some(bg) = run.style.bg {
                 fill(hdc, Rect::new(cx, y, l.w, l.h), bg);
             }
-            SelectObject(hdc, l.font);
-            SetTextColor(hdc, colorref(run.style.fg.unwrap_or(default_fg)));
             let _ = TextOutW(hdc, cx, y, &l.wide);
             cx = cx.saturating_add(l.w);
         }
@@ -266,6 +369,15 @@ pub fn draw_runs(
 
 /// Double-buffered paint of `hwnd`'s client area; `f` draws into the memory DC.
 pub fn paint_buffered(hwnd: HWND, f: impl FnOnce(HDC, Rect)) {
+    /// Marks a paint in progress for the font cache, even if `f` unwinds.
+    struct PaintGuard;
+    impl Drop for PaintGuard {
+        fn drop(&mut self) {
+            PAINTING.with(|p| p.set(p.get().saturating_sub(1)));
+        }
+    }
+    PAINTING.with(|p| p.set(p.get() + 1));
+    let _guard = PaintGuard;
     // SAFETY: standard BeginPaint/EndPaint pairing; every GDI object is released.
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -364,5 +476,33 @@ mod tests {
             colors_for(DecoState::FocusedInactive, &cc),
             cc.focused_inactive
         );
+    }
+
+    #[test]
+    fn ellipsis_cut_points() {
+        // Fits exactly: no cut.
+        assert_eq!(ellipsis_cut(&[10, 20], &[5, 5], 0, 30), None);
+        // Overflows in the second run: it keeps 29 - 5 - 10 = 14 px.
+        assert_eq!(ellipsis_cut(&[10, 20], &[5, 5], 0, 29), Some((1, 14)));
+        // The first run would leave no room for its ellipsis: cut inside it.
+        assert_eq!(ellipsis_cut(&[10, 20], &[5, 5], 0, 12), Some((0, 7)));
+        // The start offset counts; `avail` never goes negative.
+        assert_eq!(ellipsis_cut(&[10], &[8], 25, 30), Some((0, 0)));
+        assert_eq!(ellipsis_cut(&[], &[], 0, 0), None);
+    }
+    #[test]
+    fn font_cache_evicts_only_outside_paint() {
+        assert!(!should_evict(FONT_CACHE_MAX - 1, false));
+        assert!(should_evict(FONT_CACHE_MAX, false));
+        assert!(!should_evict(FONT_CACHE_MAX + 10, true));
+    }
+    #[test]
+    fn font_cache_stays_bounded() {
+        for i in 0..(FONT_CACHE_MAX + 50) {
+            let _ = font("Segoe UI", 4.0 + i as f32 * 0.1, 1.0);
+        }
+        let len = FONTS.with(|f| f.borrow().len());
+        assert!(len > 0 && len <= FONT_CACHE_MAX, "{len}");
+        free_fonts();
     }
 }

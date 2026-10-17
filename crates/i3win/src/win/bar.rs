@@ -17,8 +17,8 @@ use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
-    MonitorFromWindow, ReleaseDC, SelectObject, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    ClientToScreen, GetDC, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, ScreenToClient,
+    SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -27,7 +27,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::bar_layout::{
-    bar_binding_for, click_command, hit_test, layout_bar, BarLayout, BarStyle, ItemKind,
+    bar_binding_for, default_command, hit_test, layout_bar, route_bar_button, BarAction, BarItem,
+    BarLayout, BarStyle, ItemKind,
 };
 use crate::mainloop::{self, MainMsg};
 use crate::win::gdi;
@@ -43,6 +44,10 @@ pub struct BarData {
     pub blocks: Vec<Block>,
     /// The bar's `bindsym button<N>` entries, so the window proc needs no `App`.
     pub bindings: Vec<BarBinding>,
+    /// Whether the bar's status process asked for click events.
+    pub wants_clicks: bool,
+    /// Screen origin of the bar's output (work-area) rect, for `output_x/y`.
+    pub output_origin: (i32, i32),
 }
 
 struct BarWindow {
@@ -169,7 +174,8 @@ impl Bars {
     }
 
     /// Brings the bar windows in line with the config, outputs and `blocks`
-    /// (latest status blocks per bar id). Dock bars reserve space; Hide bars are
+    /// (latest status blocks per bar id); `click_bars` are the bar ids whose status
+    /// process asked for click events. Dock bars reserve space; Hide bars are
     /// overlays shown while `hidden_state` is show, `modifier_held`, or a
     /// workspace on the output is urgent; Invisible bars get no window.
     pub fn update(
@@ -177,6 +183,7 @@ impl Bars {
         wm: &Wm,
         arr: &Arrangement,
         blocks: &HashMap<String, Vec<Block>>,
+        click_bars: &HashSet<String>,
         modifier_held: bool,
     ) {
         let mode = (wm.mode != "default").then_some(wm.mode.as_str());
@@ -243,6 +250,8 @@ impl Bars {
                     scale,
                     blocks: bar_blocks.clone(),
                     bindings: bar.bindings.clone(),
+                    wants_clicks: click_bars.contains(&bar.id),
+                    output_origin: (o.x, o.y),
                 };
                 let mut created = false;
                 if let Some(bw) = self.windows.get_mut(&key) {
@@ -417,75 +426,109 @@ fn paint(hwnd: HWND, data: &BarData) {
     });
 }
 
-fn click(hwnd: HWND, data: &BarData, button: u8, lp: LPARAM) {
-    let x = (lp.0 & 0xffff) as i16 as i32;
-    let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
-    let Some(item) = hit_test(&data.layout, x, y) else {
+/// Sends a click on status block `item` (client point `x, y`) to the bar's status process.
+fn status_click(hwnd: HWND, data: &BarData, item: &BarItem, button: u8, x: i32, y: i32) {
+    let ItemKind::Block(i) = item.kind else {
         return;
     };
-    match &item.kind {
-        ItemKind::Workspace(name) => {
-            if button == 1 {
-                mainloop::post(MainMsg::RunCommand(click_command(name)));
-            }
-        }
-        ItemKind::Mode => {}
-        ItemKind::Block(i) => {
-            let mut pt = POINT { x, y };
-            // SAFETY: plain Win32 call on our own window.
-            unsafe {
-                let _ = ClientToScreen(hwnd, &mut pt);
-            }
-            let block = data.blocks.get(*i);
-            let (mut ox, mut oy) = (0, 0);
-            // SAFETY: plain Win32 calls on our own window; `mi` is sized correctly.
-            unsafe {
-                let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                let mut mi = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                if GetMonitorInfoW(mon, &mut mi).as_bool() {
-                    ox = mi.rcMonitor.left;
-                    oy = mi.rcMonitor.top;
+    let mut pt = POINT { x, y };
+    // SAFETY: plain Win32 call on our own window.
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut pt);
+    }
+    let block = data.blocks.get(i);
+    let key_down = |vk: VIRTUAL_KEY| {
+        // SAFETY: plain Win32 call.
+        unsafe { GetKeyState(vk.0 as i32) < 0 }
+    };
+    let mut modifiers = Vec::new();
+    if key_down(VK_SHIFT) {
+        modifiers.push("Shift".to_string());
+    }
+    if key_down(VK_CONTROL) {
+        modifiers.push("Control".to_string());
+    }
+    if key_down(VK_MENU) {
+        modifiers.push("Mod1".to_string());
+    }
+    if key_down(VK_LWIN) || key_down(VK_RWIN) {
+        modifiers.push("Mod4".to_string());
+    }
+    mainloop::post(MainMsg::StatusClick {
+        bar: data.bar_id.clone(),
+        click: block_click(
+            block,
+            item.rect,
+            button,
+            modifiers,
+            (x, y),
+            (pt.x, pt.y),
+            data.output_origin,
+        ),
+    });
+}
+
+/// The i3bar click event for `button` at bar-client point `client` (screen point
+/// `screen`) on a block occupying `rect`; `output_x/y` are relative to the
+/// output's work-area origin `output`.
+fn block_click(
+    block: Option<&Block>,
+    rect: Rect,
+    button: u8,
+    modifiers: Vec<String>,
+    client: (i32, i32),
+    screen: (i32, i32),
+    output: (i32, i32),
+) -> Click {
+    Click {
+        name: block.and_then(|b| b.name.clone()),
+        instance: block.and_then(|b| b.instance.clone()),
+        button,
+        modifiers,
+        x: screen.0,
+        y: screen.1,
+        relative_x: client.0 - rect.x,
+        relative_y: client.1 - rect.y,
+        output_x: screen.0 - output.0,
+        output_y: screen.1 - output.1,
+        width: rect.w,
+        height: rect.h,
+    }
+}
+
+/// Handles `count` events of mouse `button` (i3 numbering) at client point
+/// `x, y`: a status click, a bar binding, or the default, per `route_bar_button`.
+fn on_button(hwnd: HWND, data: &BarData, button: u8, release: bool, x: i32, y: i32, count: u32) {
+    let hit = hit_test(&data.layout, x, y);
+    let kind = hit.map(|i| &i.kind);
+    let binding = bar_binding_for(&data.bindings, button, release);
+    let cmd = match route_bar_button(kind, data.wants_clicks, release, binding) {
+        BarAction::StatusClick => {
+            if let Some(item) = hit {
+                for _ in 0..count {
+                    status_click(hwnd, data, item, button, x, y);
                 }
             }
-            let key_down = |vk: VIRTUAL_KEY| {
-                // SAFETY: plain Win32 call.
-                unsafe { GetKeyState(vk.0 as i32) < 0 }
-            };
-            let mut modifiers = Vec::new();
-            if key_down(VK_SHIFT) {
-                modifiers.push("Shift".to_string());
-            }
-            if key_down(VK_CONTROL) {
-                modifiers.push("Control".to_string());
-            }
-            if key_down(VK_MENU) {
-                modifiers.push("Mod1".to_string());
-            }
-            if key_down(VK_LWIN) || key_down(VK_RWIN) {
-                modifiers.push("Mod4".to_string());
-            }
-            mainloop::post(MainMsg::StatusClick {
-                bar: data.bar_id.clone(),
-                click: Click {
-                    name: block.and_then(|b| b.name.clone()),
-                    instance: block.and_then(|b| b.instance.clone()),
-                    button,
-                    modifiers,
-                    x: pt.x,
-                    y: pt.y,
-                    relative_x: x - item.rect.x,
-                    relative_y: y - item.rect.y,
-                    output_x: pt.x - ox,
-                    output_y: pt.y - oy,
-                    width: item.rect.w,
-                    height: item.rect.h,
-                },
-            });
+            return;
         }
+        BarAction::Command(c) => c,
+        BarAction::Default => match default_command(kind, button) {
+            Some(c) => c,
+            None => return,
+        },
+        BarAction::Nothing => return,
+    };
+    for _ in 0..count {
+        mainloop::post(MainMsg::RunCommand(cmd.clone()));
     }
+}
+
+/// The point packed in a mouse message's `lParam` (client or screen coordinates).
+fn lparam_point(lp: LPARAM) -> (i32, i32) {
+    (
+        (lp.0 & 0xffff) as i16 as i32,
+        ((lp.0 >> 16) & 0xffff) as i16 as i32,
+    )
 }
 
 unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -501,31 +544,19 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-        WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_RBUTTONDOWN => {
-            let button = match msg {
-                WM_LBUTTONDOWN => 1,
-                WM_MBUTTONDOWN => 2,
-                _ => 3,
+        WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_RBUTTONDOWN | WM_LBUTTONUP | WM_MBUTTONUP
+        | WM_RBUTTONUP => {
+            let (button, release) = match msg {
+                WM_LBUTTONDOWN => (1, false),
+                WM_MBUTTONDOWN => (2, false),
+                WM_RBUTTONDOWN => (3, false),
+                WM_LBUTTONUP => (1, true),
+                WM_MBUTTONUP => (2, true),
+                _ => (3, true),
             };
             if let Some(data) = ptr.as_ref() {
-                match bar_binding_for(&data.bindings, button, false) {
-                    Some(cmd) => mainloop::post(MainMsg::RunCommand(cmd.into())),
-                    None => click(hwnd, data, button, lp),
-                }
-            }
-            LRESULT(0)
-        }
-        WM_LBUTTONUP | WM_MBUTTONUP | WM_RBUTTONUP => {
-            let button = match msg {
-                WM_LBUTTONUP => 1,
-                WM_MBUTTONUP => 2,
-                _ => 3,
-            };
-            if let Some(cmd) = ptr
-                .as_ref()
-                .and_then(|d| bar_binding_for(&d.bindings, button, true))
-            {
-                mainloop::post(MainMsg::RunCommand(cmd.into()));
+                let (x, y) = lparam_point(lp);
+                on_button(hwnd, data, button, release, x, y, 1);
             }
             LRESULT(0)
         }
@@ -539,6 +570,9 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 a.set(acc);
                 n
             });
+            if steps == 0 {
+                return LRESULT(0);
+            }
             // i3 numbering: 4 up, 5 down, 6 left, 7 right.
             let button = match (horizontal, steps > 0) {
                 (false, true) => 4,
@@ -546,19 +580,12 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 (true, true) => 7,
                 (true, false) => 6,
             };
-            let bound = ptr
-                .as_ref()
-                .and_then(|d| bar_binding_for(&d.bindings, button, false));
-            // Unbound vertical wheel keeps the v1 workspace prev/next default.
-            let cmd = bound.or(match button {
-                4 => Some("workspace prev"),
-                5 => Some("workspace next"),
-                _ => None,
-            });
-            if let Some(cmd) = cmd {
-                for _ in 0..steps.unsigned_abs() {
-                    mainloop::post(MainMsg::RunCommand(cmd.into()));
-                }
+            if let Some(data) = ptr.as_ref() {
+                // Wheel messages carry screen coordinates.
+                let (sx, sy) = lparam_point(lp);
+                let mut pt = POINT { x: sx, y: sy };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                on_button(hwnd, data, button, false, pt.x, pt.y, steps.unsigned_abs());
             }
             LRESULT(0)
         }
@@ -624,5 +651,29 @@ mod tests {
     fn bar_outputs_filter() {
         let c = i3win_core::config::parse_config("bar {\noutput NOPE\n}\n");
         assert!(!bar_applies(&c.bars[0], "DISPLAY1", true));
+    }
+    #[test]
+    fn block_click_is_relative_to_work_area_origin() {
+        let block = Block {
+            name: Some("cpu".into()),
+            instance: Some("0".into()),
+            ..Default::default()
+        };
+        // Bar on a monitor at x=1920 whose work area starts below a 40 px top taskbar.
+        let c = block_click(
+            Some(&block),
+            Rect::new(900, 0, 60, 20),
+            4,
+            vec!["Shift".into()],
+            (910, 5),
+            (2830, 45),
+            (1920, 40),
+        );
+        assert_eq!((c.x, c.y), (2830, 45));
+        assert_eq!((c.output_x, c.output_y), (910, 5));
+        assert_eq!((c.relative_x, c.relative_y), (10, 5));
+        assert_eq!((c.width, c.height, c.button), (60, 20, 4));
+        assert_eq!(c.name.as_deref(), Some("cpu"));
+        assert_eq!(c.instance.as_deref(), Some("0"));
     }
 }

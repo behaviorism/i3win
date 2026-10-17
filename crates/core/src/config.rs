@@ -104,8 +104,6 @@ pub struct BarConfig {
     pub workspace_min_width: i32,
     /// top, right, bottom, left in px.
     pub padding: [i32; 4],
-    /// Whether the mode indicator text is pango markup.
-    pub mode_markup: bool,
     pub bindings: Vec<BarBinding>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -427,7 +425,6 @@ impl Default for BarConfig {
             binding_mode_indicator: true,
             workspace_min_width: 0,
             padding: [0; 4],
-            mode_markup: false,
             bindings: Vec::new(),
         }
     }
@@ -666,7 +663,30 @@ pub fn parse_config(text: &str) -> Config {
             cfg.warnings.push(format!("line {no}: {msg}"));
         }
     }
+    dedupe_bar_ids(&mut cfg);
     cfg
+}
+
+/// Bar ids route state and clicks, so they must be unique: a later bar whose id
+/// (explicit, or colliding with an automatic `bar-N`) is taken becomes `ID-2`,
+/// `ID-3`, ... (skipping any id used elsewhere), with a warning.
+fn dedupe_bar_ids(cfg: &mut Config) {
+    let all: Vec<String> = cfg.bars.iter().map(|b| b.id.clone()).collect();
+    let mut used: HashSet<String> = HashSet::new();
+    for i in 0..cfg.bars.len() {
+        let id = cfg.bars[i].id.clone();
+        if used.insert(id.clone()) {
+            continue;
+        }
+        let new_id = (2..)
+            .map(|n| format!("{id}-{n}"))
+            .find(|c| !used.contains(c) && !all.contains(c))
+            .unwrap_or_default();
+        cfg.warnings
+            .push(format!("bar: duplicate id '{id}' renamed to '{new_id}'"));
+        used.insert(new_id.clone());
+        cfg.bars[i].id = new_id;
+    }
 }
 
 fn handle_line(
@@ -765,7 +785,7 @@ fn bar_key(cfg: &mut Config, kw: &str, args: &str) -> Result<(), String> {
         return Err("bar: directive outside a bar block".to_string());
     };
     match kw {
-        "id" => bar.id = args.to_string(),
+        "id" => bar.id = unquote(args),
         "output" => bar.outputs.push(unquote(args)),
         "mode" => {
             bar.mode = match args {
@@ -1496,5 +1516,58 @@ output primary
         assert!(c.bindings["default"].len() >= 50 && c.bindings["resize"].len() == 11);
         assert_eq!(c.bars[0].status_command.as_deref(), Some("i3win-status"));
         assert!(default_config_text(false).contains("exec cmd"));
+    }
+
+    #[test]
+    fn bar_id_is_unquoted() {
+        let c = parse_config(
+            "bar {
+id \"top\"
+}
+",
+        );
+        assert_eq!(c.bars[0].id, "top");
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    }
+
+    #[test]
+    fn duplicate_bar_ids_are_renamed_with_warning() {
+        let c = parse_config(
+            "bar {
+id top
+}
+bar {
+id top
+}
+bar {
+id top
+}
+bar {
+id bar-4
+}
+bar {
+}
+",
+        );
+        let ids: Vec<&str> = c.bars.iter().map(|b| b.id.as_str()).collect();
+        // The fifth bar's automatic id `bar-4` collides with the explicit one.
+        assert_eq!(ids, ["top", "top-2", "top-3", "bar-4", "bar-4-2"]);
+        assert_eq!(c.warnings.len(), 3, "{:?}", c.warnings);
+        assert!(c.warnings[0].contains("duplicate id 'top'"));
+        // A rename skips ids taken by later bars.
+        let c = parse_config(
+            "bar {
+id a
+}
+bar {
+id a
+}
+bar {
+id a-2
+}
+",
+        );
+        let ids: Vec<&str> = c.bars.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["a", "a-3", "a-2"]);
     }
 }

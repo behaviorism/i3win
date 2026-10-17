@@ -93,24 +93,33 @@ impl KeyMatcher {
         }
     }
 
-    /// Sets the modifier to watch (`None` disables); the current state is the baseline.
-    pub fn set_watch(&mut self, watch: Option<Modifiers>) {
+    /// Sets the modifier to watch (`None` disables); the current state is the
+    /// baseline, which is returned so the caller can re-sync its held flag.
+    pub fn set_watch(&mut self, watch: Option<Modifiers>) -> bool {
         self.watch = watch;
         self.watch_held = watch.is_some_and(|m| self.mods().contains(m));
+        self.watch_held
+    }
+
+    /// Re-derives the watched modifier's held state from the tracked keys and
+    /// returns it when it flipped (e.g. after `resync` dropped a missed key-up).
+    pub fn resync_watch(&mut self) -> Option<bool> {
+        let watch = self.watch?;
+        let held = self.mods().contains(watch);
+        (held != std::mem::replace(&mut self.watch_held, held)).then_some(held)
     }
 
     /// Applies a modifier key event and returns the new held state of the watched
     /// modifier when it flipped (`None` for repeats, other keys or no watch).
     pub fn watch_flip(&mut self, vk: u16, down: bool) -> Option<bool> {
-        let watch = self.watch?;
+        self.watch?;
         modifier_of(vk)?;
         if down {
             self.down_mods.insert(vk);
         } else {
             self.down_mods.remove(&vk);
         }
-        let held = self.mods().contains(watch);
-        (held != std::mem::replace(&mut self.watch_held, held)).then_some(held)
+        self.resync_watch()
     }
 
     pub fn mods(&self) -> Modifiers {
@@ -199,6 +208,22 @@ thread_local! {
     static HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
 }
 
+/// Tells the main window the watched modifier's held state flipped.
+fn post_mods(held: bool) {
+    let main = main_hwnd();
+    if main != 0 {
+        // SAFETY: plain Win32 call; posting never blocks the hook.
+        unsafe {
+            let _ = PostMessageW(
+                HWND(main as *mut _),
+                WM_APP_MODS,
+                WPARAM(held as usize),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION && lparam.0 != 0 {
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
@@ -215,31 +240,30 @@ unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
             })
         };
         if let Some(held) = flip {
-            let main = main_hwnd();
-            if main != 0 {
-                let _ = PostMessageW(
-                    HWND(main as *mut _),
-                    WM_APP_MODS,
-                    WPARAM(held as usize),
-                    LPARAM(0),
-                );
-            }
+            post_mods(held);
         }
-        let action = MATCHER.with(|m| match m.try_borrow_mut() {
+        let (action, resynced) = MATCHER.with(|m| match m.try_borrow_mut() {
             Ok(mut m) => {
+                let mut resynced = None;
                 if down && !own && modifier_of(vk).is_none() {
                     m.resync(|v| GetAsyncKeyState(v as i32) < 0);
+                    // A dropped stuck modifier must also release a revealed Hide bar.
+                    resynced = m.resync_watch();
                 }
-                m.on_key(
+                let action = m.on_key(
                     vk,
                     down,
                     own,
                     info.scanCode as u8,
                     info.flags.0 & LLKHF_EXTENDED != 0,
-                )
+                );
+                (action, resynced)
             }
-            Err(_) => KeyAction::Pass,
+            Err(_) => (KeyAction::Pass, None),
         });
+        if let Some(held) = resynced {
+            post_mods(held);
+        }
         match action {
             KeyAction::Fire { .. } | KeyAction::Mask => {
                 let item = match action {
@@ -299,12 +323,17 @@ pub fn set_combos(combos: &[(KeyCombo, bool)]) {
     });
 }
 
-pub fn set_modifier_watch(mods: Option<Modifiers>) {
-    MATCHER.with(|m| {
-        if let Ok(mut m) = m.try_borrow_mut() {
-            m.set_watch(mods);
+/// Sets the modifier watched for Hide-mode bars and returns its current held
+/// state (after dropping modifiers the OS no longer reports), the new baseline.
+pub fn set_modifier_watch(mods: Option<Modifiers>) -> bool {
+    MATCHER.with(|m| match m.try_borrow_mut() {
+        Ok(mut m) => {
+            // SAFETY: plain Win32 call.
+            m.resync(|v| unsafe { GetAsyncKeyState(v as i32) } < 0);
+            m.set_watch(mods)
         }
-    });
+        Err(_) => false,
+    })
 }
 
 pub fn drain() -> Vec<(Option<KeyCombo>, bool, bool)> {
@@ -317,6 +346,34 @@ pub fn drain() -> Vec<(Option<KeyCombo>, bool, bool)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resync_releases_watched_modifier() {
+        let mut k = KeyMatcher::new();
+        k.set_watch(Some(Modifiers::WIN));
+        assert_eq!(k.watch_flip(0x5B, true), Some(true));
+        // Win's key-up was missed (Win+L); the OS no longer reports it held.
+        k.resync(|_| false);
+        assert_eq!(k.resync_watch(), Some(false));
+        assert_eq!(k.resync_watch(), None);
+    }
+    #[test]
+    fn resync_watch_silent_without_flip_or_watch() {
+        let mut k = KeyMatcher::new();
+        assert_eq!(k.resync_watch(), None);
+        k.set_watch(Some(Modifiers::WIN));
+        k.watch_flip(0x5B, true);
+        k.resync(|_| true);
+        assert_eq!(k.resync_watch(), None);
+    }
+    #[test]
+    fn set_watch_reports_baseline() {
+        let mut k = KeyMatcher::new();
+        assert!(!k.set_watch(Some(Modifiers::WIN)));
+        k.on_key(0x5B, true, false, 0, false);
+        assert!(k.set_watch(Some(Modifiers::WIN)));
+        assert!(!k.set_watch(Some(Modifiers::ALT)));
+        assert!(!k.set_watch(None));
+    }
     #[test]
     fn modifier_watch_disabled_without_hide_bars() {
         let mut k = KeyMatcher::new();

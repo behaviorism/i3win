@@ -156,9 +156,14 @@ impl StatusProcess {
         self.generation
     }
 
+    /// Whether the process asked for click events in its header.
+    pub fn wants_clicks(&self) -> bool {
+        self.click_events.load(Ordering::SeqCst)
+    }
+
     /// Forwards a click to the process if it asked for click events; errors are ignored.
     pub fn click(&mut self, click: &Click) {
-        if !self.click_events.load(Ordering::SeqCst) {
+        if !self.wants_clicks() {
             return;
         }
         let line = self.writer.encode(click);
@@ -279,5 +284,28 @@ mod tests {
         assert!(wait_for(
             &|m| matches!(m, MainMsg::StatusExited(_, g) if *g == gen)
         ));
+    }
+
+    #[test]
+    fn wants_clicks_follows_header() {
+        let _g = crate::mainloop::QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut p =
+            StatusProcess::spawn(r#"echo {"version":1,"click_events":true}"#, "bar-0".into())
+                .unwrap();
+        let gen = p.generation();
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_secs(5) {
+            if drain_main_msgs()
+                .iter()
+                .any(|m| matches!(m, MainMsg::StatusExited(_, g) if *g == gen))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(p.wants_clicks());
+        p.kill();
     }
 }

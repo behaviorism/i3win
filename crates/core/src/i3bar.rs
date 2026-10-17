@@ -1,6 +1,31 @@
 //! i3bar status protocol: block parsing and click-event encoding.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+
+/// Largest pixel value accepted from a status line.
+const MAX_PX: f64 = 10_000.0;
+
+/// A JSON number as whole pixels: rounded and clamped to `0..=MAX_PX`.
+fn px_of(v: &Value) -> Option<i32> {
+    v.as_f64()
+        .filter(|f| f.is_finite())
+        .map(|f| f.round().clamp(0.0, MAX_PX) as i32)
+}
+
+/// Pixel fields accept any JSON number; anything else is ignored rather than
+/// failing the whole status line.
+fn lenient_px<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
+    Ok(px_of(&Value::deserialize(d)?))
+}
+
+/// `min_width`: a number of pixels (any JSON number) or a text; other values are ignored.
+fn lenient_min_width<'de, D: Deserializer<'de>>(d: D) -> Result<Option<MinWidth>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(t) => Some(MinWidth::Text(t)),
+        v => px_of(&v).map(MinWidth::Px),
+    })
+}
 
 fn yes() -> bool {
     true
@@ -30,9 +55,17 @@ pub struct Block {
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub separator: bool,
     /// Default 9 when drawing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_px"
+    )]
     pub separator_block_width: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_min_width"
+    )]
     pub min_width: Option<MinWidth>,
     /// "left" (default), "center" or "right".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,13 +73,29 @@ pub struct Block {
     /// "pango" or "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub markup: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_px"
+    )]
     pub border_top: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_px"
+    )]
     pub border_right: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_px"
+    )]
     pub border_bottom: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_px"
+    )]
     pub border_left: Option<i32>,
 }
 
@@ -323,5 +372,33 @@ mod tests {
         for l in ["", "日本語,", &huge, ",", ",,[", "]", "null", "[1,2]"] {
             let _ = p.feed_line(l);
         }
+    }
+
+    #[test]
+    fn numeric_fields_accept_floats() {
+        let mut p = StatusParser::new();
+        p.feed_line(r#"{"version":1}"#);
+        p.feed_line("[");
+        let b = p
+            .feed_line(r#"[{"full_text":"x","min_width":50.5,"border_top":1.0,"separator_block_width":9.7}]"#)
+            .unwrap();
+        assert_eq!(b[0].min_width, Some(MinWidth::Px(51)));
+        assert_eq!(b[0].border_top, Some(1));
+        assert_eq!(b[0].separator_block_width, Some(10));
+    }
+
+    #[test]
+    fn numeric_fields_clamp_and_ignore_junk() {
+        let mut p = StatusParser::new();
+        p.feed_line(r#"{"version":1}"#);
+        p.feed_line("[");
+        let b = p
+            .feed_line(r#"[{"full_text":"x","min_width":true,"border_left":-3,"border_right":1e9,"border_bottom":"2","separator_block_width":null}]"#)
+            .unwrap();
+        assert_eq!(b[0].min_width, None);
+        assert_eq!(b[0].border_left, Some(0));
+        assert_eq!(b[0].border_right, Some(10_000));
+        assert_eq!(b[0].border_bottom, None);
+        assert_eq!(b[0].separator_block_width, None);
     }
 }

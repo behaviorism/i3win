@@ -36,6 +36,11 @@ pub fn parse_markup(s: &str) -> Vec<Run> {
     })
 }
 
+/// Whether `s` parses as markup (`parse_markup` would not fall back to verbatim).
+pub fn is_valid(s: &str) -> bool {
+    parse(s).is_some()
+}
+
 /// The runs' text concatenated.
 pub fn plain_text(s: &str) -> String {
     parse_markup(s).iter().map(|r| r.text.as_str()).collect()
@@ -387,5 +392,13 @@ mod tests {
         assert_eq!(r.len(), 3);
         assert!(r[0].style.mono);
         assert!((r[2].style.scale - 0.833).abs() < 1e-6);
+    }
+
+    #[test]
+    fn validity() {
+        assert!(is_valid("<b>a</b> &amp; b"));
+        assert!(is_valid("plain"));
+        assert!(!is_valid("<b>unclosed"));
+        assert!(!is_valid("a & b"));
     }
 }

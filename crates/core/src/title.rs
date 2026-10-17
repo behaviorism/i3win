@@ -1,9 +1,10 @@
-use crate::markup::escape_markup;
+use crate::markup::{escape_markup, is_valid};
 
 /// Expands a `title_format` (`None` = `%title`). Unknown `%x` stay literal.
 /// With `show_marks`, each mark not starting with `_` is appended as ` [mark]`.
 /// An explicit `format` is markup: substituted values and marks are escaped and
-/// the returned flag is true. Without one the result is plain text.
+/// the returned flag is true. Without one, or when the format itself is malformed
+/// markup, the result is plain unescaped text and the flag is false.
 pub fn format_title(
     format: Option<&str>,
     title: &str,
@@ -13,27 +14,47 @@ pub fn format_title(
     marks: &[String],
     show_marks: bool,
 ) -> (String, bool) {
-    let markup = format.is_some();
+    let expand = |escape: bool| {
+        expand_title(
+            format.unwrap_or("%title"),
+            [title, class, instance, machine],
+            marks,
+            show_marks,
+            escape,
+        )
+    };
+    if format.is_some() {
+        let out = expand(true);
+        if is_valid(&out) {
+            return (out, true);
+        }
+    }
+    (expand(false), false)
+}
+
+/// Substitutes `%title %class %instance %machine` (in `values` order) into `fmt`
+/// and appends the visible marks, escaping inserted text when `escape` is set.
+fn expand_title(
+    fmt: &str,
+    values: [&str; 4],
+    marks: &[String],
+    show_marks: bool,
+    escape: bool,
+) -> String {
     let esc = |s: &str| {
-        if markup {
+        if escape {
             escape_markup(s)
         } else {
             s.to_string()
         }
     };
-    let fmt = format.unwrap_or("%title");
+    let names = ["%title", "%class", "%instance", "%machine"];
     let mut out = String::new();
     let mut rest = fmt;
     while let Some(i) = rest.find('%') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let table = [
-            ("%title", title),
-            ("%class", class),
-            ("%instance", instance),
-            ("%machine", machine),
-        ];
-        match table.iter().find(|(p, _)| rest.starts_with(p)) {
+        match names.iter().zip(values).find(|(p, _)| rest.starts_with(*p)) {
             Some((p, value)) => {
                 out.push_str(&esc(value));
                 rest = &rest[p.len()..];
@@ -52,7 +73,7 @@ pub fn format_title(
             out.push(']');
         }
     }
-    (out, markup)
+    out
 }
 
 #[cfg(test)]
@@ -97,5 +118,16 @@ mod tests {
         let marks = vec!["<m>".to_string()];
         let (t, _) = format_title(Some("%title"), "T", "c", "i", "PC", &marks, true);
         assert_eq!(t, "T [&lt;m&gt;]");
+    }
+
+    #[test]
+    fn malformed_title_format_falls_back_to_unescaped_plain_text() {
+        let (t, mk) = format_title(Some("<b>%title & co"), "A&B", "c", "i", "PC", &[], true);
+        assert_eq!(t, "<b>A&B & co");
+        assert!(!mk);
+        let marks = vec!["<m>".to_string()];
+        let (t, mk) = format_title(Some("<i>%title"), "T", "c", "i", "PC", &marks, true);
+        assert_eq!(t, "<i>T [<m>]");
+        assert!(!mk);
     }
 }
