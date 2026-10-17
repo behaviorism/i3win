@@ -285,6 +285,8 @@ fn node_json(wm: &Wm, arr: &Arrangement, id: NodeId) -> Value {
         "urgent": is_urgent(wm, id),
         "fullscreen_mode": u8::from(n.fullscreen),
         "sticky": n.sticky,
+        "title_format": n.title_format,
+        "window_icon_padding": n.title_icon.unwrap_or(-1),
         "nodes": n.children.iter().map(|&c| node_json(wm, arr, c)).collect::<Vec<_>>(),
         "floating_nodes": n.floating.iter().map(|&c| node_json(wm, arr, c)).collect::<Vec<_>>(),
     });
@@ -548,6 +550,44 @@ mod reply_tests {
         assert_eq!(w["window"], 1);
         assert_eq!(w["window_properties"]["class"], "c1");
         assert_eq!(w["focused"], true);
+    }
+    #[test]
+    fn tree_json_v2_fields() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.run_command("mark m, sticky enable, title_format x, title_window_icon padding 3px");
+        let t = tree_json(&wm).to_string();
+        for s in [
+            "\"marks\":[\"m\"]",
+            "\"sticky\":true",
+            "\"scratchpad_state\":\"none\"",
+            "\"title_format\":\"x\"",
+            "\"window_icon_padding\":3",
+        ] {
+            assert!(t.contains(s), "missing {s} in {t}");
+        }
+    }
+    #[test]
+    fn window_move_floating_urgent_events() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.take_effects();
+        wm.run_command("move left");
+        wm.run_command("floating toggle");
+        wm.run_command("workspace 2");
+        wm.on_focus_changed(WindowId(1));
+        let changes: Vec<String> = wm
+            .take_effects()
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Ipc(IpcEvent::Window { change, .. }) => Some(change),
+                _ => None,
+            })
+            .collect();
+        for c in ["move", "floating", "urgent"] {
+            assert!(changes.iter().any(|x| x == c), "missing {c}: {changes:?}");
+        }
     }
     #[test]
     fn version_and_modes_and_config() {

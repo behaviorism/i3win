@@ -516,6 +516,17 @@ impl Wm {
         self.emit_window("close", id);
     }
 
+    /// Clears the urgent flag of `node`, announcing it when it was set.
+    fn clear_urgent(&mut self, node: NodeId, id: WindowId) {
+        let was = match &mut self.tree.get_mut(node).kind {
+            NodeKind::Window(d) => std::mem::replace(&mut d.urgent, false),
+            _ => false,
+        };
+        if was {
+            self.emit_window("urgent", id);
+        }
+    }
+
     pub fn on_focus_changed(&mut self, id: WindowId) {
         let Some(node) = self.tree.window_node(id) else {
             return;
@@ -538,17 +549,13 @@ impl Wm {
             if self.focused_workspace() != old_ws {
                 self.note_workspace_focus(old_name, ws);
             }
-            if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
-                d.urgent = false;
-            }
+            self.clear_urgent(node, id);
             self.emit_window("focus", id);
         } else if self.config.focus_on_window_activation == FocusOnActivation::Focus {
             self.show_workspace(ws);
             self.focused_container = None;
             self.tree.set_focused(node);
-            if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
-                d.urgent = false;
-            }
+            self.clear_urgent(node, id);
             self.push_focus(id);
         } else {
             let was_urgent = matches!(&self.tree.get(node).kind, NodeKind::Window(d) if d.urgent);
@@ -563,6 +570,7 @@ impl Wm {
                     d.urgent = true;
                     d.urgent_since = seq;
                 }
+                self.emit_window("urgent", id);
             }
             if let Some(w) = self.focus_leaf_window() {
                 self.push_focus(w);

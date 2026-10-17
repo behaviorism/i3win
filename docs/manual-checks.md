@@ -59,3 +59,11 @@ Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 e
 10. Polling: run `while(1){i3win-msg -t get_tree > $null; sleep -m 200}` for 30 s -> no title-bar flicker, no lag.
 11. Stalled subscriber: start a monitor, enter QuickEdit selection in its console for 60 s while switching workspaces -> WM stays responsive.
 12. IPC smoke test (empty desktop, no i3win running): `cargo test -p i3win --test smoke -- --ignored --test-threads=1`. Known issue: if an assertion in `ipc_roundtrip_and_events` fails, the test kills i3win without restoring windows it hid on other workspaces; start `i3win.exe` once and it restores them from `%LOCALAPPDATA%\i3win\hidden.txt`.
+
+## Plan 5: window commands
+
+1. Config `for_window [class=".*"] title_window_icon on` + reload -> each window's title bar shows its icon left of the title.
+2. `border pixel 4` on a focused tiled window -> a 4 px border is drawn; `border none` removes it.
+3. `hide_edge_borders both` + reload -> borders on edges touching the screen edge are not drawn.
+4. `bindcode $mod+38 exec notepad` -> Alt+A opens Notepad on any keyboard layout (e.g. German, French AZERTY).
+5. `bindsym --release $mod+x exec notepad` -> Notepad opens on key up, not key down.

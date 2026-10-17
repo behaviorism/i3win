@@ -176,6 +176,35 @@ Start-Sleep 1
 Check '5 reloads leave one status process' ((StatusCount) -eq 1) "count=$(StatusCount)"
 Check 'still running after reloads' (-not $wm.HasExited)
 
+# ---- Plan 5: marks, scratchpad, rename, gaps (placed while the WM is still running; state is restored)
+$f = Fg
+$r = Msg mark x
+Check 'plan5 mark x' ($r.out -match '"success":true') $r.out
+$r = Msg -t get_marks
+Check 'plan5 get_marks contains "x"' ($r.out -match '"x"') $r.out
+$r = Msg move scratchpad
+Start-Sleep -Milliseconds 500
+Check 'plan5 move scratchpad hides focused notepad' (-not [U]::IsWindowVisible($f)) "visible=$([U]::IsWindowVisible($f))"
+$r = Msg scratchpad show
+Start-Sleep -Milliseconds 500
+Check 'plan5 scratchpad show shows it' ([U]::IsWindowVisible($f)) "visible=$([U]::IsWindowVisible($f))"
+$null = Msg floating disable
+$null = Msg unmark x
+Start-Sleep -Milliseconds 400
+$r = Msg rename workspace to 9
+Check 'plan5 rename workspace to 9' ($r.out -match '"success":true') $r.out
+$r = Msg -t get_workspaces
+Check 'plan5 get_workspaces contains "9"' ($r.out -match '"9"') $r.out
+$null = Msg rename workspace to 1
+Start-Sleep -Milliseconds 300
+$rb = $h | ForEach-Object { [U]::Rect($_).ToString() }
+$r = Msg gaps inner current set 20
+Start-Sleep -Milliseconds 500
+$ra = $h | ForEach-Object { [U]::Rect($_).ToString() }
+Check 'plan5 gaps inner current set 20 changes rects' ($null -ne (Compare-Object $rb $ra)) "before=$rb after=$ra"
+$null = Msg gaps inner current set 0
+Start-Sleep -Milliseconds 400
+
 # ---- crash recovery: taskkill on ws2
 Combo @($ALT) 0x32
 $vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
