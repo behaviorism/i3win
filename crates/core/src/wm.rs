@@ -454,11 +454,14 @@ impl Wm {
             }
             self.emit_window("focus", id);
         } else {
-            self.urgent_counter += 1;
-            let seq = self.urgent_counter;
-            if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
-                d.urgent = true;
-                d.urgent_since = seq;
+            let was_urgent = matches!(&self.tree.get(node).kind, NodeKind::Window(d) if d.urgent);
+            if !was_urgent {
+                self.urgent_counter += 1;
+                let seq = self.urgent_counter;
+                if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
+                    d.urgent = true;
+                    d.urgent_since = seq;
+                }
             }
             if let Some(w) = self.focus_leaf_window() {
                 self.push_focus(w);

@@ -131,6 +131,26 @@ impl Criteria {
         ok(&self.class, class) && ok(&self.instance, instance) && ok(&self.title, title)
     }
 
+    /// True when no key beyond class/instance/title is set (what `matches` can evaluate).
+    pub fn uses_only_window_info(&self) -> bool {
+        self.con_mark.is_none()
+            && self.con_id.is_none()
+            && self.id.is_none()
+            && self.workspace.is_none()
+            && !self.floating
+            && !self.tiling
+            && self.urgent.is_none()
+            && !(self.focused_class
+                || self.focused_instance
+                || self.focused_title
+                || self.focused_workspace
+                || self.focused_con)
+    }
+
+    pub fn has_urgent(&self) -> bool {
+        self.urgent.is_some()
+    }
+
     /// Matches a node that already exists in the tree; every key except
     /// `urgent` (which is a selection, see `select_matches`).
     pub fn matches_node(&self, wm: &Wm, node: NodeId) -> bool {
@@ -290,6 +310,23 @@ mod tests {
         assert_eq!(latest, vec![wm.tree.window_node(WindowId(1)).unwrap()]);
         let oldest = select_matches(&wm, &parse_criteria("urgent=oldest").unwrap());
         assert_eq!(oldest, vec![wm.tree.window_node(WindowId(2)).unwrap()]);
+    }
+    #[test]
+    fn urgent_since_stable_across_repeat_focus_events() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("workspace 2");
+        wm.on_focus_changed(WindowId(2));
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        let since = |wm: &Wm| match &wm.tree.get(n2).kind {
+            NodeKind::Window(d) => d.urgent_since,
+            _ => unreachable!(),
+        };
+        let first = since(&wm);
+        wm.on_focus_changed(WindowId(1));
+        wm.on_focus_changed(WindowId(2));
+        assert_eq!(since(&wm), first);
     }
     #[test]
     fn errors() {

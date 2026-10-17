@@ -783,6 +783,9 @@ fn top_level(
         }
         "for_window" => {
             let (crit, cmd) = split_criteria(args)?;
+            if crit.has_urgent() {
+                return Err("for_window: the urgent criterion is not supported".to_string());
+            }
             if cmd.is_empty() {
                 return Err("for_window: missing command".to_string());
             }
@@ -790,6 +793,11 @@ fn top_level(
         }
         "assign" => {
             let (crit, rest) = split_criteria(args)?;
+            if !crit.uses_only_window_info() {
+                return Err(
+                    "assign: only class, instance and title criteria are supported".to_string(),
+                );
+            }
             let mut toks: Vec<&str> = rest.split_whitespace().collect();
             if matches!(toks.first(), Some(&"\u{2192}") | Some(&"->")) {
                 toks.remove(0);
@@ -1191,6 +1199,20 @@ mod tests {
                 vec!["DISPLAY1".to_string(), "DISPLAY2".to_string()]
             )
         );
+    }
+    #[test]
+    fn assign_and_for_window_reject_unsupported_criteria() {
+        let c = parse_config("assign [con_mark=x] 3\n");
+        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+        assert!(c.assigns.is_empty());
+        let c = parse_config("assign [floating] 3\n");
+        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+        assert!(c.assigns.is_empty());
+        let c = parse_config("for_window [urgent=latest] floating enable\n");
+        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+        assert!(c.for_window.is_empty());
+        let c = parse_config("for_window [floating] border none\nassign [class=x] 3\n");
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
     }
     #[test]
     fn bad_lines_warn_not_panic() {
