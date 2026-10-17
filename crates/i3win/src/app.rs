@@ -1,6 +1,6 @@
 //! The application: glue between platform events and the core window manager.
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -124,17 +124,29 @@ fn spawn(command: &str, pipe_name: &str) {
     }
 }
 
+/// The status process of one bar and the blocks it last produced.
+#[derive(Default)]
+struct BarStatus {
+    process: Option<StatusProcess>,
+    blocks: Vec<Block>,
+}
+
+/// The entry for `bar` (the owner of a click), if any.
+#[cfg_attr(not(test), allow(dead_code))] // exercised by tests
+pub(crate) fn route_click<'a, T>(statuses: &'a HashMap<String, T>, bar: &str) -> Option<&'a T> {
+    statuses.get(bar)
+}
+
 pub struct App {
     pub wm: Wm,
     applied: Applied,
     tracker: HideTracker,
     decos: Decos,
     bars: Bars,
-    /// Latest status blocks (empty until the status process feeds them).
-    blocks: Vec<Block>,
     /// Blocks changed since the bars were last redrawn.
     bars_dirty: bool,
-    status: Option<StatusProcess>,
+    /// One status process and its latest blocks per configured bar id.
+    statuses: HashMap<String, BarStatus>,
     store: HiddenStore,
     config_path: PathBuf,
     last_combos: Vec<(KeyCombo, bool)>,
@@ -180,7 +192,6 @@ impl App {
             tracker: HideTracker::new(),
             decos: Decos::new(),
             bars: Bars::new(),
-            blocks: Vec::new(),
             bars_dirty: false,
             store: HiddenStore::open(paths::hidden_path()),
             config_path,
@@ -188,45 +199,54 @@ impl App {
             pending,
             config_text,
             pipe_name,
-            status: None,
+            statuses: HashMap::new(),
         };
         app.restart_status();
         app
     }
 
-    /// Kills the running status process (if any) and starts the configured one.
+    /// Kills every running status process and starts the configured ones.
     fn restart_status(&mut self) {
-        if let Some(mut old) = self.status.take() {
-            old.kill();
-        }
-        let Some(cmd) = self
-            .wm
-            .config
-            .bars
-            .first()
-            .and_then(|b| b.status_command.clone())
-        else {
-            self.blocks.clear();
-            return;
-        };
-        match StatusProcess::spawn(&cmd) {
-            Ok(p) => self.status = Some(p),
-            Err(e) => {
-                log::error!("status_command {cmd:?}: {e}");
-                self.blocks = vec![exit_block()];
+        for (_, mut old) in self.statuses.drain() {
+            if let Some(p) = old.process.as_mut() {
+                p.kill();
             }
+        }
+        for bar in &self.wm.config.bars {
+            let mut st = BarStatus::default();
+            if let Some(cmd) = bar.status_command.as_deref() {
+                match StatusProcess::spawn(cmd, bar.id.clone()) {
+                    Ok(p) => st.process = Some(p),
+                    Err(e) => {
+                        log::error!("status_command {cmd:?}: {e}");
+                        st.blocks = vec![exit_block()];
+                    }
+                }
+            }
+            self.statuses.insert(bar.id.clone(), st);
         }
     }
 
-    fn status_gen(&self) -> Option<u64> {
-        self.status.as_ref().map(|s| s.generation())
+    /// The status entry for `bar` when `generation` is its live process.
+    fn live_status(&mut self, bar: &str, generation: u64) -> Option<&mut BarStatus> {
+        self.statuses
+            .get_mut(bar)
+            .filter(|s| s.process.as_ref().map(|p| p.generation()) == Some(generation))
+    }
+
+    fn all_blocks(&self) -> HashMap<String, Vec<Block>> {
+        self.statuses
+            .iter()
+            .map(|(k, s)| (k.clone(), s.blocks.clone()))
+            .collect()
     }
 
     /// Redraws only the bars with the current blocks.
     fn refresh_bars(&mut self) {
         self.bars_dirty = false;
         let arr = self.wm.arrange();
-        self.bars.update(&self.wm, &arr, &self.blocks);
+        let blocks = self.all_blocks();
+        self.bars.update(&self.wm, &arr, &blocks);
     }
 
     fn try_manage_in(wm: &mut Wm, id: WindowId) {
@@ -326,19 +346,19 @@ impl App {
     /// must (status messages only refresh the bars themselves).
     pub fn on_main_msg(&mut self, msg: MainMsg) -> bool {
         match msg {
-            MainMsg::StatusUpdate(g, blocks) => {
-                if self.status_gen() == Some(g) {
-                    self.blocks = blocks;
+            MainMsg::StatusUpdate(bar, g, blocks) => {
+                if let Some(st) = self.live_status(&bar, g) {
+                    st.blocks = blocks;
                     self.bars_dirty = true;
                 }
                 return false;
             }
-            MainMsg::StatusExited(g) => {
-                if self.status_gen() == Some(g) {
-                    if let Some(mut p) = self.status.take() {
+            MainMsg::StatusExited(bar, g) => {
+                if let Some(st) = self.live_status(&bar, g) {
+                    if let Some(mut p) = st.process.take() {
                         p.kill();
                     }
-                    self.blocks = vec![exit_block()];
+                    st.blocks = vec![exit_block()];
                     self.bars_dirty = true;
                 }
                 return false;
@@ -361,8 +381,8 @@ impl App {
                 self.refresh_pointer();
                 self.wm.run_command(&c);
             }
-            MainMsg::StatusClick { bar: _, click } => {
-                if let Some(p) = self.status.as_mut() {
+            MainMsg::StatusClick { bar, click } => {
+                if let Some(p) = self.statuses.get_mut(&bar).and_then(|s| s.process.as_mut()) {
                     p.click(&click);
                 }
                 return false;
@@ -489,7 +509,8 @@ impl App {
                 .find(|(o, _)| cx >= o.x && cx < o.right() && cy >= o.y && cy < o.bottom())
                 .map_or(1.0, |(_, s)| *s)
         });
-        self.bars.update(&self.wm, &arr, &self.blocks);
+        let blocks = self.all_blocks();
+        self.bars.update(&self.wm, &arr, &blocks);
         self.bars_dirty = false;
         // Focus last: focusing a still-hidden window fails.
         let leaf = self
@@ -542,8 +563,10 @@ impl App {
         events::uninstall();
         keyboard::uninstall();
         hidden::restore_all_hidden();
-        if let Some(mut p) = self.status.take() {
-            p.kill();
+        for (_, mut st) in self.statuses.drain() {
+            if let Some(p) = st.process.as_mut() {
+                p.kill();
+            }
         }
         self.bars.destroy_all();
         self.decos.destroy_all();
@@ -559,6 +582,15 @@ fn ipc_needs_flush(msg_type: u32, has_effects: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn click_routes_to_owning_bar() {
+        use super::route_click;
+        let mut ids = std::collections::HashMap::new();
+        ids.insert("bar-0".to_string(), 0u8);
+        ids.insert("bar-1".to_string(), 1u8);
+        assert_eq!(route_click(&ids, "bar-1"), Some(&1));
+        assert_eq!(route_click(&ids, "bar-9"), None);
+    }
     #[test]
     fn ipc_flush_decision() {
         use super::ipc_needs_flush;

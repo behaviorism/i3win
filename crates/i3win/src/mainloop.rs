@@ -20,16 +20,15 @@ pub const WM_APP_MAIN: u32 = WM_APP + 3;
 pub enum MainMsg {
     FocusNode(NodeId),
     RunCommand(String),
-    /// A click on a status block of bar `bar` (Task 6 routes by it).
+    /// A click on a status block of bar `bar`.
     StatusClick {
-        #[allow(dead_code)] // read once Task 6 routes clicks per bar
         bar: String,
         click: i3win_core::i3bar::Click,
     },
-    /// Blocks from the status process of the given generation.
-    StatusUpdate(u64, Vec<i3win_core::i3bar::Block>),
-    /// The status process of the given generation ended.
-    StatusExited(u64),
+    /// Blocks from the status process of bar (id) and generation.
+    StatusUpdate(String, u64, Vec<i3win_core::i3bar::Block>),
+    /// The status process of bar (id) and generation ended.
+    StatusExited(String, u64),
     /// An i3 IPC request from a connection thread; the answer goes back on `reply`.
     Ipc {
         msg_type: u32,

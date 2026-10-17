@@ -85,7 +85,7 @@ pub fn exit_block() -> Block {
 }
 
 impl StatusProcess {
-    pub fn spawn(command: &str) -> std::io::Result<StatusProcess> {
+    pub fn spawn(command: &str, bar_id: String) -> std::io::Result<StatusProcess> {
         let mut cmd = Command::new("cmd.exe");
         cmd.raw_arg(cmd_args(command))
             .creation_flags(CREATE_NO_WINDOW)
@@ -136,11 +136,11 @@ impl StatusProcess {
                     let blocks = parser.feed_line(line);
                     flag.store(parser.click_events, Ordering::SeqCst);
                     if let Some(b) = blocks {
-                        post(MainMsg::StatusUpdate(generation, b));
+                        post(MainMsg::StatusUpdate(bar_id.clone(), generation, b));
                     }
                 }
             }
-            post(MainMsg::StatusExited(generation));
+            post(MainMsg::StatusExited(bar_id, generation));
         });
         Ok(StatusProcess {
             child,
@@ -235,7 +235,7 @@ mod tests {
         let _g = crate::mainloop::QUEUE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let mut p = StatusProcess::spawn("echo hello").unwrap();
+        let mut p = StatusProcess::spawn("echo hello", "bar-0".into()).unwrap();
         let gen = p.generation();
         let t = std::time::Instant::now();
         let mut got = vec![];
@@ -243,14 +243,14 @@ mod tests {
             got.extend(drain_main_msgs());
             if got
                 .iter()
-                .any(|m| matches!(m, MainMsg::StatusExited(g) if *g == gen))
+                .any(|m| matches!(m, MainMsg::StatusExited(_, g) if *g == gen))
             {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(got.iter().any(
-            |m| matches!(m, MainMsg::StatusUpdate(g, b) if *g == gen && b[0].full_text == "hello")
+            |m| matches!(m, MainMsg::StatusUpdate(_, g, b) if *g == gen && b[0].full_text == "hello")
         ));
         p.kill();
     }
@@ -260,7 +260,7 @@ mod tests {
         let _g = crate::mainloop::QUEUE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let mut p = StatusProcess::spawn("ping -n 30 127.0.0.1").unwrap();
+        let mut p = StatusProcess::spawn("ping -n 30 127.0.0.1", "bar-0".into()).unwrap();
         let gen = p.generation();
         let wait_for = |pred: &dyn Fn(&MainMsg) -> bool| {
             let t = std::time::Instant::now();
@@ -273,11 +273,11 @@ mod tests {
             false
         };
         assert!(wait_for(
-            &|m| matches!(m, MainMsg::StatusUpdate(g, _) if *g == gen)
+            &|m| matches!(m, MainMsg::StatusUpdate(_, g, _) if *g == gen)
         ));
         p.kill();
         assert!(wait_for(
-            &|m| matches!(m, MainMsg::StatusExited(g) if *g == gen)
+            &|m| matches!(m, MainMsg::StatusExited(_, g) if *g == gen)
         ));
     }
 }

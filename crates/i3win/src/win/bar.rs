@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use i3win_core::arrange::{bar_applies, bar_height_of, Arrangement};
 use i3win_core::bar_model::workspace_buttons;
-use i3win_core::config::{BarPosition, Font};
+use i3win_core::config::{BarMode, BarPosition, Font};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::{Block, Click};
 use i3win_core::markup::parse_markup;
@@ -33,6 +33,8 @@ use crate::win::gdi;
 /// Everything a bar window needs to paint and hit-test itself.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BarData {
+    /// Id of the configured bar this window belongs to (routes clicks).
+    pub bar_id: String,
     pub layout: BarLayout,
     pub font: Font,
     pub scale: f32,
@@ -48,14 +50,16 @@ struct BarWindow {
 }
 
 pub struct Bars {
-    windows: HashMap<String, BarWindow>,
+    /// Keyed by (bar id, output name).
+    windows: HashMap<(String, String), BarWindow>,
 }
 
-/// The bar strip inside output rect `o`.
-pub fn bar_rect(o: Rect, position: BarPosition, h: i32) -> Rect {
+/// The bar strip inside output rect `o`, `offset` pixels in from the edge
+/// (the summed heights of the earlier bars at the same edge).
+pub fn bar_rect_stacked(o: Rect, position: BarPosition, offset: i32, h: i32) -> Rect {
     match position {
-        BarPosition::Top => Rect::new(o.x, o.y, o.w, h),
-        BarPosition::Bottom => Rect::new(o.x, o.bottom() - h, o.w, h),
+        BarPosition::Top => Rect::new(o.x, o.y + offset, o.w, h),
+        BarPosition::Bottom => Rect::new(o.x, o.bottom() - offset - h, o.w, h),
     }
 }
 
@@ -160,15 +164,12 @@ impl Bars {
         }
     }
 
-    /// Brings the bar windows in line with the config, outputs and `blocks`.
-    pub fn update(&mut self, wm: &Wm, arr: &Arrangement, blocks: &[Block]) {
-        let Some(bar) = wm.config.bars.first() else {
-            self.destroy_all();
-            return;
-        };
-        let font = bar.font.clone().unwrap_or_else(|| wm.config.font.clone());
+    /// Brings the bar windows in line with the config, outputs and `blocks`
+    /// (latest status blocks per bar id). Only Dock bars get windows for now.
+    pub fn update(&mut self, wm: &Wm, arr: &Arrangement, blocks: &HashMap<String, Vec<Block>>) {
         let mode = (wm.mode != "default").then_some(wm.mode.as_str());
-        let mut live: HashSet<String> = HashSet::new();
+        let mut live: HashSet<(String, String)> = HashSet::new();
+        let no_blocks: Vec<Block> = Vec::new();
         for out in wm.outputs() {
             let NodeKind::Output {
                 name,
@@ -179,89 +180,103 @@ impl Bars {
             else {
                 continue;
             };
-            if !bar_applies(bar, name, *primary) {
-                continue;
-            }
             let (scale, o) = (*scale, *rect);
-            let h = bar_height_of(bar, &wm.config, scale);
-            live.insert(name.clone());
-            let r = bar_rect(o, bar.position, h);
-            let buttons = workspace_buttons(wm, out);
-            let style = BarStyle {
-                colors: &bar.colors,
-                focused_output: buttons.iter().any(|b| b.focused),
-                show_buttons: bar.workspace_buttons,
-                show_mode: bar.binding_mode_indicator,
-                strip_numbers: bar.strip_workspace_numbers,
-                strip_name: bar.strip_workspace_name,
-                workspace_min_width: bar.workspace_min_width,
-                separator_symbol: bar.separator_symbol.as_deref(),
-                mode_markup: wm.config.mode_markup.contains(&wm.mode),
-                padding: bar.padding,
-            };
-            let layout = layout_bar(
-                r.w,
-                r.h,
-                scale,
-                &buttons,
-                mode,
-                blocks,
-                &style,
-                &|t, markup| measure_text(&font, scale, t, markup),
-            );
-            let data = BarData {
-                layout,
-                font: font.clone(),
-                scale,
-                blocks: blocks.to_vec(),
-            };
-            let mut created = false;
-            if let Some(bw) = self.windows.get_mut(name) {
-                if bw.data != data {
-                    set_data(bw.hwnd, &data);
-                    bw.data = data;
-                }
-            } else {
-                let Some(hwnd) = create_window(r, &data) else {
+            // Heights already taken at the top and bottom edges by earlier bars.
+            let (mut top, mut bottom) = (0, 0);
+            for bar in &wm.config.bars {
+                if bar.mode != BarMode::Dock || !bar_applies(bar, name, *primary) {
                     continue;
+                }
+                let h = bar_height_of(bar, &wm.config, scale);
+                let offset = match bar.position {
+                    BarPosition::Top => &mut top,
+                    BarPosition::Bottom => &mut bottom,
                 };
-                created = true;
-                self.windows.insert(
-                    name.clone(),
-                    BarWindow {
-                        hwnd,
-                        rect: r,
-                        data,
-                        shown: false,
-                    },
+                let r = bar_rect_stacked(o, bar.position, *offset, h);
+                *offset += h;
+                let font = bar.font.clone().unwrap_or_else(|| wm.config.font.clone());
+                let key = (bar.id.clone(), name.clone());
+                live.insert(key.clone());
+                let bar_blocks = blocks.get(&bar.id).unwrap_or(&no_blocks);
+                let buttons = workspace_buttons(wm, out);
+                let style = BarStyle {
+                    colors: &bar.colors,
+                    focused_output: buttons.iter().any(|b| b.focused),
+                    show_buttons: bar.workspace_buttons,
+                    show_mode: bar.binding_mode_indicator,
+                    strip_numbers: bar.strip_workspace_numbers,
+                    strip_name: bar.strip_workspace_name,
+                    workspace_min_width: bar.workspace_min_width,
+                    separator_symbol: bar.separator_symbol.as_deref(),
+                    mode_markup: wm.config.mode_markup.contains(&wm.mode),
+                    padding: bar.padding,
+                };
+                let layout = layout_bar(
+                    r.w,
+                    r.h,
+                    scale,
+                    &buttons,
+                    mode,
+                    bar_blocks,
+                    &style,
+                    &|t, markup| measure_text(&font, scale, t, markup),
                 );
-            }
-            if let Some(bw) = self.windows.get_mut(name) {
-                let want_shown = !arr.fullscreen_outputs.contains(name);
-                // Re-asserting topmost every flush would hop over menus and tooltips.
-                let raise = created || bw.rect != r || (want_shown && !bw.shown);
-                // SAFETY: plain Win32 calls on our own window.
-                unsafe {
-                    if raise {
-                        let _ = SetWindowPos(
-                            bw.hwnd,
-                            HWND_TOPMOST,
-                            r.x,
-                            r.y,
-                            r.w.max(1),
-                            r.h.max(1),
-                            SWP_NOACTIVATE,
-                        );
-                        bw.rect = r;
+                let data = BarData {
+                    bar_id: bar.id.clone(),
+                    layout,
+                    font: font.clone(),
+                    scale,
+                    blocks: bar_blocks.clone(),
+                };
+                let mut created = false;
+                if let Some(bw) = self.windows.get_mut(&key) {
+                    if bw.data != data {
+                        set_data(bw.hwnd, &data);
+                        bw.data = data;
                     }
-                    if want_shown != bw.shown {
-                        let _ = ShowWindow(bw.hwnd, if want_shown { SW_SHOWNA } else { SW_HIDE });
-                        bw.shown = want_shown;
+                } else {
+                    let Some(hwnd) = create_window(r, &data) else {
+                        continue;
+                    };
+                    created = true;
+                    self.windows.insert(
+                        key.clone(),
+                        BarWindow {
+                            hwnd,
+                            rect: r,
+                            data,
+                            shown: false,
+                        },
+                    );
+                }
+                if let Some(bw) = self.windows.get_mut(&key) {
+                    let want_shown = !arr.fullscreen_outputs.contains(name);
+                    // Re-asserting topmost every flush would hop over menus and tooltips.
+                    let raise = created || bw.rect != r || (want_shown && !bw.shown);
+                    // SAFETY: plain Win32 calls on our own window.
+                    unsafe {
+                        if raise {
+                            let _ = SetWindowPos(
+                                bw.hwnd,
+                                HWND_TOPMOST,
+                                r.x,
+                                r.y,
+                                r.w.max(1),
+                                r.h.max(1),
+                                SWP_NOACTIVATE,
+                            );
+                            bw.rect = r;
+                        }
+                        if want_shown != bw.shown {
+                            let _ =
+                                ShowWindow(bw.hwnd, if want_shown { SW_SHOWNA } else { SW_HIDE });
+                            bw.shown = want_shown;
+                        }
                     }
                 }
             }
         }
-        let stale: Vec<String> = self
+        let stale: Vec<(String, String)> = self
             .windows
             .keys()
             .filter(|k| !live.contains(*k))
@@ -275,6 +290,22 @@ impl Bars {
                 }
             }
         }
+    }
+
+    /// The workspace whose button lies under screen point `(x, y)` on a
+    /// visible bar, if any (drop target for dragging windows onto buttons).
+    #[allow(dead_code)] // consumed by the drag-and-drop plan
+    pub fn workspace_at(&self, x: i32, y: i32) -> Option<String> {
+        self.windows.values().filter(|bw| bw.shown).find_map(|bw| {
+            let r = bw.rect;
+            if x < r.x || x >= r.right() || y < r.y || y >= r.bottom() {
+                return None;
+            }
+            match &hit_test(&bw.data.layout, x - r.x, y - r.y)?.kind {
+                ItemKind::Workspace(name) => Some(name.clone()),
+                _ => None,
+            }
+        })
     }
 
     /// Destroys every bar window.
@@ -415,7 +446,7 @@ fn click(hwnd: HWND, data: &BarData, button: u8, lp: LPARAM) {
                 modifiers.push("Mod4".to_string());
             }
             mainloop::post(MainMsg::StatusClick {
-                bar: "bar-0".to_string(),
+                bar: data.bar_id.clone(),
                 click: Click {
                     name: block.and_then(|b| b.name.clone()),
                     instance: block.and_then(|b| b.instance.clone()),
@@ -511,12 +542,33 @@ mod tests {
     fn top_and_bottom_strips() {
         let o = Rect::new(100, 50, 800, 600);
         assert_eq!(
-            bar_rect(o, BarPosition::Top, 20),
+            bar_rect_stacked(o, BarPosition::Top, 0, 20),
             Rect::new(100, 50, 800, 20)
         );
         assert_eq!(
-            bar_rect(o, BarPosition::Bottom, 20),
+            bar_rect_stacked(o, BarPosition::Bottom, 0, 20),
             Rect::new(100, 630, 800, 20)
         );
+    }
+    #[test]
+    fn bar_rect_stacking() {
+        let o = Rect::new(0, 0, 1000, 500);
+        assert_eq!(
+            bar_rect_stacked(o, BarPosition::Bottom, 0, 20),
+            Rect::new(0, 480, 1000, 20)
+        );
+        assert_eq!(
+            bar_rect_stacked(o, BarPosition::Bottom, 20, 20),
+            Rect::new(0, 460, 1000, 20)
+        );
+        assert_eq!(
+            bar_rect_stacked(o, BarPosition::Top, 20, 20),
+            Rect::new(0, 20, 1000, 20)
+        );
+    }
+    #[test]
+    fn bar_outputs_filter() {
+        let c = i3win_core::config::parse_config("bar {\noutput NOPE\n}\n");
+        assert!(!bar_applies(&c.bars[0], "DISPLAY1", true));
     }
 }
