@@ -21,7 +21,7 @@ use crate::hover::{self, FreezeVerdict, HoverInput, HoverState};
 use crate::ipc_server;
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
-use crate::reconcile::{self, Applied, WinOp};
+use crate::reconcile::{self, Applied, DeferredHides, WinOp};
 use crate::status::{cmd_args, exit_block, StatusProcess};
 use crate::win::bar::Bars;
 use crate::win::deco::{self, Decos};
@@ -273,6 +273,8 @@ pub struct App {
     pub wm: Wm,
     applied: Applied,
     tracker: HideTracker,
+    /// Hides waiting for the windows shown in the same flush to become visible.
+    deferred_hides: DeferredHides,
     decos: Decos,
     bars: Bars,
     /// Blocks changed since the bars were last redrawn.
@@ -346,6 +348,7 @@ impl App {
             wm,
             applied: Applied::default(),
             tracker: HideTracker::new(),
+            deferred_hides: DeferredHides::default(),
             decos: Decos::new(),
             bars: Bars::new(),
             bars_dirty: false,
@@ -1056,28 +1059,31 @@ impl App {
             .chain(arr.hidden.iter().copied())
             .collect();
         let ops = reconcile::plan(&mut self.applied, &arr, &managed);
-        // Write-ahead: persist every pending hide before issuing any of them.
-        for op in &ops {
-            if let WinOp::Hide(id) = op {
-                self.store.add(*id);
-            }
-        }
-        self.store.persist_if_dirty();
+        let mut hides = Vec::new();
+        let mut shown = Vec::new();
         for op in ops {
             match op {
-                WinOp::Hide(id) => {
-                    self.tracker.expect(id, Instant::now());
-                    if !window::hide(id) {
-                        // Not hidden after all: do not claim it, retry on a later flush.
-                        self.applied.hidden.remove(&id);
-                        self.store.remove(id);
-                    }
-                }
+                WinOp::Hide(id) => hides.push(id),
                 WinOp::Show(id) => {
+                    self.deferred_hides.cancel(id);
                     window::show(id);
                     self.store.remove(id);
+                    shown.push(id);
                 }
-                WinOp::Place { id, rect, raise } => window::place(id, rect, raise),
+                WinOp::Place { id, rect, raise } => {
+                    self.deferred_hides.cancel(id);
+                    window::place(id, rect, raise);
+                }
+            }
+        }
+        if !hides.is_empty() {
+            if shown.is_empty() {
+                self.apply_hides(&hides);
+            } else {
+                // ShowWindowAsync runs on each window's own thread: hiding right away
+                // can beat the incoming window and expose the wallpaper.
+                self.deferred_hides.defer(hides, shown, Instant::now());
+                mainloop::arm_hide_timer();
             }
         }
         self.store.persist_if_dirty();
@@ -1145,6 +1151,41 @@ impl App {
         if combos != self.last_combos {
             keyboard::set_combos(&combos);
             self.last_combos = combos;
+        }
+    }
+
+    /// Hides `ids`, persisting them first so a crash cannot strand a hidden window.
+    fn apply_hides(&mut self, ids: &[WindowId]) {
+        for id in ids {
+            self.store.add(*id);
+        }
+        self.store.persist_if_dirty();
+        for &id in ids {
+            self.tracker.expect(id, Instant::now());
+            if !window::hide(id) {
+                // Not hidden after all: do not claim it, retry on a later flush.
+                self.applied.hidden.remove(&id);
+                self.store.remove(id);
+            }
+        }
+    }
+
+    /// The hide timer fired: issues the deferred hides once the shown windows are up.
+    pub fn on_hide_timer(&mut self) {
+        let ready = self.deferred_hides.ready(Instant::now(), |id| {
+            window::is_visible(id) || !window::is_window(id)
+        });
+        if ready {
+            let ids: Vec<WindowId> = self
+                .deferred_hides
+                .take()
+                .into_iter()
+                .filter(|id| self.applied.hidden.contains(id) && window::is_window(*id))
+                .collect();
+            self.apply_hides(&ids);
+            self.store.persist_if_dirty();
+        } else if !self.deferred_hides.is_empty() {
+            mainloop::arm_hide_timer();
         }
     }
 
@@ -1222,6 +1263,7 @@ impl App {
         events::uninstall();
         keyboard::uninstall();
         mouse::uninstall();
+        self.deferred_hides.clear();
         hidden::restore_all_hidden();
         for (_, mut st) in self.statuses.drain() {
             if let Some(p) = st.process.as_mut() {

@@ -25,6 +25,10 @@ pub const DRAG_TIMER_ID: usize = 1;
 pub const HOVER_TIMER_ID: usize = 2;
 /// One-shot timer lifting a move/size freeze that never got its END event.
 pub const FREEZE_TIMER_ID: usize = 3;
+/// One-shot timer issuing hides deferred until the shown windows are visible.
+pub const HIDE_TIMER_ID: usize = 4;
+/// Poll interval while hides are deferred.
+const HIDE_TIMER_MS: u32 = 8;
 /// Tiled live resize throttle interval.
 const DRAG_TIMER_MS: u32 = 16;
 
@@ -35,6 +39,17 @@ pub fn arm_drag_timer() {
         // SAFETY: plain Win32 call on our own window.
         unsafe {
             SetTimer(HWND(main as *mut _), DRAG_TIMER_ID, DRAG_TIMER_MS, None);
+        }
+    }
+}
+
+/// Main thread: (re)arms the one-shot deferred-hide timer.
+pub fn arm_hide_timer() {
+    let main = main_hwnd();
+    if main != 0 {
+        // SAFETY: plain Win32 call on our own window.
+        unsafe {
+            SetTimer(HWND(main as *mut _), HIDE_TIMER_ID, HIDE_TIMER_MS, None);
         }
     }
 }
@@ -285,6 +300,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = KillTimer(hwnd, FREEZE_TIMER_ID);
             if !with_app(|app| app.on_freeze_timer()) {
                 arm_freeze_timer();
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == HIDE_TIMER_ID => {
+            let _ = KillTimer(hwnd, HIDE_TIMER_ID);
+            if !with_app(|app| app.on_hide_timer()) {
+                arm_hide_timer();
             }
             LRESULT(0)
         }
