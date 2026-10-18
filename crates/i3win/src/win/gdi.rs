@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn wide_is_none_for_empty_text() {
         assert_eq!(wide(""), None);
-        assert_eq!(wide("a{1F600}"), Some(vec![0x61, 0xD83D, 0xDE00]));
+        assert_eq!(wide("a\u{1F600}"), Some(vec![0x61, 0xD83D, 0xDE00]));
     }
     #[test]
     fn colorref_packs_bgr() {
