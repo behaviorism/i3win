@@ -15,6 +15,9 @@ public class U {
   public delegate bool P(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] public static extern bool EnumWindows(P p, IntPtr l);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out int v, int size);
+  // On screen: visible and not cloaked (i3win hides by cloaking by default).
+  public static bool Shown(IntPtr h) { int c; DwmGetWindowAttribute(h, 14, out c, 4); return IsWindowVisible(h) && c == 0; }
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
@@ -115,12 +118,12 @@ Check 'no menu/start after Alt' (@('Notepad') -contains [U]::Cls((Fg))) "cls=$([
 # ---- workspaces
 $before = $h | ForEach-Object { [U]::Rect($_).ToString() }
 Combo @($ALT) 0x32   # Alt+2
-$vis = $h | Where-Object { [U]::IsWindowVisible($_) }
+$vis = $h | Where-Object { [U]::Shown($_) }
 Check 'Alt+2 hides notepads' (@($vis).Count -eq 0) "visible=$(@($vis).Count)"
 Type-Text 'zzz'
 Combo @($ALT) 0x31   # Alt+1
 Start-Sleep -Milliseconds 300
-$vis = $h | Where-Object { [U]::IsWindowVisible($_) }
+$vis = $h | Where-Object { [U]::Shown($_) }
 $after = $h | ForEach-Object { [U]::Rect($_).ToString() }
 Check 'Alt+1 shows them again' (@($vis).Count -eq 3)
 Check 'layout unchanged after round trip' ((Compare-Object $before $after) -eq $null) "before=$before after=$after"
@@ -130,15 +133,15 @@ Check 'focus on a notepad after return' ($h -contains (Fg)) "cls=$([U]::Cls((Fg)
 
 # ---- layouts
 Combo @($ALT) 0x57   # Alt+w tabbed
-$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+$vis = @($h | Where-Object { [U]::Shown($_) })
 Write-Output "tabbed visible=$($vis.Count) rects: $(($h | % { [U]::Rect($_) }) -join ' ')"
 Check 'tabbed shows one window' ($vis.Count -eq 1)
 Combo @($ALT) 0x53   # Alt+s stacking
-$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+$vis = @($h | Where-Object { [U]::Shown($_) })
 Check 'stacked shows one window' ($vis.Count -eq 1)
 Combo @($ALT) 0x45   # Alt+e toggle split
 Start-Sleep -Milliseconds 300
-$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+$vis = @($h | Where-Object { [U]::Shown($_) })
 Check 'split shows all three' ($vis.Count -eq 3) "rects: $(($h | % { [U]::Rect($_) }) -join ' ')"
 $f = Fg; $r0 = [U]::Rect($f)
 Combo @($ALT, $SHIFT) 0x20   # floating toggle
@@ -192,10 +195,10 @@ $r = Msg -t get_marks
 Check 'plan5 get_marks contains "x"' ($r.out -match '"x"') $r.out
 $r = Msg move scratchpad
 Start-Sleep -Milliseconds 500
-Check 'plan5 move scratchpad hides focused notepad' (-not [U]::IsWindowVisible($f)) "visible=$([U]::IsWindowVisible($f))"
+Check 'plan5 move scratchpad hides focused notepad' (-not [U]::Shown($f)) "visible=$([U]::Shown($f))"
 $r = Msg scratchpad show
 Start-Sleep -Milliseconds 500
-Check 'plan5 scratchpad show shows it' ([U]::IsWindowVisible($f)) "visible=$([U]::IsWindowVisible($f))"
+Check 'plan5 scratchpad show shows it' ([U]::Shown($f)) "visible=$([U]::Shown($f))"
 $null = Msg floating disable
 $null = Msg unmark x
 Start-Sleep -Milliseconds 400
@@ -218,37 +221,37 @@ $bar = [U]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, 'i3win_bar', $null)
 Check 'plan6 bar window exists' ($bar -ne [IntPtr]::Zero)
 $wa = [U]::WorkArea()
 $br = [U]::Rect($bar)
-Check 'plan6 bar sits at the bottom of the work area' ([U]::IsWindowVisible($bar) -and $br.B -eq $wa.B -and $br.B -gt $br.T) "bar=$br workarea=$wa"
+Check 'plan6 bar sits at the bottom of the work area' ([U]::Shown($bar) -and $br.B -eq $wa.B -and $br.B -gt $br.T) "bar=$br workarea=$wa"
 $r = Msg -t get_bar_config
 Check 'plan6 get_bar_config lists bar-0' ($r.out -match '^\[\s*"bar-0"\s*\]$') $r.out
 $hb = [U]::Rect($h[0]); $heightBefore = $hb.B - $hb.T
 $null = Msg bar mode hide
 Start-Sleep -Milliseconds 700
 $bar = [U]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, 'i3win_bar', $null)
-Check 'plan6 bar mode hide hides the bar' (($bar -eq [IntPtr]::Zero) -or -not [U]::IsWindowVisible($bar))
+Check 'plan6 bar mode hide hides the bar' (($bar -eq [IntPtr]::Zero) -or -not [U]::Shown($bar))
 $hb = [U]::Rect($h[0])
 Check 'plan6 bar mode hide grows the Notepads' (($hb.B - $hb.T) -gt $heightBefore) "before=$heightBefore after=$($hb.B - $hb.T)"
 $null = Msg bar mode dock
 Start-Sleep -Milliseconds 700
 $bar = [U]::FindWindowEx([IntPtr]::Zero, [IntPtr]::Zero, 'i3win_bar', $null)
-Check 'plan6 bar mode dock restores the bar' (($bar -ne [IntPtr]::Zero) -and [U]::IsWindowVisible($bar))
+Check 'plan6 bar mode dock restores the bar' (($bar -ne [IntPtr]::Zero) -and [U]::Shown($bar))
 $hb = [U]::Rect($h[0])
 Check 'plan6 bar mode dock restores the Notepad height' (($hb.B - $hb.T) -eq $heightBefore) "before=$heightBefore after=$($hb.B - $hb.T)"
 
 # ---- crash recovery: taskkill on ws2
 Combo @($ALT) 0x32
-$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+$vis = @($h | Where-Object { [U]::Shown($_) })
 Check 'ws2 hides before kill' ($vis.Count -eq 0)
 & taskkill /IM i3win.exe /F | Out-Null
 Start-Sleep 1
-$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+$vis = @($h | Where-Object { [U]::Shown($_) })
 Check 'killed: notepads stay hidden' ($vis.Count -eq 0)
 Check 'killed: status process gone (job object)' ((StatusCount) -eq 0) "count=$(StatusCount)"
 $hiddenTxt = Get-Content "$env:LOCALAPPDATA\i3win\hidden.txt" -ErrorAction SilentlyContinue
 Check 'hidden.txt lists 3 windows' (@($hiddenTxt).Count -eq 3) ($hiddenTxt -join ';')
 $wm = Start-Wm
 Start-Sleep 1
-$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+$vis = @($h | Where-Object { [U]::Shown($_) })
 Check 'restart: notepads reappear' ($vis.Count -eq 3)
 Write-Output "after restart rects: $(($h | % { [U]::Rect($_) }) -join ' ')"
 
@@ -257,7 +260,7 @@ Combo @($ALT) 0x32
 Combo @($ALT, $SHIFT) 0x45   # exit
 Start-Sleep 1.5
 Check 'Alt+Shift+e exits' ($wm.HasExited)
-$vis = @($h | Where-Object { [U]::IsWindowVisible($_) })
+$vis = @($h | Where-Object { [U]::Shown($_) })
 Check 'exit: all windows visible' ($vis.Count -eq 3)
 Check 'exit: no status process' ((StatusCount) -eq 0)
 

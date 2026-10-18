@@ -808,9 +808,11 @@ impl App {
                 if !matches!(ev, PlatformEvent::Destroyed(_))
                     && self.store.contains(id)
                     && window::is_window(id)
+                    && !(self.cloaked.contains(&id) && cloak::uncloak(id))
                 {
                     window::show(id);
                 }
+                self.cloaked.remove(&id);
                 self.wm.unmanage(id);
                 self.move_start.remove(&id);
                 self.tracker.forget(id);

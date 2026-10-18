@@ -1,12 +1,12 @@
 # Measures visual gaps ("flash") during workspace and tab switches: a Notepad (or an
-# Explorer window on an empty folder, -app explorer) fills the screen on each workspace /
+# Explorer window on an empty folder, or a dark Chrome app window) fills the screen on each workspace /
 # tab; a few screen points are read before each switch and then sampled as fast as
 # possible for 600 ms after it. A point turning to the wallpaper colour (read with
 # everything minimised) means the background showed through; other changes are
 # fades or unpainted content.
 # Commands go straight over the IPC pipe: a spawned i3win-msg console would itself show up
 # as a flash (and get tiled), and process start-up would delay the sampling.
-# Run: cargo build --workspace; powershell -ExecutionPolicy Bypass -File scripts\flash-probe.ps1 [-bin <dir>] [-app notepad|explorer] [-config <file>]
+# Run: cargo build --workspace; powershell -ExecutionPolicy Bypass -File scripts\flash-probe.ps1 [-bin <dir>] [-app notepad|explorer|chrome] [-config <file>]
 param([string]$bin = "$(Split-Path -Parent $PSScriptRoot)\target\debug", [string]$app = "notepad", [string]$config)
 $ErrorActionPreference = 'Continue'
 $exe = "$bin\i3win.exe"
@@ -93,12 +93,18 @@ Get-Process i3win, i3win-status -ErrorAction SilentlyContinue | Stop-Process -Fo
 $wall = [P]::Pixels($xs, $ys)
 "wallpaper colours: " + (($wall | ForEach-Object { $_.ToString('X6') }) -join ' ')
 $wm = Start-Process $exe -ArgumentList '--config', $config -PassThru; Start-Sleep 1.5
-$np = @(); $dirs = @()
+$np = @(); $dirs = @(); $chromeCount = 0; $chromeProfile = "$env:TEMP\i3win-flash-chrome"
 # Opens one window of the chosen app; an Explorer window gets its own empty folder.
 function Open-App {
   if ($app -eq 'explorer') {
     $d = "$env:TEMP\i3win-flash-$($dirs.Count)"; New-Item -ItemType Directory -Force $d | Out-Null
     $script:dirs += $d; Start-Process explorer.exe $d; Start-Sleep 2.5
+  } elseif ($app -eq 'chrome') {
+    # A separate Chrome with its own temp profile: dark app windows, the real profile untouched.
+    $n = $script:chromeCount++
+    $url = "data:text/html,<title>FlashProbe$n</title><body style='background:%23223344'>"
+    Start-Process 'C:\Program Files\Google\Chrome\Application\chrome.exe' "--user-data-dir=`"$chromeProfile`" --no-first-run --no-default-browser-check --app=`"$url`""
+    Start-Sleep 4
   } else { $script:np += Start-Process notepad -PassThru; Start-Sleep 1.5 }
 }
 try {
@@ -123,7 +129,10 @@ finally {
   Get-Process i3win, i3win-status -ErrorAction SilentlyContinue | Stop-Process -Force
   $np | Stop-Process -Force -ErrorAction SilentlyContinue
   (New-Object -ComObject Shell.Application).Windows() | Where-Object { $_.LocationURL -like '*i3win-flash-*' } | ForEach-Object { $_.Quit() }
+  Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*i3win-flash-chrome*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   Start-Sleep 0.5; $dirs | Remove-Item -Force -ErrorAction SilentlyContinue
+  Remove-Item -Recurse -Force $chromeProfile -ErrorAction SilentlyContinue
   if ($tmpCfg) { Remove-Item $config -ErrorAction SilentlyContinue }
   # Restart an i3win that was running before the probe (it restores its hidden windows).
   if ($running) { Start-Process $running; Start-Sleep 2 }
