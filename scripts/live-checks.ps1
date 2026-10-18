@@ -47,6 +47,9 @@ public class U {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, UIntPtr extra);
   public static void Mouse(uint flags){ mouse_event(flags, 0, 0, 0, UIntPtr.Zero); }
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+  // Real mouse-move input (SetCursorPos alone is invisible to low-level mouse hooks).
+  public static void MoveTo(int x, int y){ SetCursorPos(x, y); int w = GetSystemMetrics(0), h = GetSystemMetrics(1); mouse_event(0x8001, (int)((long)x * 65535 / (w - 1)), (int)((long)y * 65535 / (h - 1)), 0, UIntPtr.Zero); }
   public static void Key(byte vk, bool up){ keybd_event(vk,(byte)MapVirtualKey(vk,0), up?2u:0u, UIntPtr.Zero); }
 }
 "@
@@ -285,16 +288,16 @@ Remove-Item $blocksConf -ErrorAction SilentlyContinue
 # MOUSEEVENTF: LEFTDOWN 2, LEFTUP 4, RIGHTDOWN 8, RIGHTUP 0x10. Tolerance +-12 px (DWM frame differences).
 # Held button/key are tracked so `finally` sends only the matching up events.
 $script:heldUp = $null; $script:heldAlt = $false
-function Mouse-Drag($x1, $y1, $x2, $y2, [uint32]$down, [uint32]$up, [bool]$alt = $true) {
-  if ($alt) { [U]::Key($ALT, $false); $script:heldAlt = $true; Start-Sleep -Milliseconds 80 }
-  [void][U]::SetCursorPos($x1, $y1); Start-Sleep -Milliseconds 100
+function Mouse-Drag($x1, $y1, $x2, $y2, [uint32]$down, [uint32]$up, [bool]$withAlt = $true) {
+  if ($withAlt) { [U]::Key($ALT, $false); $script:heldAlt = $true; Start-Sleep -Milliseconds 80 }
+  [U]::MoveTo($x1, $y1); Start-Sleep -Milliseconds 100
   [U]::Mouse($down); $script:heldUp = $up; Start-Sleep -Milliseconds 100
   for ($s = 1; $s -le 10; $s++) {
-    [void][U]::SetCursorPos([int]($x1 + ($x2 - $x1) * $s / 10), [int]($y1 + ($y2 - $y1) * $s / 10)); Start-Sleep -Milliseconds 50
+    [U]::MoveTo([int]($x1 + ($x2 - $x1) * $s / 10), [int]($y1 + ($y2 - $y1) * $s / 10)); Start-Sleep -Milliseconds 50
   }
   Start-Sleep -Milliseconds 100
   [U]::Mouse($up); $script:heldUp = $null; Start-Sleep -Milliseconds 100
-  if ($alt) { [U]::Key($ALT, $true); $script:heldAlt = $false }
+  if ($withAlt) { [U]::Key($ALT, $true); $script:heldAlt = $false }
   Start-Sleep -Milliseconds 500
 }
 # Focuses a known notepad through IPC instead of trusting the current foreground.
@@ -356,9 +359,9 @@ try {
   Focus-Window $left
   $other = $right
   $ro = [U]::Rect($other)
-  [void][U]::SetCursorPos([int](($ro.L + $ro.R) / 2), [int](($ro.T + $ro.B) / 2) + 20)
+  [U]::MoveTo([int](($ro.L + $ro.R) / 2), [int](($ro.T + $ro.B) / 2) + 20)
   Start-Sleep -Milliseconds 100
-  [void][U]::SetCursorPos([int](($ro.L + $ro.R) / 2) + 5, [int](($ro.T + $ro.B) / 2) + 25)
+  [U]::MoveTo([int](($ro.L + $ro.R) / 2) + 5, [int](($ro.T + $ro.B) / 2) + 25)
   Start-Sleep -Milliseconds 500
   Check 'plan8 hover focuses the notepad under the cursor' ((Fg) -eq $other) "fg=$(Fg) expected=$other"
 } catch {
