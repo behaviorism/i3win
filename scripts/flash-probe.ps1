@@ -1,12 +1,13 @@
 # Measures visual gaps ("flash") during workspace and tab switches: a Notepad (or an
 # Explorer window on an empty folder, -app explorer) fills the screen on each workspace /
-# tab; the pixel at the screen centre is read before each switch and then sampled as fast
-# as possible for 600 ms after it. Any sample that differs from the colour before the
-# switch means the wallpaper, a fade or unpainted content showed through.
+# tab; a few screen points are read before each switch and then sampled as fast as
+# possible for 600 ms after it. A point turning to the wallpaper colour (read with
+# everything minimised) means the background showed through; other changes are
+# fades or unpainted content.
 # Commands go straight over the IPC pipe: a spawned i3win-msg console would itself show up
 # as a flash (and get tiled), and process start-up would delay the sampling.
-# Run: cargo build --workspace; powershell -ExecutionPolicy Bypass -File scripts\flash-probe.ps1 [-bin <dir>] [-app notepad|explorer]
-param([string]$bin = "$(Split-Path -Parent $PSScriptRoot)\target\debug", [string]$app = "notepad")
+# Run: cargo build --workspace; powershell -ExecutionPolicy Bypass -File scripts\flash-probe.ps1 [-bin <dir>] [-app notepad|explorer] [-config <file>]
+param([string]$bin = "$(Split-Path -Parent $PSScriptRoot)\target\debug", [string]$app = "notepad", [string]$config)
 $ErrorActionPreference = 'Continue'
 $exe = "$bin\i3win.exe"
 Add-Type @"
@@ -37,40 +38,59 @@ public class P {
     IntPtr dc = GetDC(IntPtr.Zero); uint c = GetPixel(dc, x, y); ReleaseDC(IntPtr.Zero, dc); return c;
   }
   static int Ch(uint c, int s) { return (int)((c >> s) & 0xFF); }
-  // Samples (x,y) for ms milliseconds, counting samples that differ from want;
-  // returns "samples bad firstBadMs lastBadColour".
-  public static string Sample(int x, int y, int ms, uint want) {
-    IntPtr dc = GetDC(IntPtr.Zero); var sw = Stopwatch.StartNew(); int n = 0, bad = 0; long first = -1; uint last = 0;
+  static bool Near(uint a, uint b) {
+    return Math.Abs(Ch(a, 0) - Ch(b, 0)) <= 20 && Math.Abs(Ch(a, 8) - Ch(b, 8)) <= 20 && Math.Abs(Ch(a, 16) - Ch(b, 16)) <= 20;
+  }
+  // Samples the points for ms milliseconds. A sample is "diff" when any point differs
+  // from its colour before the switch (want), and "wall" when a point that was not
+  // showing the wallpaper before the switch now does. Returns
+  // "samples diff wall firstWallMs".
+  public static string Sample(int[] xs, int[] ys, int ms, uint[] want, uint[] wall) {
+    IntPtr dc = GetDC(IntPtr.Zero); var sw = Stopwatch.StartNew(); int n = 0, diff = 0, walls = 0; long first = -1;
     while (sw.ElapsedMilliseconds < ms) {
-      uint c = GetPixel(dc, x, y); n++;
-      if (Math.Abs(Ch(c, 0) - Ch(want, 0)) > 20 || Math.Abs(Ch(c, 8) - Ch(want, 8)) > 20 || Math.Abs(Ch(c, 16) - Ch(want, 16)) > 20) {
-        bad++; if (first < 0) first = sw.ElapsedMilliseconds; last = c;
+      bool d = false, w = false; n++;
+      for (int i = 0; i < xs.Length; i++) {
+        uint c = GetPixel(dc, xs[i], ys[i]);
+        if (!Near(c, want[i])) d = true;
+        if (Near(c, wall[i]) && !Near(want[i], wall[i])) w = true;
       }
+      if (d) diff++;
+      if (w) { walls++; if (first < 0) first = sw.ElapsedMilliseconds; }
     }
-    ReleaseDC(IntPtr.Zero, dc); return n + " " + bad + " " + first + " " + last.ToString("X6");
+    ReleaseDC(IntPtr.Zero, dc); return n + " " + diff + " " + walls + " " + first;
+  }
+  public static uint[] Pixels(int[] xs, int[] ys) {
+    var r = new uint[xs.Length]; for (int i = 0; i < xs.Length; i++) r[i] = Pixel(xs[i], ys[i]); return r;
   }
 }
 "@
 function Msg { [P]::Cmd(($args -join ' ')) }
+# Sample points spread over the screen (the tab bar sits near the top).
+[int[]]$xs = 960, 480, 1440, 960, 300
+[int[]]$ys = 540, 300, 800, 30, 1000
 function Probe($label, [scriptblock]$switch) {
-  $results = @(); $detail = @()
+  $diffs = @(); $walls = @()
   for ($i = 0; $i -lt 6; $i++) {
-    $want = [P]::Pixel(960, 540)
+    $want = [P]::Pixels($xs, $ys)
     & $switch $i
-    $r = [P]::Sample(960, 540, 600, $want) -split ' '
-    $results += [int]$r[1]; $detail += "n=$($r[0]) bad=$($r[1]) at=$($r[2])ms col=$($r[3]) want=$($want.ToString('X6'))"
+    $r = [P]::Sample($xs, $ys, 600, $want, $wall) -split ' '
+    $diffs += [int]$r[1]; $walls += [int]$r[2]
     Start-Sleep -Milliseconds 300
   }
-  $flashes = @($results | Where-Object { $_ -gt 0 }).Count
-  "{0}: {1}/6 switches showed a different colour (bad samples per switch: {2})" -f $label, $flashes, ($results -join ',')
-  $detail | ForEach-Object { "    $_" }
+  "{0}: wallpaper seen on {1}/6 switches (wallpaper samples: {2}; any-change samples: {3})" -f $label,
+    @($walls | Where-Object { $_ -gt 0 }).Count, ($walls -join ','), ($diffs -join ',')
 }
 
-$cfg = "$env:TEMP\i3win-flash.conf"
-Set-Content $cfg -Encoding ascii -Value "set `$mod Mod1`ndefault_border none`ngaps inner 0`n"
-(New-Object -ComObject Shell.Application).MinimizeAll(); Start-Sleep 2
+$running = Get-Process i3win -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path
+$tmpCfg = -not $config
+if ($tmpCfg) {
+  $config = "$env:TEMP\i3win-flash.conf"
+  Set-Content $config -Encoding ascii -Value "set `$mod Mod1`ndefault_border none`ngaps inner 0`n"
+}
 Get-Process i3win, i3win-status -ErrorAction SilentlyContinue | Stop-Process -Force
-$wm = Start-Process $exe -ArgumentList '--config', $cfg -PassThru; Start-Sleep 1.5
+(New-Object -ComObject Shell.Application).MinimizeAll(); Start-Sleep 2
+$wall = [P]::Pixels($xs, $ys)
+$wm = Start-Process $exe -ArgumentList '--config', $config -PassThru; Start-Sleep 1.5
 $np = @(); $dirs = @()
 # Opens one window of the chosen app; an Explorer window gets its own empty folder.
 function Open-App {
@@ -102,6 +122,8 @@ finally {
   $np | Stop-Process -Force -ErrorAction SilentlyContinue
   (New-Object -ComObject Shell.Application).Windows() | Where-Object { $_.LocationURL -like '*i3win-flash-*' } | ForEach-Object { $_.Quit() }
   Start-Sleep 0.5; $dirs | Remove-Item -Force -ErrorAction SilentlyContinue
-  Remove-Item $cfg -ErrorAction SilentlyContinue
+  if ($tmpCfg) { Remove-Item $config -ErrorAction SilentlyContinue }
+  # Restart an i3win that was running before the probe (it restores its hidden windows).
+  if ($running) { Start-Process $running; Start-Sleep 2 }
   (New-Object -ComObject Shell.Application).UndoMinimizeALL()
 }
