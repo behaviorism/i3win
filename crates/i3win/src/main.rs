@@ -112,7 +112,7 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--version" => {
-                println!("i3win 0.1.0");
+                println!("i3win {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
             "--config" => config_override = args.next().map(PathBuf::from),

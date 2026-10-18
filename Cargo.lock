@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "i3win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "i3win-core",
  "log",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "i3win-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "i3win-msg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "i3win-core",
  "serde_json",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "i3win-status"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "chrono-tz",

@@ -321,7 +321,7 @@ pub fn version_json(ctx: &IpcContext) -> Value {
         "major": 4,
         "minor": 22,
         "patch": 0,
-        "human_readable": "4.22 (i3win 0.1.0)",
+        "human_readable": concat!("4.22 (i3win ", env!("CARGO_PKG_VERSION"), ")"),
         "loaded_config_file_name": ctx.config_path,
     })
 }
