@@ -128,6 +128,9 @@ impl Wm {
             .into_iter()
             .filter_map(|n| self.tree.window_id(n))
             .collect();
+        let src_rect = src
+            .and_then(|s| self.tree.output_of(s))
+            .map(|o| self.output_rect(o));
         let old_parent = self.tree.parent(target);
         self.tree.detach(target);
         if let Some(p) = old_parent {
@@ -139,6 +142,7 @@ impl Wm {
             // A marked workspace receives the container like `move to workspace`.
             if target_floating {
                 self.tree.attach_floating(m, target);
+                self.shift_to_dest_output(target, src_rect, dest_ws);
             } else {
                 self.insert_tiled(m, target);
             }
@@ -152,6 +156,7 @@ impl Wm {
                 }
             }
             self.tree.attach_floating(dest_ws, target);
+            self.shift_to_dest_output(target, src_rect, dest_ws);
         } else {
             match (self.tree.parent(m), self.tree.index_in_parent(m)) {
                 (Some(p), Some(i)) => self.tree.attach(p, target, Some(i + 1)),
@@ -183,6 +188,22 @@ impl Wm {
             self.emit_window("move", w);
         }
         Ok(())
+    }
+
+    /// Moves the floating window `n` from the output rect `src_rect` onto the
+    /// output holding `dest_ws`, keeping its relative offset.
+    fn shift_to_dest_output(
+        &mut self,
+        n: NodeId,
+        src_rect: Option<crate::geom::Rect>,
+        dest_ws: NodeId,
+    ) {
+        let to = self.tree.output_of(dest_ws).map(|o| self.output_rect(o));
+        if let (Some(from), Some(to)) = (src_rect, to) {
+            if from != to {
+                self.shift_floating(n, from, to);
+            }
+        }
     }
 
     pub(crate) fn swap_with(&mut self, target: NodeId, with: &SwapTarget) -> Result<(), String> {
@@ -230,6 +251,12 @@ impl Wm {
         if self.tree.is_floating(target) {
             let ra = self.floating_rect_of(target);
             let rb = self.floating_rect_of(other);
+            // Each window takes the other's slot, so the swapped rects are
+            // already absolute positions on the new output; only clamp.
+            let clamp = |wm: &Self, r: Option<crate::geom::Rect>| {
+                r.map(|r| crate::ops::floating::clamp_floating_rect(&wm.config, r))
+            };
+            let (ra, rb) = (clamp(self, ra), clamp(self, rb));
             self.set_floating_rect_of(target, rb);
             self.set_floating_rect_of(other, ra);
         }
@@ -509,6 +536,63 @@ mod tests {
         // A container has no window properties to match.
         wm.run_command("[con_mark=x class=.] layout splitv");
         assert_eq!(ws_desc(&wm), "H[w1 S[w2 w3]]");
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn floating_move_to_mark_on_other_output_shifts_rect() {
+        for mark_ws in [true, false] {
+            let mut wm = crate::wm::Wm::new(
+                crate::config::Config::default(),
+                vec![out("A", 0, 1000), out("B", 1000, 1000)],
+            );
+            wm.manage(win(1));
+            wm.run_command("floating enable");
+            let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+            if let crate::tree::NodeKind::Window(d) = &mut wm.tree.get_mut(n1).kind {
+                let r = d.floating_rect.unwrap();
+                d.floating_rect = Some(crate::geom::Rect::new(100, 50, r.w.min(300), r.h.min(200)));
+            }
+            wm.run_command("focus output B");
+            if mark_ws {
+                wm.run_command("mark t");
+            } else {
+                wm.manage(win(2));
+                wm.run_command("floating enable; mark t");
+            }
+            wm.run_command("focus output A");
+            assert!(wm.run_command("[id=1] move container to mark t")[0].success);
+            let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+            let x = match &wm.tree.get(n1).kind {
+                crate::tree::NodeKind::Window(d) => d.floating_rect.unwrap().x,
+                _ => unreachable!(),
+            };
+            assert_eq!(x, 1100, "mark_ws={mark_ws}");
+            check_invariants(&wm);
+        }
+    }
+
+    #[test]
+    fn floating_swap_across_outputs_keeps_windows_on_new_outputs() {
+        let mut wm = crate::wm::Wm::new(
+            crate::config::Config::default(),
+            vec![out("A", 0, 1000), out("B", 1000, 1000)],
+        );
+        wm.manage(win(1));
+        wm.run_command("floating enable");
+        wm.run_command("focus output B");
+        wm.manage(win(2));
+        wm.run_command("floating enable; mark t");
+        assert!(wm.run_command("[id=1] swap container with mark t")[0].success);
+        let x = |wm: &crate::wm::Wm, id| {
+            let n = wm.tree.window_node(WindowId(id)).unwrap();
+            match &wm.tree.get(n).kind {
+                crate::tree::NodeKind::Window(d) => d.floating_rect.unwrap().x,
+                _ => unreachable!(),
+            }
+        };
+        assert!(x(&wm, 1) >= 1000, "w1 now on B");
+        assert!(x(&wm, 2) < 1000, "w2 now on A");
         check_invariants(&wm);
     }
 }

@@ -16,7 +16,7 @@ impl Wm {
         }
     }
 
-    fn output_rect(&self, output: NodeId) -> Rect {
+    pub(crate) fn output_rect(&self, output: NodeId) -> Rect {
         match &self.tree.get(output).kind {
             NodeKind::Output { rect, .. } => *rect,
             _ => Rect::default(),
@@ -32,7 +32,7 @@ impl Wm {
 
     /// Shifts the floating window `n` from output rect `from` to `to` and
     /// keeps it inside `to`.
-    fn shift_floating(&mut self, n: NodeId, from: Rect, to: Rect) {
+    pub(crate) fn shift_floating(&mut self, n: NodeId, from: Rect, to: Rect) {
         let dx = i64::from(to.x) - i64::from(from.x);
         let dy = i64::from(to.y) - i64::from(from.y);
         let sat = |v: i32, d: i64| {

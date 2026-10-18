@@ -282,7 +282,16 @@ fn blocks_json(blocks: &[Block]) -> String {
                 let keep = truncate_str(t, t.len() / 2).len();
                 t.truncate(keep);
             }
-            _ => return ser(&blocks), // nothing left to shorten
+            _ => {
+                // Non-text fields are capped per block; if the line is still
+                // too long, drop blocks from the left until it fits.
+                let mut json = ser(&blocks);
+                while json.len() > MAX_STATUS_LINE && !blocks.is_empty() {
+                    blocks.remove(0);
+                    json = ser(&blocks);
+                }
+                return json;
+            }
         }
         let json = ser(&blocks);
         if json.len() <= MAX_STATUS_LINE {
@@ -339,6 +348,20 @@ impl Coalescer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blocks_json_never_exceeds_cap_even_with_huge_other_fields() {
+        let blocks: Vec<Block> = (0..400)
+            .map(|i| {
+                let mut b = Block::new(format!("t{i}"));
+                b.name = Some("x".repeat(2000));
+                b
+            })
+            .collect();
+        let out = blocks_json(&blocks);
+        assert!(out.len() <= MAX_STATUS_LINE);
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+    }
+
     use super::*;
 
     fn sec(name: &str, kv: &[(&str, &str)]) -> Section {

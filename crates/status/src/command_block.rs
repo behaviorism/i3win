@@ -26,6 +26,14 @@ pub fn truncate_str(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Longest non-text property (`name`, `color`, `markup`, ...) kept, in bytes.
+pub const MAX_PROP: usize = 256;
+
+/// `s` capped at [`MAX_PROP`] bytes.
+pub fn cap_prop(s: &str) -> String {
+    truncate_str(s, MAX_PROP).to_string()
+}
+
 /// `s` capped at [`MAX_TEXT`] bytes.
 pub fn cap_text(s: &str) -> String {
     truncate_str(s, MAX_TEXT).to_string()
@@ -230,7 +238,7 @@ fn px_str(s: &str) -> Option<i32> {
 }
 
 fn opt(s: &str) -> Option<String> {
-    (!s.is_empty()).then(|| s.to_string())
+    (!s.is_empty()).then(|| cap_prop(s))
 }
 
 fn truthy(s: &str) -> Option<bool> {
@@ -260,7 +268,7 @@ fn set_prop(b: &mut Block, key: &str, v: &str) {
             b.min_width = match (v.is_empty(), px_str(v)) {
                 (true, _) => None,
                 (false, Some(px)) => Some(MinWidth::Px(px)),
-                (false, None) => Some(MinWidth::Text(v.to_string())),
+                (false, None) => Some(MinWidth::Text(cap_prop(v))),
             }
         }
         "border_top" => b.border_top = px_str(v),
@@ -325,7 +333,7 @@ pub fn apply_json_line(block: &mut Block, line: &str) -> bool {
         // A JSON string min_width is always a text, even if numeric.
         if key == "min_width" && !text.is_empty() {
             if let Value::String(s) = val {
-                block.min_width = Some(MinWidth::Text(s.clone()));
+                block.min_width = Some(MinWidth::Text(cap_prop(s)));
                 continue;
             }
         }
@@ -360,7 +368,7 @@ pub fn static_block(section: &Section) -> Block {
     if let Some(label) = section.get("label") {
         b.full_text = cap_text(&format!("{label}{}", b.full_text));
     }
-    b.name = Some(section.name.clone());
+    b.name = Some(cap_prop(&section.name));
     b
 }
 
@@ -601,6 +609,36 @@ mod tests {
         let s = static_block(&sec("a", &[("label", "L"), ("full_text", &big)]));
         assert!(s.full_text.len() <= MAX_TEXT && s.full_text.starts_with('L'));
         assert_eq!(truncate_str("a\u{e9}", 2), "a");
+    }
+
+    #[test]
+    fn huge_non_text_fields_keep_line_under_bar_cap() {
+        let huge = "n".repeat(100_000);
+        let mut b = Block::new("hi");
+        let line = serde_json::json!({
+            "name": huge, "instance": huge, "color": huge, "background": huge,
+            "border": huge, "markup": huge, "align": huge, "min_width": huge,
+        })
+        .to_string();
+        assert!(apply_json_line(&mut b, &line));
+        for f in [
+            &b.name,
+            &b.instance,
+            &b.color,
+            &b.background,
+            &b.border,
+            &b.markup,
+            &b.align,
+        ] {
+            assert!(f.as_ref().unwrap().len() <= MAX_PROP);
+        }
+        match &b.min_width {
+            Some(MinWidth::Text(t)) => assert!(t.len() <= MAX_PROP),
+            other => panic!("{other:?}"),
+        }
+        let out = crate::runner::render_line(&[b], true);
+        assert!(out.len() < 64 * 1024);
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
     }
 
     #[test]

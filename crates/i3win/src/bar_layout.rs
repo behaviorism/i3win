@@ -389,8 +389,8 @@ pub fn route_bar_button(
 pub fn default_command(hit: Option<&ItemKind>, button: u8) -> Option<String> {
     match (button, hit) {
         (1, Some(ItemKind::Workspace(name))) => Some(click_command(name)),
-        (4, _) => Some("workspace prev".into()),
-        (5, _) => Some("workspace next".into()),
+        (4 | 6, _) => Some("workspace prev".into()),
+        (5 | 7, _) => Some("workspace next".into()),
         _ => None,
     }
 }
@@ -834,6 +834,8 @@ mod tests {
             default_command(Some(&ItemKind::Block(1)), 5).as_deref(),
             Some("workspace next")
         );
-        assert_eq!(default_command(None, 6), None);
+        assert_eq!(default_command(None, 6).as_deref(), Some("workspace prev"));
+        assert_eq!(default_command(None, 7).as_deref(), Some("workspace next"));
+        assert_eq!(default_command(None, 8), None);
     }
 }
