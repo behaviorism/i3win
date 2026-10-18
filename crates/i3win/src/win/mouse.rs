@@ -231,6 +231,13 @@ thread_local! {
     static HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
     /// The App has a drag in progress (set by the App; read by the keyboard hook).
     static DRAG_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// Diagnostic: how many times the hook proc ran.
+    static HOOK_CALLS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Diagnostic: hook proc invocations so far.
+pub fn hook_calls() -> u64 {
+    HOOK_CALLS.with(|c| c.get())
 }
 
 /// Posts one WM_APP_MOUSE unless one is already pending.
@@ -295,6 +302,7 @@ fn button_of(msg: u32) -> Option<(Button, bool)> {
 }
 
 unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    HOOK_CALLS.with(|c| c.set(c.get().wrapping_add(1)));
     if code == HC_ACTION && lparam.0 != 0 {
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         let own = info.flags & LLMHF_INJECTED != 0 && info.dwExtraInfo == OWN_INPUT_TAG;

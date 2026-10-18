@@ -306,6 +306,9 @@ pub struct App {
     epoch: Instant,
 }
 
+/// Diagnostic: log the first move after each press.
+static LOG_NEXT_MOVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl App {
     pub fn start(config_path: PathBuf, pipe_name: String) -> App {
         let (config, config_text) = match paths::load_or_create_config(&config_path) {
@@ -416,6 +419,10 @@ impl App {
     /// Mouse hook events in order, then the latest coalesced move after them.
     /// Flushes once when anything changed.
     pub fn on_mouse(&mut self, events: Vec<MouseEvent>, latest_move: Option<(i32, i32)>) {
+        log::debug!(
+            "on_mouse: {} events, latest_move={latest_move:?}",
+            events.len()
+        );
         let mut changed = false;
         for ev in events {
             changed |= self.on_mouse_event(ev);
@@ -438,6 +445,18 @@ impl App {
 
     /// Returns whether a flush is needed.
     fn on_mouse_event(&mut self, ev: MouseEvent) -> bool {
+        match ev {
+            MouseEvent::Press { .. } => {
+                log::debug!("mouse event: {ev:?}");
+                LOG_NEXT_MOVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            MouseEvent::Move { .. } => {
+                if LOG_NEXT_MOVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    log::debug!("mouse event (first move after press): {ev:?}");
+                }
+            }
+            _ => log::debug!("mouse event: {ev:?}"),
+        }
         match ev {
             MouseEvent::Press {
                 button, x, y, id, ..
@@ -478,6 +497,13 @@ impl App {
         } else {
             None
         };
+        log::debug!(
+            "begin_drag: node={node:?} button={button:?} ({x},{y}) titlebar={from_titlebar} floating={} tiling_drag={:?} already_dragging={} -> {:?}",
+            self.wm.tree.contains(node) && self.wm.tree.is_floating(node),
+            self.wm.config.tiling_drag,
+            self.drag.is_some(),
+            started.as_ref().map(|d| &d.kind)
+        );
         let Some(d) = started else {
             if from_titlebar {
                 deco::end_title_drag();
@@ -549,7 +575,14 @@ impl App {
             now_ms: self.now_ms(),
             pos: (x, y),
         };
+        let cand_before = self.hover.candidate;
         let fire = hover::hover_step(&mut self.hover, &input);
+        if fire.is_some() || self.hover.candidate != cand_before {
+            log::debug!(
+                "hover: {input:?} -> fire={fire:?} candidate={:?}",
+                self.hover.candidate
+            );
+        }
         if self.hover.candidate.is_some() {
             mainloop::arm_hover_timer();
         }
@@ -788,7 +821,11 @@ impl App {
         }
         if let PlatformEvent::Foreground(fg) = ev {
             // Between flushes too: a menu or unmanaged window in front blocks drags at once.
-            mouse::set_foreground_managed(self.foreground_managed(fg));
+            let managed = self.foreground_managed(fg);
+            log::debug!(
+                "mouse snapshot (foreground event): fg={fg:?} foreground_managed={managed}"
+            );
+            mouse::set_foreground_managed(managed);
         }
     }
 
@@ -1093,7 +1130,17 @@ impl App {
         }
         self.warp_pointer(&arr, leaf);
         let fg_managed = window::foreground().is_some_and(|fg| self.foreground_managed(fg));
-        mouse::set_snapshot(mouse_snapshot(&self.wm, &arr, fg_managed));
+        let snap = mouse_snapshot(&self.wm, &arr, fg_managed);
+        log::debug!(
+            "mouse snapshot (flush): hits={} modifier={:?} foreground_managed={} want_moves={} fg={:?} hook_calls={}",
+            snap.hits.len(),
+            snap.modifier,
+            snap.foreground_managed,
+            snap.want_moves,
+            window::foreground(),
+            mouse::hook_calls()
+        );
+        mouse::set_snapshot(snap);
         let combos = self.wm.active_combos();
         if combos != self.last_combos {
             keyboard::set_combos(&combos);
