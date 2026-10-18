@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use i3win_core::tree::WindowId;
 
-use super::window;
+use super::{cloak, window};
 
 const EXPECT_TTL: Duration = Duration::from_secs(2);
 
@@ -183,6 +183,8 @@ pub fn restore_all_hidden() {
     for i in ids {
         let id = WindowId(i);
         if window::is_window(id) {
+            // Both are harmless if the window was not hidden that way.
+            cloak::uncloak_fresh(id);
             window::show(id);
         }
     }

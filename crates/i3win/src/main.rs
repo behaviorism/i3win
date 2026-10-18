@@ -129,6 +129,8 @@ fn main() {
     std::env::set_var("I3SOCK", &ipc_pipe);
 
     init_logging();
+    // Before first use of the shell COM objects (cloaking) on this thread.
+    win::cloak::init_com();
     install_crash_safety();
     #[cfg(debug_assertions)]
     spawn_debug_panic_trigger();
@@ -156,11 +158,12 @@ fn main() {
     // Recover windows a crashed previous run left hidden. Only windows that are
     // still owned by the same process and are still invisible (HWNDs get reused).
     for (id, pid) in win::hidden::take_previous(&paths::hidden_path()) {
-        if win::window::is_window(id)
-            && win::window::window_pid(id) == pid
-            && !win::window::is_visible(id)
-        {
-            win::window::show(id);
+        if win::window::is_window(id) && win::window::window_pid(id) == pid {
+            // A cloaked window is still "visible", so uncloak whatever the state.
+            win::cloak::uncloak_fresh(id);
+            if !win::window::is_visible(id) {
+                win::window::show(id);
+            }
         }
     }
 

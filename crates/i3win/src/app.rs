@@ -7,7 +7,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use i3win_core::arrange::{floating_frame_from_client, Arrangement};
-use i3win_core::config::{default_config_text, parse_config, BarMode, Config};
+use i3win_core::config::{default_config_text, parse_config, BarMode, Config, HideMethod};
 use i3win_core::geom::Rect;
 use i3win_core::i3bar::Block;
 use i3win_core::ipc::{self, IpcContext, Request, EV_TICK};
@@ -24,6 +24,7 @@ use crate::paths;
 use crate::reconcile::{self, Applied, DeferredHides, WinOp};
 use crate::status::{cmd_args, exit_block, StatusProcess};
 use crate::win::bar::Bars;
+use crate::win::cloak;
 use crate::win::deco::{self, Decos};
 use crate::win::events::{self, PlatformEvent};
 use crate::win::hidden::{self, HiddenStore, HideTracker};
@@ -275,6 +276,8 @@ pub struct App {
     tracker: HideTracker,
     /// Hides waiting for the windows shown in the same flush to become visible.
     deferred_hides: DeferredHides,
+    /// Windows currently hidden by cloaking (the rest of `applied.hidden` use SW_HIDE).
+    cloaked: HashSet<WindowId>,
     decos: Decos,
     bars: Bars,
     /// Blocks changed since the bars were last redrawn.
@@ -349,6 +352,7 @@ impl App {
             applied: Applied::default(),
             tracker: HideTracker::new(),
             deferred_hides: DeferredHides::default(),
+            cloaked: HashSet::new(),
             decos: Decos::new(),
             bars: Bars::new(),
             bars_dirty: false,
@@ -1066,7 +1070,9 @@ impl App {
                 WinOp::Hide(id) => hides.push(id),
                 WinOp::Show(id) => {
                     self.deferred_hides.cancel(id);
-                    window::show(id);
+                    if !(self.cloaked.remove(&id) && cloak::uncloak(id)) {
+                        window::show(id);
+                    }
                     self.store.remove(id);
                     shown.push(id);
                 }
@@ -1076,6 +1082,8 @@ impl App {
                 }
             }
         }
+        // Gone or unmanaged windows no longer count as cloaked (HWNDs get reused).
+        self.cloaked.retain(|id| self.applied.hidden.contains(id));
         if !hides.is_empty() {
             if shown.is_empty() {
                 self.apply_hides(&hides);
@@ -1162,7 +1170,10 @@ impl App {
         self.store.persist_if_dirty();
         for &id in ids {
             self.tracker.expect(id, Instant::now());
-            if !window::hide(id) {
+            let cloaked = self.wm.config.hide_method == HideMethod::Cloak && cloak::cloak(id);
+            if cloaked {
+                self.cloaked.insert(id);
+            } else if !window::hide(id) {
                 // Not hidden after all: do not claim it, retry on a later flush.
                 self.applied.hidden.remove(&id);
                 self.store.remove(id);
@@ -1173,7 +1184,7 @@ impl App {
     /// The hide timer fired: issues the deferred hides once the shown windows are up.
     pub fn on_hide_timer(&mut self) {
         let ready = self.deferred_hides.ready(Instant::now(), |id| {
-            window::is_visible(id) || !window::is_window(id)
+            window::is_shown(id) || !window::is_window(id)
         });
         if ready {
             let ids: Vec<WindowId> = self

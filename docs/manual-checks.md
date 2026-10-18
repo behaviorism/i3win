@@ -101,3 +101,4 @@ Build with `cargo build --workspace` (builds i3win-msg.exe). In PowerShell 5.1 e
 6. Mouse wheel over a tabbed/stacked tab row cycles the tabs.
 7. `mouse_warping output` with two monitors: `focus output right` moves the cursor to the other monitor.
 8. With `focus_follows_mouse yes`, hovering over windows while a context menu is open never closes the menu.
+9. `hide_method cloak` (default): switching workspaces keeps Chrome from flashing grey and hidden windows leave the taskbar; `hide_method hide` restores the old SW_HIDE behaviour.

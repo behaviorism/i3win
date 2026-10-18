@@ -310,6 +310,22 @@ pub fn is_visible(id: WindowId) -> bool {
     unsafe { IsWindowVisible(hwnd(id)).as_bool() }
 }
 
+/// Visible and not cloaked: what a window shown by us must be before hides may follow.
+pub fn is_shown(id: WindowId) -> bool {
+    let mut cloak = 0u32;
+    // SAFETY: plain Win32 calls; the out buffer is a valid u32.
+    unsafe {
+        IsWindowVisible(hwnd(id)).as_bool()
+            && DwmGetWindowAttribute(
+                hwnd(id),
+                DWMWA_CLOAKED,
+                &mut cloak as *mut u32 as *mut c_void,
+                size_of::<u32>() as u32,
+            )
+            .is_ok_and(|()| cloak == 0)
+    }
+}
+
 pub fn show(id: WindowId) {
     // SAFETY: plain Win32 call.
     unsafe {

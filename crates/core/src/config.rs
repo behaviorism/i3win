@@ -213,6 +213,8 @@ pub struct Config {
     /// The config text has a `focus_follows_mouse` line.
     pub focus_follows_mouse_explicit: bool,
     pub mouse_warping: MouseWarping,
+    /// i3win-specific: how windows are hidden on workspace/tab switches.
+    pub hide_method: HideMethod,
     pub floating_modifier: Option<Modifiers>,
     pub tiling_drag: TilingDrag,
     pub show_marks: bool,
@@ -229,6 +231,14 @@ pub struct Config {
     /// Mode names declared with `--pango_markup`; the bar draws them as markup.
     pub mode_markup: HashSet<String>,
     pub warnings: Vec<String>, // "line N: message"
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HideMethod {
+    /// DWM cloaking: the window keeps its surface and returns instantly.
+    Cloak,
+    /// `SW_HIDE`: the app must repaint when shown again.
+    Hide,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -593,6 +603,7 @@ pub fn parse_config(text: &str) -> Config {
         focus_follows_mouse: true,
         focus_follows_mouse_explicit: false,
         mouse_warping: MouseWarping::Output,
+        hide_method: HideMethod::Cloak,
         floating_modifier: None,
         tiling_drag: TilingDrag {
             modifier: true,
@@ -1076,6 +1087,13 @@ fn top_level(
                 _ => return Err(format!("mouse_warping: invalid value '{args}'")),
             }
         }
+        "hide_method" => {
+            cfg.hide_method = match args {
+                "cloak" => HideMethod::Cloak,
+                "hide" => HideMethod::Hide,
+                _ => return Err(format!("hide_method: invalid value '{args}'")),
+            }
+        }
         "floating_modifier" => cfg.floating_modifier = Some(parse_modifiers(args)?),
         "tiling_drag" => cfg.tiling_drag = parse_tiling_drag(args)?,
         "show_marks" => cfg.show_marks = parse_bool(kw, args)?,
@@ -1201,6 +1219,25 @@ output primary
             )
             .focus_follows_mouse_explicit
         );
+    }
+
+    #[test]
+    fn hide_method_parsing() {
+        assert_eq!(parse_config("").hide_method, HideMethod::Cloak);
+        assert_eq!(
+            parse_config("hide_method cloak").hide_method,
+            HideMethod::Cloak
+        );
+        assert_eq!(
+            parse_config("hide_method hide").hide_method,
+            HideMethod::Hide
+        );
+        let c = parse_config(
+            "hide_method hide
+hide_method bogus",
+        );
+        assert_eq!(c.hide_method, HideMethod::Hide);
+        assert!(c.warnings.iter().any(|w| w.contains("hide_method")));
     }
 
     #[test]
