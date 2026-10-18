@@ -43,21 +43,22 @@ public class P {
   }
   // Samples the points for ms milliseconds. A sample is "diff" when any point differs
   // from its colour before the switch (want), and "wall" when a point that was not
-  // showing the wallpaper before the switch now does. Returns
+  // showing the wallpaper before the switch now does (points where the wallpaper is
+  // near-white are skipped: unpainted windows flash white too). Returns
   // "samples diff wall firstWallMs".
   public static string Sample(int[] xs, int[] ys, int ms, uint[] want, uint[] wall) {
-    IntPtr dc = GetDC(IntPtr.Zero); var sw = Stopwatch.StartNew(); int n = 0, diff = 0, walls = 0; long first = -1;
+    IntPtr dc = GetDC(IntPtr.Zero); var sw = Stopwatch.StartNew(); int n = 0, diff = 0, walls = 0; long first = -1; string seen = "";
     while (sw.ElapsedMilliseconds < ms) {
       bool d = false, w = false; n++;
       for (int i = 0; i < xs.Length; i++) {
         uint c = GetPixel(dc, xs[i], ys[i]);
         if (!Near(c, want[i])) d = true;
-        if (Near(c, wall[i]) && !Near(want[i], wall[i])) w = true;
+        if (Near(c, wall[i]) && !Near(want[i], wall[i]) && !Near(wall[i], 0xFFFFFF)) { w = true; if (seen == "") seen = "p" + i + "=" + c.ToString("X6") + " want " + want[i].ToString("X6"); }
       }
       if (d) diff++;
       if (w) { walls++; if (first < 0) first = sw.ElapsedMilliseconds; }
     }
-    ReleaseDC(IntPtr.Zero, dc); return n + " " + diff + " " + walls + " " + first;
+    ReleaseDC(IntPtr.Zero, dc); return n + " " + diff + " " + walls + " " + first + " " + (seen == "" ? "-" : seen.Replace(" ", "_"));
   }
   public static uint[] Pixels(int[] xs, int[] ys) {
     var r = new uint[xs.Length]; for (int i = 0; i < xs.Length; i++) r[i] = Pixel(xs[i], ys[i]); return r;
@@ -74,7 +75,7 @@ function Probe($label, [scriptblock]$switch) {
     $want = [P]::Pixels($xs, $ys)
     & $switch $i
     $r = [P]::Sample($xs, $ys, 600, $want, $wall) -split ' '
-    $diffs += [int]$r[1]; $walls += [int]$r[2]
+    $diffs += [int]$r[1]; $walls += [int]$r[2]; if ($r[4] -ne '-') { "    wallpaper hit: $($r[4]) at $($r[3])ms" }
     Start-Sleep -Milliseconds 300
   }
   "{0}: wallpaper seen on {1}/6 switches (wallpaper samples: {2}; any-change samples: {3})" -f $label,
@@ -90,6 +91,7 @@ if ($tmpCfg) {
 Get-Process i3win, i3win-status -ErrorAction SilentlyContinue | Stop-Process -Force
 (New-Object -ComObject Shell.Application).MinimizeAll(); Start-Sleep 2
 $wall = [P]::Pixels($xs, $ys)
+"wallpaper colours: " + (($wall | ForEach-Object { $_.ToString('X6') }) -join ' ')
 $wm = Start-Process $exe -ArgumentList '--config', $config -PassThru; Start-Sleep 1.5
 $np = @(); $dirs = @()
 # Opens one window of the chosen app; an Explorer window gets its own empty folder.
