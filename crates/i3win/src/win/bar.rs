@@ -14,11 +14,10 @@ use i3win_core::tree::{NodeKind, WindowId};
 use i3win_core::wm::Wm;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM,
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, GetDC, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, ScreenToClient,
-    SelectObject,
+    ClientToScreen, GetDC, InvalidateRect, ReleaseDC, ScreenToClient, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -143,16 +142,10 @@ fn measure_text(font: &Font, scale: f32, text: &str, markup: bool) -> i32 {
             gdi::measure_runs(hdc, &parse_markup(text), font, scale)
         } else {
             let hfont = gdi::font(&font.family, font.size_pt, scale);
-            let wide: Vec<u16> = text.encode_utf16().collect();
-            let mut size = SIZE::default();
             let old = SelectObject(hdc, hfont);
-            let ok = GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool();
+            let w = gdi::measure_wide(hdc, text).unwrap_or(0);
             SelectObject(hdc, old);
-            if ok {
-                size.cx
-            } else {
-                0
-            }
+            w
         };
         ReleaseDC(None, hdc);
         width

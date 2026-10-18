@@ -210,6 +210,9 @@ pub fn layout_bar(
             } else {
                 &block.full_text
             };
+            if text.is_empty() {
+                continue;
+            }
             let markup = block.markup.as_deref() == Some("pango");
             let cw = measure(text, markup).max(0);
             let min_w = match &block.min_width {
@@ -613,6 +616,46 @@ mod tests {
         assert_eq!(texts, vec!["a", "b"]);
         let l = layout_bar(400, 20, 1.0, &[], None, &blocks, &style(), &m);
         assert_eq!(l.items[0].text, "aaaaaaaaaa");
+    }
+    #[test]
+    fn empty_text_blocks_are_not_laid_out() {
+        let l = layout_bar(
+            400,
+            20,
+            1.0,
+            &[],
+            None,
+            &[blk("", None), blk("x", None)],
+            &style(),
+            &m,
+        );
+        assert_eq!(l.items.len(), 1);
+        assert_eq!(l.items[0].text, "x");
+        assert!(l.separators.is_empty());
+        let l = layout_bar(
+            400,
+            20,
+            1.0,
+            &[],
+            None,
+            &[blk("x", None), blk("", None)],
+            &style(),
+            &m,
+        );
+        assert_eq!(l.items.len(), 1);
+        assert!(l.separators.is_empty());
+        // short_text selection that is empty is skipped too.
+        let l = layout_bar(
+            10,
+            20,
+            1.0,
+            &[],
+            None,
+            &[blk("aaaaaaaaaa", Some(""))],
+            &style(),
+            &m,
+        );
+        assert!(l.items.is_empty());
     }
     #[test]
     fn min_width_and_align() {

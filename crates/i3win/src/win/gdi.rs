@@ -152,9 +152,33 @@ pub fn outline(hdc: HDC, r: Rect, c: Color) {
     }
 }
 
+/// UTF-16 of `text`, or `None` when empty. GDI text calls must never be handed
+/// an empty slice (windows-rs passes a dangling pointer and user32 faults).
+pub fn wide(text: &str) -> Option<Vec<u16>> {
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.encode_utf16().collect())
+    }
+}
+
+/// Width of `text` with the font selected into `hdc`; 0 for empty text.
+///
+/// # Safety
+/// `hdc` must be a valid DC.
+pub unsafe fn measure_wide(hdc: HDC, text: &str) -> Option<i32> {
+    let w = wide(text)?;
+    let mut size = SIZE::default();
+    GetTextExtentPoint32W(hdc, &w, &mut size)
+        .as_bool()
+        .then_some(size.cx)
+}
+
 /// Draws one line of `text` in `r` with `font`, left aligned and vertically centered.
 pub fn draw_text(hdc: HDC, r: Rect, text: &str, c: Color, font: HFONT) {
-    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let Some(mut wide) = wide(text) else {
+        return;
+    };
     let mut rc = to_rect(r);
     // SAFETY: `wide` and `rc` outlive the calls; the old font is restored.
     unsafe {
@@ -218,13 +242,15 @@ struct Laid {
 
 fn lay_out(hdc: HDC, run: &Run, base: &Font, scale: f32) -> Laid {
     let font = run_font(base, &run.style, scale);
-    let wide: Vec<u16> = run.text.encode_utf16().collect();
+    let wide: Vec<u16> = wide(&run.text).unwrap_or_default();
     let mut size = SIZE::default();
     let mut tm = TEXTMETRICW::default();
     // SAFETY: out-pointers are valid locals; the previous font is restored.
     unsafe {
         let old = SelectObject(hdc, font);
-        let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+        if !wide.is_empty() {
+            let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+        }
         let _ = GetTextMetricsW(hdc, &mut tm);
         SelectObject(hdc, old);
     }
@@ -269,6 +295,9 @@ fn ellipsis_cut(widths: &[i32], ell: &[i32], x: i32, right: i32) -> Option<(usiz
 /// # Safety
 /// `hdc` must be a valid DC.
 unsafe fn fit_prefix(hdc: HDC, wide: &[u16], max: i32) -> usize {
+    if wide.is_empty() {
+        return 0;
+    }
     let mut fit = 0i32;
     let mut size = SIZE::default();
     let ok = GetTextExtentExPointW(
@@ -297,6 +326,9 @@ unsafe fn fit_prefix(hdc: HDC, wide: &[u16], max: i32) -> usize {
 /// # Safety
 /// `hdc` must be a valid DC.
 unsafe fn text_width(hdc: HDC, wide: &[u16]) -> i32 {
+    if wide.is_empty() {
+        return 0;
+    }
     let mut size = SIZE::default();
     let _ = GetTextExtentPoint32W(hdc, wide, &mut size);
     size.cx.max(0)
@@ -353,14 +385,18 @@ pub fn draw_runs(
                 if let Some(bg) = run.style.bg {
                     fill(hdc, Rect::new(cx, y, hw.saturating_add(ew), l.h), bg);
                 }
-                let _ = TextOutW(hdc, cx, y, head);
+                if !head.is_empty() {
+                    let _ = TextOutW(hdc, cx, y, head);
+                }
                 let _ = TextOutW(hdc, cx.saturating_add(hw), y, &ELLIPSIS);
                 break;
             }
             if let Some(bg) = run.style.bg {
                 fill(hdc, Rect::new(cx, y, l.w, l.h), bg);
             }
-            let _ = TextOutW(hdc, cx, y, &l.wide);
+            if !l.wide.is_empty() {
+                let _ = TextOutW(hdc, cx, y, &l.wide);
+            }
             cx = cx.saturating_add(l.w);
         }
         let _ = RestoreDC(hdc, saved);
@@ -410,6 +446,11 @@ mod tests {
     use super::*;
     use i3win_core::arrange::DecoState;
     use i3win_core::config::Color;
+    #[test]
+    fn wide_is_none_for_empty_text() {
+        assert_eq!(wide(""), None);
+        assert_eq!(wide("a{1F600}"), Some(vec![0x61, 0xD83D, 0xDE00]));
+    }
     #[test]
     fn colorref_packs_bgr() {
         assert_eq!(colorref(Color(0x11, 0x22, 0x33)).0, 0x0033_2211);
