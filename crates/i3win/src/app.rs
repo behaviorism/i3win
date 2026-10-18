@@ -771,6 +771,7 @@ impl App {
         };
         if let Some(info) = window::info(id, wants_float) {
             wm.manage(info);
+            window::disable_transitions(id);
         }
     }
 
@@ -805,6 +806,9 @@ impl App {
                     window::show(id);
                 }
                 self.wm.unmanage(id);
+                if window::is_window(id) {
+                    window::restore_transitions(id);
+                }
                 self.move_start.remove(&id);
                 self.tracker.forget(id);
                 self.store.remove(id);
@@ -1223,6 +1227,15 @@ impl App {
         keyboard::uninstall();
         mouse::uninstall();
         hidden::restore_all_hidden();
+        let placed = self.applied.rects.keys();
+        for &id in placed
+            .chain(&self.applied.hidden)
+            .chain(&self.applied.frozen)
+        {
+            if window::is_window(id) {
+                window::restore_transitions(id);
+            }
+        }
         for (_, mut st) in self.statuses.drain() {
             if let Some(p) = st.process.as_mut() {
                 p.kill();

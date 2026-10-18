@@ -8,7 +8,8 @@ use i3win_core::tree::{WindowId, WindowInfo};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_TRANSITIONS_FORCEDISABLED,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -285,6 +286,36 @@ pub fn place(id: WindowId, target: Rect, raise: bool) {
             w.borrow_mut().remove(&id);
         }),
     }
+}
+
+/// Turns the DWM show/hide/move animations off (or back on) for one window.
+fn set_transitions_disabled(id: WindowId, disabled: bool) {
+    let v = BOOL::from(disabled);
+    // SAFETY: v is a valid BOOL and the size passed matches it.
+    let res = unsafe {
+        DwmSetWindowAttribute(
+            hwnd(id),
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &v as *const BOOL as *const c_void,
+            size_of::<BOOL>() as u32,
+        )
+    };
+    if let Err(e) = res {
+        log::debug!(
+            "DWMWA_TRANSITIONS_FORCEDISABLED({disabled}) failed for {:#x}: {e}",
+            id.0
+        );
+    }
+}
+
+/// Suppresses Windows' transition animations on a managed window (avoids switch flashes).
+pub fn disable_transitions(id: WindowId) {
+    set_transitions_disabled(id, true);
+}
+
+/// Gives a window that is no longer managed its normal animations back.
+pub fn restore_transitions(id: WindowId) {
+    set_transitions_disabled(id, false);
 }
 
 thread_local! {

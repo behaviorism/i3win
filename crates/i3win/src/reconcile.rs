@@ -25,7 +25,8 @@ pub struct Applied {
 }
 
 /// Diffs `arr` against what was already applied and returns the minimal ops.
-/// Order: hides first (avoids flashing), then shows, then placements.
+/// Order: placements first (hidden windows move while invisible), then shows, then
+/// hides last so the screen is never empty mid-switch.
 pub fn plan(applied: &mut Applied, arr: &Arrangement, managed: &HashSet<WindowId>) -> Vec<WinOp> {
     let mut hides = Vec::new();
     let mut shows = Vec::new();
@@ -52,9 +53,9 @@ pub fn plan(applied: &mut Applied, arr: &Arrangement, managed: &HashSet<WindowId
     applied.rects.retain(|id, _| managed.contains(id));
     applied.hidden.retain(|id| managed.contains(id));
     applied.frozen.retain(|id| managed.contains(id));
-    hides.extend(shows);
-    hides.extend(places);
-    hides
+    places.extend(shows);
+    places.extend(hides);
+    places
 }
 
 /// Forgets the applied rect so the next plan re-places the window.
@@ -98,12 +99,12 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                WinOp::Hide(WindowId(2)),
                 WinOp::Place {
                     id: WindowId(1),
                     rect: Rect::new(0, 0, 10, 10),
                     raise: false
-                }
+                },
+                WinOp::Hide(WindowId(2)),
             ]
         );
     }
@@ -115,7 +116,7 @@ mod tests {
         assert!(plan(&mut a, &x, &managed(&[1, 2])).is_empty());
     }
     #[test]
-    fn unhide_shows_then_places() {
+    fn unhide_places_then_shows() {
         let mut a = Applied::default();
         plan(&mut a, &arr(vec![], vec![1]), &managed(&[1]));
         let ops = plan(
@@ -126,12 +127,32 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                WinOp::Show(WindowId(1)),
                 WinOp::Place {
                     id: WindowId(1),
                     rect: Rect::new(0, 0, 5, 5),
                     raise: true
-                }
+                },
+                WinOp::Show(WindowId(1)),
+            ]
+        );
+    }
+    #[test]
+    fn workspace_switch_places_shows_then_hides() {
+        let mut a = Applied::default();
+        let old = arr(vec![(1, Rect::new(0, 0, 10, 10), false)], vec![2]);
+        plan(&mut a, &old, &managed(&[1, 2]));
+        let new = arr(vec![(2, Rect::new(0, 0, 20, 20), false)], vec![1]);
+        let ops = plan(&mut a, &new, &managed(&[1, 2]));
+        assert_eq!(
+            ops,
+            vec![
+                WinOp::Place {
+                    id: WindowId(2),
+                    rect: Rect::new(0, 0, 20, 20),
+                    raise: false
+                },
+                WinOp::Show(WindowId(2)),
+                WinOp::Hide(WindowId(1)),
             ]
         );
     }
