@@ -118,3 +118,10 @@ Per-task reviews also logged minor findings judged safe to defer; the final whol
 - Task 5: minor (deferred): Resized(vec![]) when width change split across sub-slop edges; Up/positive Down untested.
 - Task 6: minor (deferred): 10 s freeze expiry thaws a genuinely long native drag; hover_at/classify_point glue untested; wheel delta sign unverified live.
 - Task 7: minor (deferred): unmatched button-ups in finally; force-kill leaves ws1 notepads hidden (killed after); weak swap assertion; hover check can pick a stranger window; no-config branch has no bindings.
+
+## Live run and follow-up fixes (2026-10-18)
+
+- Live run found a crash: an empty status block (the default battery block on a PC without a battery) crashed i3win in the bar's text drawing (0xC000041D, a v1 bug newly reachable). Fixed in 89d8080: empty blocks are not laid out (i3bar behaviour) and every GDI text call guards empty text.
+- Live checks script fixed (7ec3350): real mouse-move input, and a `$alt` parameter that shadowed `$ALT`. Result: 70/70 live checks and both desktop smoke tests pass.
+- Parked items resolved in 18e8ed6 and bd57692: floating windows moved to a mark on another output are shifted onto it (a floating swap already exchanges rects, so it only clamps); unbound horizontal wheel on the bar switches workspace; every status block string field is capped at 256 bytes and an oversized line drops blocks from the left; bar.rs split into bar/{mod,window,paint,input}.rs.
+- Debug-level mouse diagnostics kept (3259ffd): only logged with I3WIN_LOG=debug.
