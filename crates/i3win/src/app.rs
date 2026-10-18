@@ -21,7 +21,7 @@ use crate::hover::{self, FreezeVerdict, HoverInput, HoverState};
 use crate::ipc_server;
 use crate::mainloop::{self, MainMsg};
 use crate::paths;
-use crate::reconcile::{self, Applied, DeferredHides, WinOp};
+use crate::reconcile::{self, Applied, WinOp};
 use crate::status::{cmd_args, exit_block, StatusProcess};
 use crate::win::bar::Bars;
 use crate::win::cloak;
@@ -274,8 +274,6 @@ pub struct App {
     pub wm: Wm,
     applied: Applied,
     tracker: HideTracker,
-    /// Hides waiting for the windows shown in the same flush to become visible.
-    deferred_hides: DeferredHides,
     /// Windows currently hidden by cloaking (the rest of `applied.hidden` use SW_HIDE).
     cloaked: HashSet<WindowId>,
     decos: Decos,
@@ -351,7 +349,6 @@ impl App {
             wm,
             applied: Applied::default(),
             tracker: HideTracker::new(),
-            deferred_hides: DeferredHides::default(),
             cloaked: HashSet::new(),
             decos: Decos::new(),
             bars: Bars::new(),
@@ -1066,36 +1063,22 @@ impl App {
             .collect();
         let ops = reconcile::plan(&mut self.applied, &arr, &managed);
         let mut hides = Vec::new();
-        let mut shown = Vec::new();
         for op in ops {
             match op {
                 WinOp::Hide(id) => hides.push(id),
                 WinOp::Show(id) => {
-                    self.deferred_hides.cancel(id);
                     if !(self.cloaked.remove(&id) && cloak::uncloak(id)) {
                         window::show(id);
                     }
                     self.store.remove(id);
-                    shown.push(id);
                 }
-                WinOp::Place { id, rect, raise } => {
-                    self.deferred_hides.cancel(id);
-                    window::place(id, rect, raise);
-                }
+                WinOp::Place { id, rect, raise } => window::place(id, rect, raise),
             }
         }
         // Gone or unmanaged windows no longer count as cloaked (HWNDs get reused).
         self.cloaked.retain(|id| self.applied.hidden.contains(id));
-        if !hides.is_empty() {
-            if shown.is_empty() {
-                self.apply_hides(&hides);
-            } else {
-                // ShowWindowAsync runs on each window's own thread: hiding right away
-                // can beat the incoming window and expose the wallpaper.
-                self.deferred_hides.defer(hides, shown, Instant::now());
-                mainloop::arm_hide_timer();
-            }
-        }
+        // Hides last (plan order), after the incoming windows were shown.
+        self.apply_hides(&hides);
         self.store.persist_if_dirty();
         let outputs: Vec<(Rect, f32)> = self
             .wm
@@ -1183,25 +1166,6 @@ impl App {
         }
     }
 
-    /// The hide timer fired: issues the deferred hides once the shown windows are up.
-    pub fn on_hide_timer(&mut self) {
-        let ready = self.deferred_hides.ready(Instant::now(), |id| {
-            window::is_shown(id) || !window::is_window(id)
-        });
-        if ready {
-            let ids: Vec<WindowId> = self
-                .deferred_hides
-                .take()
-                .into_iter()
-                .filter(|id| self.applied.hidden.contains(id) && window::is_window(*id))
-                .collect();
-            self.apply_hides(&ids);
-            self.store.persist_if_dirty();
-        } else if !self.deferred_hides.is_empty() {
-            mainloop::arm_hide_timer();
-        }
-    }
-
     /// After a keyboard/IPC focus change, moves the pointer per `mouse_warping`.
     fn warp_pointer(&mut self, arr: &Arrangement, leaf: Option<WindowId>) {
         let node = self.wm.tree.focused_descendant(self.wm.tree.root());
@@ -1276,7 +1240,6 @@ impl App {
         events::uninstall();
         keyboard::uninstall();
         mouse::uninstall();
-        self.deferred_hides.clear();
         hidden::restore_all_hidden();
         for (_, mut st) in self.statuses.drain() {
             if let Some(p) = st.process.as_mut() {

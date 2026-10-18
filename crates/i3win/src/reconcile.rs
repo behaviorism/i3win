@@ -1,6 +1,5 @@
 //! Pure diffing of the desired arrangement against what has already been applied.
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
 
 use i3win_core::arrange::Arrangement;
 use i3win_core::geom::Rect;
@@ -23,75 +22,6 @@ pub struct Applied {
     pub hidden: HashSet<WindowId>,
     /// Windows in a native move/size loop: never placed until they are thawed.
     pub frozen: HashSet<WindowId>,
-}
-
-/// Give up waiting for the shown windows to become visible after this long.
-const DEFER_TIMEOUT: Duration = Duration::from_millis(150);
-/// Once the shown windows are visible, wait this long so DWM composes a frame with them.
-const DEFER_SETTLE: Duration = Duration::from_millis(16);
-
-/// Hides held back until the windows shown in the same flush are actually visible, so
-/// the desktop never shows through between the outgoing and the incoming window.
-#[derive(Default)]
-pub struct DeferredHides {
-    hides: Vec<WindowId>,
-    awaiting: Vec<WindowId>,
-    since: Option<Instant>,
-    /// When every awaited window was first seen visible (reset if that stops holding).
-    visible_since: Option<Instant>,
-}
-
-impl DeferredHides {
-    pub fn is_empty(&self) -> bool {
-        self.hides.is_empty()
-    }
-
-    /// Holds `hides` back until `awaiting` are visible; merges with pending hides and
-    /// restarts the wait.
-    pub fn defer(&mut self, hides: Vec<WindowId>, awaiting: Vec<WindowId>, now: Instant) {
-        for id in hides {
-            if !self.hides.contains(&id) {
-                self.hides.push(id);
-            }
-        }
-        self.awaiting = awaiting;
-        self.since = Some(now);
-        self.visible_since = None;
-    }
-
-    /// A window that is shown or placed again must stay visible: drop its pending hide.
-    pub fn cancel(&mut self, id: WindowId) {
-        self.hides.retain(|h| *h != id);
-    }
-
-    /// Whether the pending hides may be issued now.
-    pub fn ready(&mut self, now: Instant, visible: impl Fn(WindowId) -> bool) -> bool {
-        if self.hides.is_empty() {
-            return false;
-        }
-        let since = self.since.unwrap_or(now);
-        if now.saturating_duration_since(since) >= DEFER_TIMEOUT {
-            return true;
-        }
-        if !self.awaiting.iter().all(|id| visible(*id)) {
-            self.visible_since = None;
-            return false;
-        }
-        let first = *self.visible_since.get_or_insert(now);
-        now.saturating_duration_since(first) >= DEFER_SETTLE
-    }
-
-    /// Takes the pending hides and resets.
-    pub fn take(&mut self) -> Vec<WindowId> {
-        self.awaiting.clear();
-        self.since = None;
-        self.visible_since = None;
-        std::mem::take(&mut self.hides)
-    }
-
-    pub fn clear(&mut self) {
-        self.take();
-    }
 }
 
 /// Diffs `arr` against what was already applied and returns the minimal ops.
@@ -249,74 +179,5 @@ mod tests {
         plan(&mut a, &arr(vec![], vec![1]), &managed(&[1]));
         plan(&mut a, &arr(vec![], vec![]), &managed(&[]));
         assert!(a.hidden.is_empty());
-    }
-
-    #[test]
-    fn deferred_hides_wait_for_visibility_and_settle() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let mut d = DeferredHides::default();
-        assert!(!d.ready(t0, |_| true));
-        d.defer(vec![WindowId(1)], vec![WindowId(2)], t0);
-        assert!(!d.is_empty());
-        assert!(!d.ready(t0 + ms(8), |_| false));
-        // visible from 16 ms on, ready only 16 ms later
-        assert!(!d.ready(t0 + ms(16), |_| true));
-        assert!(!d.ready(t0 + ms(24), |_| true));
-        assert!(d.ready(t0 + ms(32), |_| true));
-        assert_eq!(d.take(), vec![WindowId(1)]);
-        assert!(d.is_empty());
-    }
-
-    #[test]
-    fn deferred_hides_visibility_loss_resets_settle() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let mut d = DeferredHides::default();
-        d.defer(vec![WindowId(1)], vec![WindowId(2)], t0);
-        assert!(!d.ready(t0 + ms(8), |_| true));
-        assert!(!d.ready(t0 + ms(16), |_| false));
-        assert!(!d.ready(t0 + ms(24), |_| true));
-        assert!(!d.ready(t0 + ms(32), |_| true));
-        assert!(d.ready(t0 + ms(40), |_| true));
-    }
-
-    #[test]
-    fn deferred_hides_time_out() {
-        let t0 = Instant::now();
-        let mut d = DeferredHides::default();
-        d.defer(vec![WindowId(1)], vec![WindowId(2)], t0);
-        assert!(!d.ready(t0 + Duration::from_millis(149), |_| false));
-        assert!(d.ready(t0 + Duration::from_millis(150), |_| false));
-    }
-
-    #[test]
-    fn deferred_hide_cancelled_by_reshow() {
-        let t0 = Instant::now();
-        let mut d = DeferredHides::default();
-        d.defer(vec![WindowId(1), WindowId(3)], vec![WindowId(2)], t0);
-        d.cancel(WindowId(1));
-        assert_eq!(d.take(), vec![WindowId(3)]);
-        d.defer(vec![WindowId(1)], vec![WindowId(2)], t0);
-        d.cancel(WindowId(1));
-        assert!(d.is_empty());
-        assert!(!d.ready(t0 + Duration::from_secs(1), |_| true));
-    }
-
-    #[test]
-    fn deferred_hides_merge_and_restart() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let mut d = DeferredHides::default();
-        d.defer(vec![WindowId(1)], vec![WindowId(2)], t0);
-        d.defer(
-            vec![WindowId(1), WindowId(3)],
-            vec![WindowId(4)],
-            t0 + ms(100),
-        );
-        // restarted: the old timeout no longer applies
-        assert!(!d.ready(t0 + ms(150), |id| id == WindowId(2)));
-        assert!(d.ready(t0 + ms(250), |_| false));
-        assert_eq!(d.take(), vec![WindowId(1), WindowId(3)]);
     }
 }
