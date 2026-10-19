@@ -213,19 +213,36 @@ impl Ctx<'_> {
                 self.emit_window(node, frame, border, in_tabs, false);
             }
             NodeKind::Workspace { .. } | NodeKind::Container => {
-                let count = n.children.len();
+                // Parked children take no space: the others share it.
+                let live: Vec<NodeId> = n
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&c| !tree.fully_parked(c))
+                    .collect();
+                let count = live.len();
                 if count == 0 {
                     return;
                 }
+                let share = if count == n.children.len() {
+                    1.0
+                } else {
+                    live.iter().map(|&c| tree.get(c).percent).sum::<f64>()
+                };
                 match n.layout {
                     Layout::SplitH | Layout::SplitV => {
                         let horizontal = n.layout == Layout::SplitH;
                         let total = if horizontal { rect.w } else { rect.h };
                         let mut used = 0i32;
-                        for (i, &c) in n.children.iter().enumerate() {
+                        for (i, &c) in live.iter().enumerate() {
                             let left = (total - used).max(0);
                             let size = if i + 1 < count {
-                                let s = (tree.get(c).percent * total as f64).round();
+                                let frac = if share > 1e-12 {
+                                    tree.get(c).percent / share
+                                } else {
+                                    1.0 / count as f64
+                                };
+                                let s = (frac * total as f64).round();
                                 s.clamp(0.0, left as f64) as i32
                             } else {
                                 left
@@ -245,7 +262,7 @@ impl Ctx<'_> {
                         let header_h = if stacked { th.saturating_mul(cnt) } else { th };
                         let header = Rect::new(rect.x, rect.y, rect.w, header_h);
                         let mut tabs = Vec::with_capacity(count);
-                        for (i, &c) in n.children.iter().enumerate() {
+                        for (i, &c) in live.iter().enumerate() {
                             let idx = i32::try_from(i).unwrap_or(i32::MAX);
                             let r = if stacked {
                                 let y = rect.y.saturating_add(idx.saturating_mul(th));
@@ -280,8 +297,8 @@ impl Ctx<'_> {
                             vertical: stacked,
                             tabs,
                         });
-                        let active = n.focus.iter().copied().find(|c| n.children.contains(c));
-                        for &c in &n.children {
+                        let active = n.focus.iter().copied().find(|c| live.contains(c));
+                        for &c in &live {
                             if Some(c) != active {
                                 self.hide_under(c);
                             }
@@ -378,10 +395,14 @@ pub fn effective_gaps(tree: &Tree, config: &Config, ws: NodeId) -> Gaps {
 fn visible_tiled(tree: &Tree, id: NodeId) -> usize {
     let n = tree.get(id);
     if matches!(n.kind, NodeKind::Window(_)) {
-        return 1;
+        return usize::from(!tree.is_parked(id));
     }
     if matches!(n.layout, Layout::Tabbed | Layout::Stacked) {
-        let active = n.focus.iter().copied().find(|c| n.children.contains(c));
+        let active = n
+            .focus
+            .iter()
+            .copied()
+            .find(|&c| n.children.contains(&c) && !tree.fully_parked(c));
         return active.map_or(0, |a| visible_tiled(tree, a));
     }
     n.children.iter().map(|&c| visible_tiled(tree, c)).sum()
@@ -529,6 +550,9 @@ fn place_floating(ctx: &mut Ctx, config: &Config, ws: NodeId, skip: Option<NodeI
         let NodeKind::Window(d) = &tree.get(f).kind else {
             continue;
         };
+        if d.parked {
+            continue;
+        }
         let frame = d.floating_rect.unwrap_or(d.info.rect);
         let border = tree.get(f).border.unwrap_or(config.default_floating_border);
         ctx.emit_window(f, frame, border, false, true);
@@ -1047,5 +1071,107 @@ default_border normal 2
         assert_eq!(w1.y, t.bottom());
         assert_eq!((w1.x, w1.bottom()), (0, 500));
         assert_eq!(w1.right(), 498);
+    }
+
+    fn tab_titles(a: &Arrangement) -> Vec<String> {
+        a.decos
+            .iter()
+            .find_map(|d| match d {
+                Deco::TabBar { tabs, .. } => Some(tabs.iter().map(|t| t.title.clone()).collect()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+    #[test]
+    fn parked_tiled_window_is_left_out_and_sibling_takes_space() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        let before = wm.arrange();
+        wm.park(WindowId(2));
+        let a = wm.arrange();
+        assert_eq!(a.windows.len(), 1);
+        assert_eq!(placement(&a, 1), Rect::new(2, 20, 996, 478));
+        assert!(a.hidden.is_empty());
+        assert_eq!(a.decos.len(), 1);
+        assert_eq!(wm.tree.describe(wm.focused_workspace()), "H[w1 w2]");
+        wm.unpark(WindowId(2));
+        // Focus stays on w1, so only the placements are compared.
+        assert_eq!(wm.arrange().windows, before.windows);
+    }
+    #[test]
+    fn parked_tab_is_dropped_and_restored_in_place() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.manage(win(3));
+        wm.run_command("layout tabbed");
+        let before = wm.arrange();
+        wm.park(WindowId(2));
+        let a = wm.arrange();
+        assert_eq!(tab_titles(&a), vec!["w1", "w3"]);
+        assert_eq!(a.hidden, vec![WindowId(1)]);
+        wm.unpark(WindowId(2));
+        assert_eq!(tab_titles(&wm.arrange()), vec!["w1", "w2", "w3"]);
+        assert_eq!(wm.arrange(), before);
+    }
+    #[test]
+    fn parked_container_takes_no_space() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("split v");
+        wm.manage(win(3));
+        wm.park(WindowId(2));
+        wm.park(WindowId(3));
+        let a = wm.arrange();
+        assert_eq!(a.windows.len(), 1);
+        assert_eq!(placement(&a, 1), Rect::new(2, 20, 996, 478));
+        wm.unpark(WindowId(3));
+        assert_eq!(wm.arrange().windows.len(), 2);
+    }
+    #[test]
+    fn parking_moves_focus_off_the_window() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.take_effects();
+        wm.park(WindowId(2));
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        assert!(wm
+            .take_effects()
+            .contains(&crate::wm::Effect::Focus(WindowId(1))));
+        wm.on_focus_changed(WindowId(2));
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        wm.unpark(WindowId(2));
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        wm.run_command("focus right");
+        assert_eq!(wm.focused_window(), Some(WindowId(2)));
+    }
+    #[test]
+    fn workspace_with_only_parked_windows_is_kept() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.park(WindowId(1));
+        wm.run_command("workspace 2");
+        assert!(wm.find_workspace("1").is_some());
+        wm.run_command("workspace 1");
+        wm.unpark(WindowId(1));
+        assert_eq!(wm.arrange().windows.len(), 1);
+        crate::testutil::check_invariants(&wm);
+    }
+    #[test]
+    fn parked_floating_window_keeps_its_rect() {
+        let mut wm = test_wm();
+        let mut info = win(1);
+        info.wants_float = true;
+        wm.manage(info);
+        wm.manage(win(2));
+        let before = wm.arrange();
+        let rect = placement(&before, 1);
+        wm.park(WindowId(1));
+        assert!(wm.arrange().windows.iter().all(|p| p.id != WindowId(1)));
+        wm.unpark(WindowId(1));
+        assert_eq!(placement(&wm.arrange(), 1), rect);
     }
 }

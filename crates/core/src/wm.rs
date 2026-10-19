@@ -466,6 +466,7 @@ impl Wm {
                 floating_rect: None,
                 urgent: false,
                 urgent_since: 0,
+                parked: false,
             }),
             Layout::SplitH,
         );
@@ -575,6 +576,56 @@ impl Wm {
         self.emit_window("close", id);
     }
 
+    /// Parks a window that left with a Windows virtual desktop: it keeps its
+    /// node and place in the tree but is left out of the arrangement and of
+    /// focus. Focus moves as if it were closed.
+    pub fn park(&mut self, id: WindowId) {
+        let Some(node) = self.tree.window_node(id) else {
+            return;
+        };
+        if self.tree.is_parked(node) {
+            return;
+        }
+        let before = self.focus_leaf_window();
+        if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
+            d.parked = true;
+        }
+        // Sink the node (and containers that became fully parked) to the back
+        // of the focus lists, so unparking does not steal focus.
+        let mut cur = node;
+        while self.tree.fully_parked(cur) {
+            let Some(p) = self.tree.parent(cur) else {
+                break;
+            };
+            let f = &mut self.tree.get_mut(p).focus;
+            f.retain(|&c| c != cur);
+            f.push(cur);
+            cur = p;
+        }
+        let after = self.focus_leaf_window();
+        if after != before {
+            if let Some(w) = after {
+                self.push_focus(w);
+            }
+        }
+    }
+
+    /// Brings a parked window back exactly where it was (without focusing it).
+    pub fn unpark(&mut self, id: WindowId) {
+        let Some(node) = self.tree.window_node(id) else {
+            return;
+        };
+        if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
+            d.parked = false;
+        }
+    }
+
+    pub fn is_parked(&self, id: WindowId) -> bool {
+        self.tree
+            .window_node(id)
+            .is_some_and(|n| self.tree.is_parked(n))
+    }
+
     /// Clears the urgent flag of `node`, announcing it when it was set.
     fn clear_urgent(&mut self, node: NodeId, id: WindowId) {
         let was = match &mut self.tree.get_mut(node).kind {
@@ -590,6 +641,9 @@ impl Wm {
         let Some(node) = self.tree.window_node(id) else {
             return;
         };
+        if self.tree.is_parked(node) {
+            return;
+        }
         // Already the focus-path leaf: nothing changes, keep any selection.
         if self.tree.focused_descendant(self.tree.root()) == node {
             return;
@@ -654,7 +708,7 @@ impl Wm {
         let Some(node) = self.tree.window_node(id) else {
             return;
         };
-        if !self.tree.is_floating(node) {
+        if !self.tree.is_floating(node) || self.tree.is_parked(node) {
             return;
         }
         if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {

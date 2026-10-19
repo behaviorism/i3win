@@ -29,9 +29,9 @@ impl Wm {
     }
 
     fn find_marked(&self, name: &str) -> Option<NodeId> {
-        self.all_nodes()
-            .into_iter()
-            .find(|&n| self.tree.get(n).marks.iter().any(|m| m == name))
+        self.all_nodes().into_iter().find(|&n| {
+            !self.tree.fully_parked(n) && self.tree.get(n).marks.iter().any(|m| m == name)
+        })
     }
 
     /// The window a node-level event is reported for (itself, or the first

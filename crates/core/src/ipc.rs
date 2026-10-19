@@ -295,6 +295,7 @@ fn node_json(wm: &Wm, arr: &Arrangement, id: NodeId) -> Value {
         NodeKind::Workspace { num, .. } => v["num"] = json!(num.unwrap_or(-1)),
         NodeKind::Window(d) => {
             v["window"] = json!(d.info.id.0 as i64);
+            v["parked"] = json!(d.parked);
             v["window_properties"] = json!({
                 "class": d.info.class,
                 "instance": d.info.instance,

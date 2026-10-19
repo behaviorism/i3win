@@ -60,6 +60,9 @@ pub struct WindowData {
     pub urgent: bool,
     /// Value of `Wm::urgent_counter` when the window last became urgent.
     pub urgent_since: u64,
+    /// The window left with a Windows virtual desktop: it keeps its node and
+    /// place but takes no part in the arrangement or in focus.
+    pub parked: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -308,9 +311,11 @@ impl Tree {
         }
     }
 
+    /// Live (not parked) windows in `id`'s subtree.
     pub fn windows_under(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
         self.collect_windows(id, &mut out);
+        out.retain(|&w| !self.is_parked(w));
         out
     }
 
@@ -321,6 +326,25 @@ impl Tree {
         }
         for &c in n.children.iter().chain(n.floating.iter()) {
             self.collect_windows(c, out);
+        }
+    }
+
+    /// Whether `id` is a parked window.
+    pub fn is_parked(&self, id: NodeId) -> bool {
+        matches!(&self.get(id).kind, NodeKind::Window(d) if d.parked)
+    }
+
+    /// Whether `id` is a parked window, or a container holding windows that
+    /// are all parked: it takes no space and never gets focus.
+    pub fn fully_parked(&self, id: NodeId) -> bool {
+        match self.get(id).kind {
+            NodeKind::Window(_) => self.is_parked(id),
+            NodeKind::Container => {
+                let mut all = Vec::new();
+                self.collect_windows(id, &mut all);
+                !all.is_empty() && all.iter().all(|&w| self.is_parked(w))
+            }
+            _ => false,
         }
     }
 
@@ -349,7 +373,7 @@ impl Tree {
 
     pub fn focused_descendant(&self, id: NodeId) -> NodeId {
         let mut cur = id;
-        while let Some(&next) = self.get(cur).focus.first() {
+        while let Some(&next) = self.get(cur).focus.iter().find(|&&c| !self.fully_parked(c)) {
             cur = next;
         }
         cur
@@ -359,7 +383,11 @@ impl Tree {
         let mut cur = id;
         loop {
             let n = self.get(cur);
-            match n.focus.iter().find(|c| n.children.contains(c)) {
+            match n
+                .focus
+                .iter()
+                .find(|&&c| n.children.contains(&c) && !self.fully_parked(c))
+            {
                 Some(&next) => cur = next,
                 None => return cur,
             }
@@ -512,6 +540,7 @@ mod tests {
                 floating_rect: None,
                 urgent: false,
                 urgent_since: 0,
+                parked: false,
             }),
             Layout::SplitH,
         )

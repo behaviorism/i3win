@@ -30,6 +30,7 @@ use crate::win::events::{self, PlatformEvent};
 use crate::win::hidden::{self, HiddenStore, HideTracker};
 use crate::win::mouse::{self, Button, MouseEvent};
 use crate::win::overlay::Overlay;
+use crate::win::vdesk;
 use crate::win::window::{self, Manage};
 use crate::win::{keyboard, monitors};
 
@@ -549,7 +550,7 @@ impl App {
                 (self.wm.tree.window_id(node), false, false)
             };
         }
-        (self.is_managed(top).then_some(top), false, false)
+        (self.is_live(top).then_some(top), false, false)
     }
 
     /// Focus-follows-mouse: runs the hover decision for the pointer at (x, y).
@@ -798,11 +799,16 @@ impl App {
         self.wm.tree.window_node(id).is_some()
     }
 
+    /// Managed and not parked (a parked window is invisible and takes no input).
+    fn is_live(&self, id: WindowId) -> bool {
+        self.is_managed(id) && !self.wm.is_parked(id)
+    }
+
     /// See `foreground_counts_as_managed`.
     fn foreground_managed(&self, fg: WindowId) -> bool {
         foreground_counts_as_managed(
             fg,
-            self.is_managed(fg),
+            self.is_live(fg),
             self.bars.owns(fg) || self.decos.lookup(fg).is_some(),
             mainloop::main_hwnd(),
         )
@@ -812,16 +818,43 @@ impl App {
     pub fn on_event(&mut self, ev: PlatformEvent) {
         let id = event_id(ev);
         let now = Instant::now();
+        let parked = self.wm.is_parked(id);
+        if parked
+            && matches!(ev, PlatformEvent::Shown(_) | PlatformEvent::Foreground(_))
+            && vdesk::on_current_desktop(id) != Some(false)
+        {
+            // Back on the current desktop: the window returns to its old place.
+            self.wm.unpark(id);
+            reconcile::invalidate(&mut self.applied, id);
+        }
         let tracked_hide = matches!(ev, PlatformEvent::Hidden(_)) && self.tracker.consume(id, now);
         let recent_hide =
             matches!(ev, PlatformEvent::Foreground(_)) && self.tracker.hid_recently(id, now);
-        match route(
+        let decision = route(
             ev,
             self.is_managed(id),
             tracked_hide,
             recent_hide,
             &self.applied,
-        ) {
+        );
+        match decision {
+            // A parked window only waits for its desktop; a hide while it is on
+            // the current one is the app's own and unmanages as usual.
+            EventDecision::Unmanage
+                if self.wm.is_parked(id)
+                    && matches!(ev, PlatformEvent::Hidden(_))
+                    && vdesk::on_current_desktop(id) != Some(true) => {}
+            EventDecision::Unmanage
+                if matches!(ev, PlatformEvent::Hidden(_))
+                    && !self.wm.is_parked(id)
+                    && window::is_window(id)
+                    && vdesk::on_current_desktop(id) == Some(false) =>
+            {
+                // Cloaked by a virtual desktop switch: keep its place in the layout.
+                self.wm.park(id);
+                self.move_start.remove(&id);
+            }
+            EventDecision::MoveSizeStart | EventDecision::MoveSizeEnd if self.wm.is_parked(id) => {}
             EventDecision::Ignore => {}
             EventDecision::TryManage => Self::try_manage_in(&mut self.wm, id),
             EventDecision::Unmanage => {

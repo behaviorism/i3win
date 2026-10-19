@@ -4,13 +4,19 @@ use crate::tree::{NodeId, NodeKind};
 use crate::wm::Wm;
 
 impl Wm {
+    /// `nodes` without the fully parked ones (except `keep`).
+    fn live(&self, mut nodes: Vec<NodeId>, keep: NodeId) -> Vec<NodeId> {
+        nodes.retain(|&n| n == keep || !self.tree.fully_parked(n));
+        nodes
+    }
+
     pub fn focus_direction(&mut self, from: NodeId, dir: Direction) -> Result<(), String> {
         self.focused_container = None;
         if self.tree.is_floating(from) {
             let Some(ws) = self.tree.workspace_of(from) else {
                 return Ok(());
             };
-            let floating = self.tree.get(ws).floating.clone();
+            let floating = self.live(self.tree.get(ws).floating.clone(), from);
             let Some(i) = floating.iter().position(|&n| n == from) else {
                 return Ok(());
             };
@@ -45,16 +51,16 @@ impl Wm {
                 return Ok(());
             };
             if self.tree.get(p).layout.orientation() == dir.orientation() {
-                let multi = self.tree.get(p).children.len() >= 2;
+                let kids = self.live(self.tree.get(p).children.clone(), cur);
+                let multi = kids.len() >= 2;
                 if multi {
                     outermost = Some(p);
                 }
-                if let Some(i) = self.tree.index_in_parent(cur) {
+                if let Some(i) = kids.iter().position(|&k| k == cur) {
                     let sibling = if dir.is_forward() {
-                        self.tree.get(p).children.get(i + 1)
+                        kids.get(i + 1)
                     } else {
-                        i.checked_sub(1)
-                            .and_then(|k| self.tree.get(p).children.get(k))
+                        i.checked_sub(1).and_then(|k| kids.get(k))
                     };
                     if let Some(&s) = sibling {
                         let f = self.tree.focused_tiling_descendant(s);
@@ -74,7 +80,7 @@ impl Wm {
     /// Focuses the focused tiling descendant of `p`'s first (forward) or
     /// last (backward) child.
     fn wrap_focus(&mut self, p: NodeId, dir: Direction) {
-        let children = &self.tree.get(p).children;
+        let children = self.live(self.tree.get(p).children.clone(), p);
         let target = if dir.is_forward() {
             children.first()
         } else {
@@ -101,6 +107,7 @@ impl Wm {
                 None => return,
             }
         };
+        let siblings = self.live(siblings, from);
         let Some(i) = siblings.iter().position(|&n| n == from) else {
             return;
         };
@@ -152,7 +159,7 @@ impl Wm {
     pub fn focus_child(&mut self, from: NodeId) {
         let n = self.tree.get(from);
         if matches!(n.kind, NodeKind::Container) {
-            if let Some(&c) = n.focus.first() {
+            if let Some(&c) = n.focus.iter().find(|&&c| !self.tree.fully_parked(c)) {
                 self.focus_in_place(c);
                 let leaf = self.tree.focused_descendant(c);
                 self.focused_container =
@@ -170,7 +177,8 @@ impl Wm {
         let want_floating = floating.unwrap_or_else(|| !self.tree.is_floating(from));
         if want_floating {
             let n = self.tree.get(ws);
-            if let Some(&f) = n.focus.iter().find(|c| n.floating.contains(c)) {
+            let live = |c: &&NodeId| n.floating.contains(c) && !self.tree.fully_parked(**c);
+            if let Some(&f) = n.focus.iter().find(live) {
                 self.focus_in_place(f);
             }
         } else {
@@ -185,7 +193,7 @@ impl Wm {
     /// bookkeeping) when needed. Emits no OS focus effect.
     pub(crate) fn focus_target(&mut self, n: NodeId) {
         self.focused_container = None;
-        if !self.tree.contains(n) {
+        if !self.tree.contains(n) || self.tree.fully_parked(n) {
             return;
         }
         if self.tree.workspace_of(n) == Some(self.scratch) {

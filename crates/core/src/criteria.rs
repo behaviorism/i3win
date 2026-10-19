@@ -219,7 +219,9 @@ impl Criteria {
 fn windows_and_containers(wm: &Wm) -> Vec<NodeId> {
     fn walk(wm: &Wm, n: NodeId, out: &mut Vec<NodeId>) {
         let node = wm.tree.get(n);
-        if matches!(node.kind, NodeKind::Window(_) | NodeKind::Container) {
+        if matches!(node.kind, NodeKind::Window(_) | NodeKind::Container)
+            && !wm.tree.fully_parked(n)
+        {
             out.push(n);
         }
         for &c in node.children.iter().chain(node.floating.iter()) {
