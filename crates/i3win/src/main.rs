@@ -149,7 +149,7 @@ fn main() {
         std::process::exit(1);
     }
     // On the desktop the user is on now, before the first flush can need it.
-    win::vdesk::create_marker(mainloop::main_hwnd());
+    win::vdesk::create_marker();
     ipc_server::start(ipc_pipe.clone());
     // Hooks go in as soon as the main window exists (their wake-ups need a target),
     // so windows shown by the recovery below are seen as late Shown events.

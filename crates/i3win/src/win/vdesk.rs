@@ -35,8 +35,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GetWindowThreadProcessId,
-    IsWindowVisible, RegisterClassW, ShowWindow, SW_SHOWNA, WNDCLASSW, WS_EX_NOACTIVATE, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GetWindow,
+    GetWindowThreadProcessId, IsWindowVisible, RegisterClassW, ShowWindow, GW_OWNER, SW_SHOWNA,
+    WINDOW_EX_STYLE, WNDCLASSW, WS_POPUP,
 };
 
 thread_local! {
@@ -150,10 +151,13 @@ unsafe extern "system" fn marker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-/// Creates the desktop marker on the current desktop, owned by the main window
-/// `owner`. Call once after the main window exists.
-pub fn create_marker(owner: isize) {
-    if owner == 0 || MARKER.get() != 0 {
+/// Creates the desktop marker on the current desktop. Call once at startup.
+///
+/// It is owned by a hidden owner of its own: an owned window takes its desktop
+/// from its owner, and i3win's main window is a tool window, which belongs to no
+/// desktop (verified: owned by it, the marker reported GUID_NULL).
+pub fn create_marker() {
+    if MARKER.get() != 0 {
         return;
     }
     // SAFETY: registers and creates a window of our own class on the UI thread.
@@ -169,9 +173,32 @@ pub fn create_marker(owner: isize) {
         };
         // Fails when already registered, which is fine.
         RegisterClassW(&wc);
-        // On-screen (off-screen windows may be treated differently), never activated.
+        // Never shown; not a tool window, so the marker it owns gets a desktop.
+        let owner = match CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("i3win_marker"),
+            w!("i3win desktop marker owner"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            hinst,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("vdesk: marker owner window: {e}");
+                return;
+            }
+        };
+        // On-screen (off-screen windows may be treated differently). No
+        // WS_EX_NOACTIVATE: with it the shell assigns no desktop (verified). Being
+        // cloaked and owned, it cannot be clicked, Alt+Tabbed or activated anyway.
         match CreateWindowExW(
-            WS_EX_NOACTIVATE,
+            WINDOW_EX_STYLE(0),
             w!("i3win_marker"),
             w!("i3win desktop marker"),
             WS_POPUP,
@@ -179,7 +206,7 @@ pub fn create_marker(owner: isize) {
             0,
             1,
             1,
-            HWND(owner as *mut c_void),
+            owner,
             None,
             hinst,
             None,
@@ -191,9 +218,9 @@ pub fn create_marker(owner: isize) {
             }
         }
     };
-    // SAFETY: plain calls on our own window; it never paints before being cloaked.
+    // SAFETY: plain calls on our own window. Cloaked before it is shown, so it is
+    // never drawn; it still gets a desktop (verified).
     unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOWNA);
         let on = BOOL(1);
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -201,6 +228,7 @@ pub fn create_marker(owner: isize) {
             &on as *const BOOL as *const c_void,
             std::mem::size_of::<BOOL>() as u32,
         );
+        let _ = ShowWindow(hwnd, SW_SHOWNA);
     }
     MARKER.set(hwnd.0 as isize);
 }
@@ -209,8 +237,15 @@ pub fn create_marker(owner: isize) {
 pub fn destroy_marker() {
     let m = MARKER.replace(0);
     if m != 0 {
-        // SAFETY: our own window, destroyed on its creating thread.
-        let _ = unsafe { DestroyWindow(HWND(m as *mut c_void)) };
+        // SAFETY: our own windows, destroyed on their creating thread; destroying
+        // the owner also destroys the marker.
+        unsafe {
+            let owner = GetWindow(HWND(m as *mut c_void), GW_OWNER);
+            let _ = DestroyWindow(HWND(m as *mut c_void));
+            if let Ok(o) = owner {
+                let _ = DestroyWindow(o);
+            }
+        }
     }
 }
 
