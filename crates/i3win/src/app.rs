@@ -286,6 +286,9 @@ fn button_up(button: Button) -> bool {
     }
 }
 
+/// Current-desktop hint and marker state, queried lazily once per pass.
+type DesktopCtx = (Option<GUID>, Option<(GUID, bool)>);
+
 pub struct App {
     pub wm: Wm,
     applied: Applied,
@@ -825,6 +828,7 @@ impl App {
         self.wm.unpark(id);
         reconcile::invalidate(&mut self.applied, id);
         if let Some(g) = desktop {
+            vdesk::move_marker_to(g);
             self.away.remove(&g);
             for w in self.wm.parked_windows() {
                 if self.hidden_desktop.get(&w) == Some(&g) {
@@ -837,13 +841,13 @@ impl App {
 
     /// Whether a parked window i3win hid may come back (None: not hidden by us).
     /// Its tab is gone, so `on_current_desktop` cannot be asked.
-    fn hidden_may_return(&self, id: WindowId, hint: &mut Option<Option<GUID>>) -> Option<bool> {
+    fn hidden_may_return(&self, id: WindowId, ctx: &mut Option<DesktopCtx>) -> Option<bool> {
         let g = *self.hidden_desktop.get(&id)?;
         if !self.away.contains(&g) {
             return Some(true);
         }
-        let h = *hint.get_or_insert_with(vdesk::current_desktop_hint);
-        Some(vdesk::sweep_unparks_hidden(g, &self.away, h))
+        let (h, m) = *ctx.get_or_insert_with(vdesk::current_context);
+        Some(vdesk::sweep_unparks_hidden(g, &self.away, h, m))
     }
 
     /// Forgets a window. A window we hid is shown first (when `restore`) so it is
@@ -869,13 +873,13 @@ impl App {
     /// forgotten, ones on the current desktop again come back. Costs a COM call per
     /// parked window, and there are none unless the user is on another desktop.
     fn sweep_parked(&mut self) {
-        let mut hint = None;
+        let mut ctx = None;
         for id in self.wm.parked_windows() {
             if !window::is_window(id) {
                 self.unmanage_window(id, false);
             } else if !self.wm.is_parked(id) {
                 // Already brought back by a sibling.
-            } else if let Some(back) = self.hidden_may_return(id, &mut hint) {
+            } else if let Some(back) = self.hidden_may_return(id, &mut ctx) {
                 if back {
                     self.unpark_window(id);
                 }
@@ -1231,19 +1235,19 @@ impl App {
             let mut touched = reconcile::would_show(&self.applied, &arr);
             touched.extend(focus_to_apply(&focus, leaf));
             let mut parked_any = false;
-            let mut hint = None;
+            let mut ctx: Option<DesktopCtx> = None;
             for id in touched {
                 if self.wm.is_parked(id) {
                     continue;
                 }
                 let off = match self.hidden_desktop.get(&id).copied() {
                     Some(g) => {
-                        let h = if self.away.contains(&g) {
-                            None
+                        let (h, m) = if self.away.contains(&g) {
+                            (None, None)
                         } else {
-                            *hint.get_or_insert_with(vdesk::current_desktop_hint)
+                            *ctx.get_or_insert_with(vdesk::current_context)
                         };
-                        let (off, mark) = vdesk::should_park_hidden(g, &self.away, h);
+                        let (off, mark) = vdesk::should_park_hidden(g, &self.away, h, m);
                         self.away.extend(mark);
                         off
                     }
@@ -1444,6 +1448,7 @@ impl App {
         keyboard::uninstall();
         mouse::uninstall();
         hidden::restore_all_hidden();
+        vdesk::destroy_marker();
         for (_, mut st) in self.statuses.drain() {
             if let Some(p) = st.process.as_mut() {
                 p.kill();
