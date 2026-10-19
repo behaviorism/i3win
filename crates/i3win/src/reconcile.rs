@@ -16,7 +16,7 @@ pub enum WinOp {
     },
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Applied {
     pub rects: HashMap<WindowId, Rect>,
     pub hidden: HashSet<WindowId>,

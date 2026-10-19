@@ -207,6 +207,19 @@ struct MoveStart {
     thawed: bool,
 }
 
+/// A window parked (left with a virtual desktop) during a native move/size loop: its
+/// END arrives while parked and is swallowed, so end the loop here. Unfrozen and with
+/// its applied rect forgotten, it is re-placed into its tile when it comes back.
+fn drop_native_loop(
+    applied: &mut Applied,
+    move_start: &mut HashMap<WindowId, MoveStart>,
+    id: WindowId,
+) {
+    move_start.remove(&id);
+    applied.frozen.remove(&id);
+    reconcile::invalidate(applied, id);
+}
+
 /// Judges every open native loop: thaws (keeping START) the ones frozen too long and
 /// forgets the ones the foreground left. Returns the windows to unfreeze.
 fn thaw_step(
@@ -966,10 +979,7 @@ impl App {
                     }
                 }
                 self.wm.park(id);
-                self.move_start.remove(&id);
-                // A native loop that ends while parked is swallowed: thaw it now.
-                self.applied.frozen.remove(&id);
-                reconcile::invalidate(&mut self.applied, id);
+                drop_native_loop(&mut self.applied, &mut self.move_start, id);
                 if self
                     .drag
                     .as_ref()
@@ -1469,6 +1479,63 @@ fn ipc_needs_flush(msg_type: u32, has_effects: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_parked_mid_drag_is_retiled_when_it_returns() {
+        use super::{drop_native_loop, MoveStart};
+        use crate::reconcile::{plan, Applied, WinOp};
+        use i3win_core::arrange::{Arrangement, WindowPlacement};
+        use i3win_core::geom::Rect;
+        use i3win_core::tree::WindowId;
+        use std::collections::{HashMap, HashSet};
+        let w = WindowId(7);
+        let tile = Rect::new(0, 0, 960, 1080);
+        let arr = |windows: Vec<WindowId>| Arrangement {
+            windows: windows
+                .into_iter()
+                .map(|id| WindowPlacement {
+                    id,
+                    rect: tile,
+                    floating: false,
+                    fullscreen: false,
+                })
+                .collect(),
+            hidden: vec![],
+            decos: vec![],
+            fullscreen_outputs: vec![],
+            rects: vec![],
+        };
+        let managed: HashSet<WindowId> = [w].into();
+        let mut applied = Applied::default();
+        plan(&mut applied, &arr(vec![w]), &managed);
+        // A native move starts (the user drags the window away from its tile).
+        let mut move_start = HashMap::new();
+        move_start.insert(
+            w,
+            MoveStart {
+                frame: tile,
+                at_ms: 0,
+                start_fg: Some(w),
+                on_border: false,
+                thawed: false,
+            },
+        );
+        applied.frozen.insert(w);
+        // Without the cleanup a frozen window is never re-placed.
+        let mut stuck = applied.clone();
+        assert!(plan(&mut stuck, &arr(vec![w]), &managed).is_empty());
+        // Parked mid-drag (its END will be swallowed), then back on its desktop.
+        drop_native_loop(&mut applied, &mut move_start, w);
+        assert!(move_start.is_empty() && !applied.frozen.contains(&w));
+        plan(&mut applied, &arr(vec![]), &managed); // while parked: in neither list
+        assert_eq!(
+            plan(&mut applied, &arr(vec![w]), &managed),
+            vec![WinOp::Place {
+                id: w,
+                rect: tile,
+                raise: false
+            }]
+        );
+    }
     #[test]
     fn click_routes_to_owning_bar() {
         use super::route_click;
