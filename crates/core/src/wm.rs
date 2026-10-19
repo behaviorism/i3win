@@ -588,6 +588,13 @@ impl Wm {
             return;
         }
         let before = self.focus_leaf_window();
+        // A selected parent that holds (or is) the window cannot stay selected.
+        if self
+            .focused_container
+            .is_some_and(|(c, _)| c == node || self.tree.is_ancestor(c, node))
+        {
+            self.focused_container = None;
+        }
         if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
             d.parked = true;
         }
@@ -619,6 +626,16 @@ impl Wm {
         if let NodeKind::Window(d) = &mut self.tree.get_mut(node).kind {
             d.parked = false;
         }
+    }
+
+    /// Every parked window, in tree order.
+    pub fn parked_windows(&self) -> Vec<WindowId> {
+        self.tree
+            .all_windows_under(self.tree.root())
+            .into_iter()
+            .filter(|&n| self.tree.is_parked(n))
+            .filter_map(|n| self.tree.window_id(n))
+            .collect()
     }
 
     pub fn is_parked(&self, id: WindowId) -> bool {

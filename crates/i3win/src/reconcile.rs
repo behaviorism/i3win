@@ -58,6 +58,15 @@ pub fn plan(applied: &mut Applied, arr: &Arrangement, managed: &HashSet<WindowId
     places
 }
 
+/// Windows `plan` would show: in the arrangement but still hidden by us.
+pub fn would_show(applied: &Applied, arr: &Arrangement) -> Vec<WindowId> {
+    arr.windows
+        .iter()
+        .map(|p| p.id)
+        .filter(|id| applied.hidden.contains(id))
+        .collect()
+}
+
 /// Forgets the applied rect so the next plan re-places the window.
 pub fn invalidate(applied: &mut Applied, id: WindowId) {
     applied.rects.remove(&id);
@@ -172,6 +181,20 @@ mod tests {
         assert!(plan(&mut a, &x, &managed(&[1])).is_empty());
         a.frozen.clear();
         assert_eq!(plan(&mut a, &x, &managed(&[1])).len(), 1);
+    }
+    #[test]
+    fn managed_window_in_neither_list_is_untouched() {
+        // A parked window is managed but left out of the arrangement: no ops, and
+        // its applied state survives until it comes back.
+        let mut a = Applied::default();
+        plan(&mut a, &arr(vec![], vec![1]), &managed(&[1]));
+        let ops = plan(&mut a, &arr(vec![], vec![]), &managed(&[1]));
+        assert!(ops.is_empty());
+        assert!(a.hidden.contains(&WindowId(1)));
+        let back = arr(vec![(1, Rect::new(0, 0, 5, 5), false)], vec![]);
+        assert_eq!(would_show(&a, &back), vec![WindowId(1)]);
+        let ops = plan(&mut a, &back, &managed(&[1]));
+        assert_eq!(ops.last(), Some(&WinOp::Show(WindowId(1))));
     }
     #[test]
     fn forgets_unmanaged() {

@@ -1149,6 +1149,29 @@ default_border normal 2
         assert_eq!(wm.focused_window(), Some(WindowId(2)));
     }
     #[test]
+    fn parked_windows_lists_only_parked() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        assert!(wm.parked_windows().is_empty());
+        wm.park(WindowId(2));
+        assert_eq!(wm.parked_windows(), vec![WindowId(2)]);
+        wm.unpark(WindowId(2));
+        assert!(wm.parked_windows().is_empty());
+    }
+    #[test]
+    fn parking_clears_the_selected_parent() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("split v");
+        wm.manage(win(3));
+        wm.run_command("focus parent");
+        assert_ne!(wm.focused(), wm.tree.window_node(WindowId(3)).unwrap());
+        wm.park(WindowId(3));
+        assert!(wm.focused_container.is_none());
+    }
+    #[test]
     fn workspace_with_only_parked_windows_is_kept() {
         let mut wm = test_wm();
         wm.manage(win(1));

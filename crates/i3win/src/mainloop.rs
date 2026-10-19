@@ -25,6 +25,10 @@ pub const DRAG_TIMER_ID: usize = 1;
 pub const HOVER_TIMER_ID: usize = 2;
 /// One-shot timer lifting a move/size freeze that never got its END event.
 pub const FREEZE_TIMER_ID: usize = 3;
+/// One-shot timer re-checking parked windows after a refused return (switch race).
+pub const VDESK_TIMER_ID: usize = 4;
+/// Delay before the parked windows are looked at again.
+const VDESK_TIMER_MS: u32 = 300;
 /// Tiled live resize throttle interval.
 const DRAG_TIMER_MS: u32 = 16;
 
@@ -35,6 +39,17 @@ pub fn arm_drag_timer() {
         // SAFETY: plain Win32 call on our own window.
         unsafe {
             SetTimer(HWND(main as *mut _), DRAG_TIMER_ID, DRAG_TIMER_MS, None);
+        }
+    }
+}
+
+/// Main thread: (re)arms the one-shot parked-window recheck timer.
+pub fn arm_vdesk_timer() {
+    let main = main_hwnd();
+    if main != 0 {
+        // SAFETY: plain Win32 call on our own window.
+        unsafe {
+            SetTimer(HWND(main as *mut _), VDESK_TIMER_ID, VDESK_TIMER_MS, None);
         }
     }
 }
@@ -287,6 +302,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = KillTimer(hwnd, FREEZE_TIMER_ID);
             if !with_app(|app| app.on_freeze_timer()) {
                 arm_freeze_timer();
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == VDESK_TIMER_ID => {
+            let _ = KillTimer(hwnd, VDESK_TIMER_ID);
+            if !with_app(|app| app.on_vdesk_timer()) {
+                arm_vdesk_timer();
             }
             LRESULT(0)
         }

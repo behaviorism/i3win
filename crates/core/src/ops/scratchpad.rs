@@ -135,13 +135,11 @@ impl Wm {
             self.send_to_scratch(leaf, false);
             return Ok(());
         }
-        let visible = self
-            .tree
-            .get(focused_ws)
-            .focus
-            .iter()
-            .copied()
-            .find(|&c| self.scratch_state(c) != ScratchState::None && self.tree.is_floating(c));
+        let visible = self.tree.get(focused_ws).focus.iter().copied().find(|&c| {
+            self.scratch_state(c) != ScratchState::None
+                && self.tree.is_floating(c)
+                && !self.tree.fully_parked(c)
+        });
         if let Some(v) = visible {
             self.focused_container = None;
             self.tree.set_focused(v);
@@ -155,7 +153,9 @@ impl Wm {
             .filter(|&w| w != focused_ws)
             .find_map(|w| {
                 self.tree.get(w).focus.iter().copied().find(|&c| {
-                    self.scratch_state(c) != ScratchState::None && self.tree.is_floating(c)
+                    self.scratch_state(c) != ScratchState::None
+                        && self.tree.is_floating(c)
+                        && !self.tree.fully_parked(c)
                 })
             });
         if let Some(n) = elsewhere {
@@ -226,6 +226,21 @@ mod tests {
         assert_eq!(wm.tree.workspace_of(n2), Some(wm.scratch_workspace()));
         assert!(!test_wm().run_command("scratchpad show")[0].success);
         check_invariants(&wm);
+    }
+    #[test]
+    fn scratchpad_show_skips_parked_windows() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.run_command("[id=2] move scratchpad");
+        wm.run_command("scratchpad show");
+        wm.park(WindowId(2));
+        // The visible scratchpad window is parked: show must not focus it, and
+        // with nothing else to show it fails.
+        wm.take_effects();
+        assert!(!wm.run_command("scratchpad show")[0].success);
+        assert_eq!(wm.focused_window(), Some(WindowId(1)));
+        assert!(wm.parked_windows().contains(&WindowId(2)));
     }
     #[test]
     fn scratchpad_windows_are_in_arrangement_hidden() {

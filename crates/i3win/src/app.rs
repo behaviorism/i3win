@@ -97,6 +97,17 @@ pub(crate) fn route(
     }
 }
 
+/// The windows reconcile keeps state for: placed, hidden, and parked ones (a parked
+/// window keeps its applied state, so it comes back cloaked or placed as it was).
+fn managed_set(arr: &Arrangement, parked: &[WindowId]) -> HashSet<WindowId> {
+    arr.windows
+        .iter()
+        .map(|p| p.id)
+        .chain(arr.hidden.iter().copied())
+        .chain(parked.iter().copied())
+        .collect()
+}
+
 /// Only the last queued focus request matters, and only while it still names the
 /// window at the end of the core's focus path.
 pub(crate) fn focus_to_apply(requests: &[WindowId], leaf: Option<WindowId>) -> Option<WindowId> {
@@ -799,6 +810,48 @@ impl App {
         self.wm.tree.window_node(id).is_some()
     }
 
+    /// Brings a parked window back exactly where it was.
+    fn unpark_window(&mut self, id: WindowId) {
+        self.wm.unpark(id);
+        reconcile::invalidate(&mut self.applied, id);
+    }
+
+    /// Forgets a window. A window we hid is shown first (when `restore`) so it is
+    /// never stranded.
+    fn unmanage_window(&mut self, id: WindowId, restore: bool) {
+        if restore
+            && self.store.contains(id)
+            && window::is_window(id)
+            && !(self.cloaked.contains(&id) && cloak::uncloak(id))
+        {
+            window::show(id);
+        }
+        self.cloaked.remove(&id);
+        self.wm.unmanage(id);
+        self.move_start.remove(&id);
+        self.tracker.forget(id);
+        self.store.remove(id);
+        self.store.persist_if_dirty();
+    }
+
+    /// Recovery for parked windows whose return was missed: destroyed ones are
+    /// forgotten, ones on the current desktop again come back. Costs a COM call per
+    /// parked window, and there are none unless the user is on another desktop.
+    fn sweep_parked(&mut self) {
+        for id in self.wm.parked_windows() {
+            if !window::is_window(id) {
+                self.unmanage_window(id, false);
+            } else if vdesk::on_current_desktop(id) == Some(true) {
+                self.unpark_window(id);
+            }
+        }
+    }
+
+    /// The virtual-desktop recheck timer fired: a flush sweeps the parked windows.
+    pub fn on_vdesk_timer(&mut self) {
+        self.flush();
+    }
+
     /// Managed and not parked (a parked window is invisible and takes no input).
     fn is_live(&self, id: WindowId) -> bool {
         self.is_managed(id) && !self.wm.is_parked(id)
@@ -818,14 +871,15 @@ impl App {
     pub fn on_event(&mut self, ev: PlatformEvent) {
         let id = event_id(ev);
         let now = Instant::now();
-        let parked = self.wm.is_parked(id);
-        if parked
+        if self.wm.is_parked(id)
             && matches!(ev, PlatformEvent::Shown(_) | PlatformEvent::Foreground(_))
-            && vdesk::on_current_desktop(id) != Some(false)
         {
-            // Back on the current desktop: the window returns to its old place.
-            self.wm.unpark(id);
-            reconcile::invalidate(&mut self.applied, id);
+            if vdesk::on_current_desktop(id) == Some(false) {
+                // Possibly a race with the switch animation: look again shortly.
+                mainloop::arm_vdesk_timer();
+            } else {
+                self.unpark_window(id);
+            }
         }
         let tracked_hide = matches!(ev, PlatformEvent::Hidden(_)) && self.tracker.consume(id, now);
         let recent_hide =
@@ -853,25 +907,22 @@ impl App {
                 // Cloaked by a virtual desktop switch: keep its place in the layout.
                 self.wm.park(id);
                 self.move_start.remove(&id);
+                // A native loop that ends while parked is swallowed: thaw it now.
+                self.applied.frozen.remove(&id);
+                reconcile::invalidate(&mut self.applied, id);
+                if self
+                    .drag
+                    .as_ref()
+                    .is_some_and(|s| self.wm.tree.window_id(s.drag.node) == Some(id))
+                {
+                    self.cancel_drag();
+                }
             }
             EventDecision::MoveSizeStart | EventDecision::MoveSizeEnd if self.wm.is_parked(id) => {}
             EventDecision::Ignore => {}
             EventDecision::TryManage => Self::try_manage_in(&mut self.wm, id),
             EventDecision::Unmanage => {
-                // A window we hid must never be stranded: show it before forgetting it.
-                if !matches!(ev, PlatformEvent::Destroyed(_))
-                    && self.store.contains(id)
-                    && window::is_window(id)
-                    && !(self.cloaked.contains(&id) && cloak::uncloak(id))
-                {
-                    window::show(id);
-                }
-                self.cloaked.remove(&id);
-                self.wm.unmanage(id);
-                self.move_start.remove(&id);
-                self.tracker.forget(id);
-                self.store.remove(id);
-                self.store.persist_if_dirty();
+                self.unmanage_window(id, !matches!(ev, PlatformEvent::Destroyed(_)));
             }
             EventDecision::Focus => self.wm.on_focus_changed(id),
             EventDecision::Title => {
@@ -1090,34 +1141,51 @@ impl App {
     /// Applies effects, then the arrangement, then focus.
     pub fn flush(&mut self) {
         self.thaw_expired();
+        self.sweep_parked();
         let mut focus = Vec::new();
-        loop {
-            let mut effects = std::mem::take(&mut self.pending);
-            effects.extend(self.wm.take_effects());
-            if effects.is_empty() {
-                break;
-            }
-            for e in effects {
-                match e {
-                    Effect::Exec(c) => spawn(&c, &self.pipe_name),
-                    Effect::Close(w) => window::close(w),
-                    Effect::Focus(w) => focus.push(w),
-                    Effect::Exit => mainloop::post(MainMsg::Shutdown),
-                    Effect::Reload => self.reload(),
-                    Effect::Ipc(ev) => {
-                        let (i, n, p) = ipc::event_json(&self.wm, &ev);
-                        ipc_server::broadcast(i, n, &p);
+        // Each extra pass parks at least one more window, so this ends.
+        let arr = loop {
+            loop {
+                let mut effects = std::mem::take(&mut self.pending);
+                effects.extend(self.wm.take_effects());
+                if effects.is_empty() {
+                    break;
+                }
+                for e in effects {
+                    match e {
+                        Effect::Exec(c) => spawn(&c, &self.pipe_name),
+                        Effect::Close(w) => window::close(w),
+                        Effect::Focus(w) => focus.push(w),
+                        Effect::Exit => mainloop::post(MainMsg::Shutdown),
+                        Effect::Reload => self.reload(),
+                        Effect::Ipc(ev) => {
+                            let (i, n, p) = ipc::event_json(&self.wm, &ev);
+                            ipc_server::broadcast(i, n, &p);
+                        }
                     }
                 }
             }
-        }
-        let arr = self.wm.arrange();
-        let managed: HashSet<WindowId> = arr
-            .windows
-            .iter()
-            .map(|p| p.id)
-            .chain(arr.hidden.iter().copied())
-            .collect();
+            let arr = self.wm.arrange();
+            // A window that left with another virtual desktop must not be shown,
+            // placed or focused (an i3win-hidden one gets no event when it leaves).
+            let leaf = self
+                .wm
+                .tree
+                .window_id(self.wm.tree.focused_descendant(self.wm.tree.root()));
+            let mut touched = reconcile::would_show(&self.applied, &arr);
+            touched.extend(focus_to_apply(&focus, leaf));
+            let mut parked_any = false;
+            for id in touched {
+                if !self.wm.is_parked(id) && vdesk::on_current_desktop(id) == Some(false) {
+                    self.wm.park(id);
+                    parked_any = true;
+                }
+            }
+            if !parked_any {
+                break arr;
+            }
+        };
+        let managed = managed_set(&arr, &self.wm.parked_windows());
         let ops = reconcile::plan(&mut self.applied, &arr, &managed);
         let mut hides = Vec::new();
         for op in ops {
@@ -1396,6 +1464,19 @@ mod tests {
         assert!(thaw_step(&mut m, 61_000, Some(WindowId(9))).is_empty());
         assert!(m.is_empty());
     }
+    #[test]
+    fn managed_set_keeps_parked_windows() {
+        let arr = Arrangement {
+            windows: vec![],
+            hidden: vec![WindowId(2)],
+            decos: vec![],
+            fullscreen_outputs: vec![],
+            rects: vec![],
+        };
+        let set = managed_set(&arr, &[WindowId(3)]);
+        assert_eq!(set, HashSet::from([WindowId(2), WindowId(3)]));
+    }
+
     #[test]
     fn abandoned_loop_is_unfrozen_and_forgotten() {
         let w = WindowId(1);
