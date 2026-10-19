@@ -33,6 +33,7 @@ use crate::win::overlay::Overlay;
 use crate::win::vdesk;
 use crate::win::window::{self, Manage};
 use crate::win::{keyboard, monitors};
+use windows::core::GUID;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -291,6 +292,11 @@ pub struct App {
     tracker: HideTracker,
     /// Windows currently hidden by cloaking (the rest of `applied.hidden` use SW_HIDE).
     cloaked: HashSet<WindowId>,
+    /// Virtual desktop of each window i3win hid itself, recorded before `DeleteTab`
+    /// erases the association (see `vdesk`).
+    hidden_desktop: HashMap<WindowId, GUID>,
+    /// Virtual desktops the user has left.
+    away: HashSet<GUID>,
     decos: Decos,
     bars: Bars,
     /// Blocks changed since the bars were last redrawn.
@@ -365,6 +371,8 @@ impl App {
             applied: Applied::default(),
             tracker: HideTracker::new(),
             cloaked: HashSet::new(),
+            hidden_desktop: HashMap::new(),
+            away: HashSet::new(),
             decos: Decos::new(),
             bars: Bars::new(),
             bars_dirty: false,
@@ -810,10 +818,32 @@ impl App {
         self.wm.tree.window_node(id).is_some()
     }
 
-    /// Brings a parked window back exactly where it was.
+    /// Brings a parked window back exactly where it was. Its desktop is back, so its
+    /// away marker clears and the windows i3win hid on that desktop return too.
     fn unpark_window(&mut self, id: WindowId) {
+        let desktop = vdesk::desktop_of(id).or_else(|| self.hidden_desktop.get(&id).copied());
         self.wm.unpark(id);
         reconcile::invalidate(&mut self.applied, id);
+        if let Some(g) = desktop {
+            self.away.remove(&g);
+            for w in self.wm.parked_windows() {
+                if self.hidden_desktop.get(&w) == Some(&g) {
+                    self.wm.unpark(w);
+                    reconcile::invalidate(&mut self.applied, w);
+                }
+            }
+        }
+    }
+
+    /// Whether a parked window i3win hid may come back (None: not hidden by us).
+    /// Its tab is gone, so `on_current_desktop` cannot be asked.
+    fn hidden_may_return(&self, id: WindowId, hint: &mut Option<Option<GUID>>) -> Option<bool> {
+        let g = *self.hidden_desktop.get(&id)?;
+        if !self.away.contains(&g) {
+            return Some(true);
+        }
+        let h = *hint.get_or_insert_with(vdesk::current_desktop_hint);
+        Some(vdesk::sweep_unparks_hidden(g, &self.away, h))
     }
 
     /// Forgets a window. A window we hid is shown first (when `restore`) so it is
@@ -827,6 +857,7 @@ impl App {
             window::show(id);
         }
         self.cloaked.remove(&id);
+        self.hidden_desktop.remove(&id);
         self.wm.unmanage(id);
         self.move_start.remove(&id);
         self.tracker.forget(id);
@@ -838,9 +869,16 @@ impl App {
     /// forgotten, ones on the current desktop again come back. Costs a COM call per
     /// parked window, and there are none unless the user is on another desktop.
     fn sweep_parked(&mut self) {
+        let mut hint = None;
         for id in self.wm.parked_windows() {
             if !window::is_window(id) {
                 self.unmanage_window(id, false);
+            } else if !self.wm.is_parked(id) {
+                // Already brought back by a sibling.
+            } else if let Some(back) = self.hidden_may_return(id, &mut hint) {
+                if back {
+                    self.unpark_window(id);
+                }
             } else if vdesk::on_current_desktop(id) == Some(true) {
                 self.unpark_window(id);
             }
@@ -874,7 +912,11 @@ impl App {
         if self.wm.is_parked(id)
             && matches!(ev, PlatformEvent::Shown(_) | PlatformEvent::Foreground(_))
         {
-            if vdesk::on_current_desktop(id) == Some(false) {
+            let stay = match self.hidden_may_return(id, &mut None) {
+                Some(back) => !back,
+                None => vdesk::on_current_desktop(id) == Some(false),
+            };
+            if stay {
                 // Possibly a race with the switch animation: look again shortly.
                 mainloop::arm_vdesk_timer();
             } else {
@@ -905,6 +947,20 @@ impl App {
                     && vdesk::on_current_desktop(id) == Some(false) =>
             {
                 // Cloaked by a virtual desktop switch: keep its place in the layout.
+                if let Some(g) = vdesk::desktop_of(id) {
+                    // We left g: the windows we hid there left with it.
+                    self.away.insert(g);
+                    let siblings: Vec<WindowId> = self
+                        .hidden_desktop
+                        .iter()
+                        .filter(|&(w, d)| *d == g && !self.wm.is_parked(*w))
+                        .map(|(w, _)| *w)
+                        .collect();
+                    for w in siblings {
+                        self.wm.park(w);
+                        reconcile::invalidate(&mut self.applied, w);
+                    }
+                }
                 self.wm.park(id);
                 self.move_start.remove(&id);
                 // A native loop that ends while parked is swallowed: thaw it now.
@@ -1175,8 +1231,25 @@ impl App {
             let mut touched = reconcile::would_show(&self.applied, &arr);
             touched.extend(focus_to_apply(&focus, leaf));
             let mut parked_any = false;
+            let mut hint = None;
             for id in touched {
-                if !self.wm.is_parked(id) && vdesk::on_current_desktop(id) == Some(false) {
+                if self.wm.is_parked(id) {
+                    continue;
+                }
+                let off = match self.hidden_desktop.get(&id).copied() {
+                    Some(g) => {
+                        let h = if self.away.contains(&g) {
+                            None
+                        } else {
+                            *hint.get_or_insert_with(vdesk::current_desktop_hint)
+                        };
+                        let (off, mark) = vdesk::should_park_hidden(g, &self.away, h);
+                        self.away.extend(mark);
+                        off
+                    }
+                    None => vdesk::on_current_desktop(id) == Some(false),
+                };
+                if off {
                     self.wm.park(id);
                     parked_any = true;
                 }
@@ -1192,6 +1265,7 @@ impl App {
             match op {
                 WinOp::Hide(id) => hides.push(id),
                 WinOp::Show(id) => {
+                    self.hidden_desktop.remove(&id);
                     if !(self.cloaked.remove(&id) && cloak::uncloak(id)) {
                         window::show(id);
                     }
@@ -1279,6 +1353,10 @@ impl App {
         }
         self.store.persist_if_dirty();
         for &id in ids {
+            // Before `cloak` deletes the tab and with it the association.
+            if let Some(g) = vdesk::desktop_of(id) {
+                self.hidden_desktop.insert(id, g);
+            }
             self.tracker.expect(id, Instant::now());
             let cloaked = self.wm.config.hide_method == HideMethod::Cloak && cloak::cloak(id);
             if cloaked {
