@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use i3win_core::tree::NodeId;
@@ -103,6 +103,8 @@ pub enum MainMsg {
 pub(crate) static QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+/// The "TaskbarCreated" message broadcast when Explorer (re)creates the taskbar.
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static QUEUE: Mutex<VecDeque<MainMsg>> = Mutex::new(VecDeque::new());
 /// True while a WM_APP_MAIN wake-up is posted and not yet being handled.
 static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -288,6 +290,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+            if !with_app(|app| app.on_taskbar_created()) {
+                repost(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
         WM_DISPLAYCHANGE => {
             if !with_app(|app| app.refresh_outputs()) {
                 repost(hwnd, msg, wp, lp);
@@ -342,6 +350,10 @@ pub fn create_main_window() -> Result<HWND> {
             None,
         )?;
         MAIN_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        TASKBAR_CREATED.store(
+            RegisterWindowMessageW(w!("TaskbarCreated")),
+            Ordering::Relaxed,
+        );
         // Deliver anything queued before the window existed.
         WAKE_PENDING.store(true, Ordering::Release);
         let _ = PostMessageW(hwnd, WM_APP_MAIN, WPARAM(0), LPARAM(0));

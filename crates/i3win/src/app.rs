@@ -631,6 +631,19 @@ impl App {
     }
 
     /// The freeze timer fired: lifts stale freezes.
+    /// Explorer recreated the taskbar: it re-adds buttons for every window, including
+    /// cloaked ones, so remove those again on a fresh shell connection.
+    pub fn on_taskbar_created(&mut self) {
+        cloak::reset();
+        for &id in &self.cloaked {
+            cloak::remove_tab(id);
+        }
+        log::info!(
+            "taskbar recreated; re-hid {} taskbar buttons",
+            self.cloaked.len()
+        );
+    }
+
     pub fn on_freeze_timer(&mut self) {
         let thawed = self.thaw_expired();
         if self.move_start.values().any(|m| !m.thawed) {

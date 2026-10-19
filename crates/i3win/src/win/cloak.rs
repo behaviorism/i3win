@@ -163,6 +163,23 @@ pub fn uncloak(id: WindowId) -> bool {
     r.is_ok()
 }
 
+/// Removes the taskbar button of an already cloaked window.
+pub fn remove_tab(id: WindowId) -> bool {
+    let r = with_conn(|conn| {
+        // SAFETY: plain COM call.
+        unsafe { conn.taskbar.DeleteTab(HWND(id.0 as *mut c_void)) }
+    });
+    if let Err(e) = &r {
+        log::debug!("remove_tab {:#x} failed: {e}", id.0);
+    }
+    r.is_ok()
+}
+
+/// Drops the cached shell connection (Explorer restarted); the next call reconnects.
+pub fn reset() {
+    CONN.with(|c| *c.borrow_mut() = None);
+}
+
 /// Uncloaks `id` from any thread (crash and exit paths) with its own COM objects,
 /// leaving the main-thread cache alone. Harmless for a window that is not cloaked.
 pub fn uncloak_fresh(id: WindowId) {
