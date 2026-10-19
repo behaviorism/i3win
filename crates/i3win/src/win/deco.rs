@@ -14,9 +14,10 @@ use i3win_core::markup::parse_markup;
 use i3win_core::tree::{NodeId, WindowId};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    GetLastError, BOOL, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{InvalidateRect, HBRUSH, HDC, HFONT};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+use windows::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow, HBRUSH, HDC, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -204,7 +205,23 @@ fn set_data(hwnd: HWND, data: &DecoData) {
         if let Some(slot) = p.as_mut() {
             *slot = data.clone();
         }
+        // Repaint now, in step with the windows being rearranged.
         let _ = InvalidateRect(hwnd, None, false);
+        let _ = UpdateWindow(hwnd);
+    }
+}
+
+/// Cloaks (or uncloaks) one of our own deco windows.
+fn set_cloaked(hwnd: HWND, on: bool) {
+    let v = BOOL::from(on);
+    // SAFETY: our own window; the value is a BOOL of the size passed.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &v as *const BOOL as *const std::ffi::c_void,
+            size_of::<BOOL>() as u32,
+        );
     }
 }
 
@@ -225,20 +242,7 @@ impl Decos {
     /// Brings the deco windows in line with `arr`.
     pub fn reconcile(&mut self, arr: &Arrangement, cfg: &Config, scale_of: impl Fn(Rect) -> f32) {
         let live: HashSet<NodeId> = arr.decos.iter().map(deco_key).collect();
-        let stale: Vec<NodeId> = self
-            .windows
-            .keys()
-            .filter(|k| !live.contains(k))
-            .copied()
-            .collect();
-        for k in stale {
-            if let Some((hwnd, _)) = self.windows.remove(&k) {
-                // SAFETY: destroying our own window.
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
-                }
-            }
-        }
+        let mut created_now = Vec::new();
         for d in &arr.decos {
             let key = deco_key(d);
             let r = deco_rect(d);
@@ -251,7 +255,13 @@ impl Decos {
             let (hwnd, created, changed, old_rect) = match self.windows.get(&key) {
                 Some((h, old)) => (*h, false, *old != data, deco_rect(&old.deco)),
                 None => match create_window(&data) {
-                    Some(h) => (h, true, false, r),
+                    Some(h) => {
+                        // Cloaked until painted: a shown but unpainted window lets the
+                        // wallpaper through for a frame.
+                        set_cloaked(h, true);
+                        created_now.push(h);
+                        (h, true, false, r)
+                    }
                     None => continue,
                 },
             };
@@ -299,6 +309,28 @@ impl Decos {
                 }
             }
             self.windows.insert(key, (hwnd, data));
+        }
+        for &hwnd in &created_now {
+            // SAFETY: our own, now shown window: paint synchronously, then reveal it.
+            unsafe {
+                let _ = UpdateWindow(hwnd);
+            }
+            set_cloaked(hwnd, false);
+        }
+        // Old decos go last, once the new ones cover their places.
+        let stale: Vec<NodeId> = self
+            .windows
+            .keys()
+            .filter(|k| !live.contains(k))
+            .copied()
+            .collect();
+        for k in stale {
+            if let Some((hwnd, _)) = self.windows.remove(&k) {
+                // SAFETY: destroying our own window.
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
         }
     }
 

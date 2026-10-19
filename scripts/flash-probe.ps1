@@ -1,13 +1,13 @@
 # Measures visual gaps ("flash") during workspace and tab switches: a Notepad (or an
 # Explorer window on an empty folder, or a dark Chrome app window) fills the screen on each workspace /
 # tab; a few screen points are read before each switch and then sampled as fast as
-# possible for 600 ms after it. A point turning to the wallpaper colour (read with
-# everything minimised) means the background showed through; other changes are
-# fades or unpainted content.
+# possible for 600 ms after it. A sample matching neither the colour before the switch
+# nor the colour the point settles on is a flash; wallpaper-coloured flashes (read with
+# everything minimised) mean the background showed through.
 # Commands go straight over the IPC pipe: a spawned i3win-msg console would itself show up
 # as a flash (and get tiled), and process start-up would delay the sampling.
-# Run: cargo build --workspace; powershell -ExecutionPolicy Bypass -File scripts\flash-probe.ps1 [-bin <dir>] [-app notepad|explorer|chrome] [-config <file>]
-param([string]$bin = "$(Split-Path -Parent $PSScriptRoot)\target\debug", [string]$app = "notepad", [string]$config)
+# Run: cargo build --workspace; powershell -ExecutionPolicy Bypass -File scripts\flash-probe.ps1 [-bin <dir>] [-app notepad|explorer|chrome] [-config <file>] [-points "x,y;x,y"]
+param([string]$bin = "$(Split-Path -Parent $PSScriptRoot)\target\debug", [string]$app = "notepad", [string]$config, [string]$points)
 $ErrorActionPreference = 'Continue'
 $exe = "$bin\i3win.exe"
 Add-Type @"
@@ -41,24 +41,35 @@ public class P {
   static bool Near(uint a, uint b) {
     return Math.Abs(Ch(a, 0) - Ch(b, 0)) <= 20 && Math.Abs(Ch(a, 8) - Ch(b, 8)) <= 20 && Math.Abs(Ch(a, 16) - Ch(b, 16)) <= 20;
   }
-  // Samples the points for ms milliseconds. A sample is "diff" when any point differs
-  // from its colour before the switch (want), and "wall" when a point that was not
-  // showing the wallpaper before the switch now does (points where the wallpaper is
-  // near-white are skipped: unpainted windows flash white too). Returns
-  // "samples diff wall firstWallMs".
+  // Samples the points for ms milliseconds. A round is "transient" when some point
+  // shows neither its colour before the switch (want) nor the colour it settles on
+  // (its last sample): that is a flash, while a lasting change (a new title, focus
+  // colours) is not. A transient round is also a "wall" round when that point shows
+  // the wallpaper colour (near-white wallpaper is skipped: unpainted windows flash
+  // white too). Returns "rounds transient wall firstTransientMs firstHit".
   public static string Sample(int[] xs, int[] ys, int ms, uint[] want, uint[] wall) {
-    IntPtr dc = GetDC(IntPtr.Zero); var sw = Stopwatch.StartNew(); int n = 0, diff = 0, walls = 0; long first = -1; string seen = "";
+    IntPtr dc = GetDC(IntPtr.Zero); var sw = Stopwatch.StartNew();
+    var rounds = new System.Collections.Generic.List<uint[]>(); var times = new System.Collections.Generic.List<long>();
     while (sw.ElapsedMilliseconds < ms) {
-      bool d = false, w = false; n++;
-      for (int i = 0; i < xs.Length; i++) {
-        uint c = GetPixel(dc, xs[i], ys[i]);
-        if (!Near(c, want[i])) d = true;
-        if (Near(c, wall[i]) && !Near(want[i], wall[i]) && !Near(wall[i], 0xFFFFFF)) { w = true; if (seen == "") seen = "p" + i + "=" + c.ToString("X6") + " want " + want[i].ToString("X6"); }
-      }
-      if (d) diff++;
-      if (w) { walls++; if (first < 0) first = sw.ElapsedMilliseconds; }
+      var c = new uint[xs.Length];
+      for (int i = 0; i < xs.Length; i++) c[i] = GetPixel(dc, xs[i], ys[i]);
+      rounds.Add(c); times.Add(sw.ElapsedMilliseconds);
     }
-    ReleaseDC(IntPtr.Zero, dc); return n + " " + diff + " " + walls + " " + first + " " + (seen == "" ? "-" : seen.Replace(" ", "_"));
+    ReleaseDC(IntPtr.Zero, dc);
+    uint[] fin = rounds[rounds.Count - 1]; int trans = 0, walls = 0; long first = -1; string seen = "-";
+    for (int r = 0; r < rounds.Count; r++) {
+      bool t = false, w = false;
+      for (int i = 0; i < xs.Length; i++) {
+        uint c = rounds[r][i];
+        if (Near(c, want[i]) || Near(c, fin[i])) continue;
+        t = true;
+        if (Near(c, wall[i]) && !Near(wall[i], 0xFFFFFF)) w = true;
+        if (first < 0) { first = times[r]; seen = "p" + i + "=" + c.ToString("X6") + "_was_" + want[i].ToString("X6") + "_ends_" + fin[i].ToString("X6"); }
+      }
+      if (t) trans++;
+      if (w) walls++;
+    }
+    return rounds.Count + " " + trans + " " + walls + " " + first + " " + seen;
   }
   public static uint[] Pixels(int[] xs, int[] ys) {
     var r = new uint[xs.Length]; for (int i = 0; i < xs.Length; i++) r[i] = Pixel(xs[i], ys[i]); return r;
@@ -66,20 +77,25 @@ public class P {
 }
 "@
 function Msg { [P]::Cmd(($args -join ' ')) }
-# Sample points spread over the screen (the tab bar sits near the top).
-[int[]]$xs = 960, 480, 1440, 960, 300
-[int[]]$ys = 540, 300, 800, 30, 1000
+# Sample points spread over the screen; the last one sits in the title bar row.
+[int[]]$xs = 960, 480, 1440, 960, 300, 1800
+[int[]]$ys = 540, 300, 800, 30, 1000, 8
+# Fewer points sample faster (each GetPixel waits for DWM, ~7 ms).
+if ($points) {
+  $xs = [int[]]@($points -split ';' | ForEach-Object { ($_ -split ',')[0] })
+  $ys = [int[]]@($points -split ';' | ForEach-Object { ($_ -split ',')[1] })
+}
 function Probe($label, [scriptblock]$switch) {
-  $diffs = @(); $walls = @()
+  $trans = @(); $walls = @()
   for ($i = 0; $i -lt 6; $i++) {
     $want = [P]::Pixels($xs, $ys)
     & $switch $i
     $r = [P]::Sample($xs, $ys, 600, $want, $wall) -split ' '
-    $diffs += [int]$r[1]; $walls += [int]$r[2]; if ($r[4] -ne '-') { "    wallpaper hit: $($r[4]) at $($r[3])ms" }
+    $trans += [int]$r[1]; $walls += [int]$r[2]; if ($r[4] -ne '-') { "    first transient: $($r[4]) at $($r[3])ms" }
     Start-Sleep -Milliseconds 300
   }
-  "{0}: wallpaper seen on {1}/6 switches (wallpaper samples: {2}; any-change samples: {3})" -f $label,
-    @($walls | Where-Object { $_ -gt 0 }).Count, ($walls -join ','), ($diffs -join ',')
+  "{0}: flash on {1}/6 switches (transient samples: {2}; of them wallpaper-coloured: {3})" -f $label,
+    @($trans | Where-Object { $_ -gt 0 }).Count, ($trans -join ','), ($walls -join ',')
 }
 
 $running = Get-Process i3win -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path
