@@ -77,17 +77,20 @@ pub(crate) fn decide(ev: PlatformEvent, managed: bool, expected_hide: bool) -> E
 }
 
 /// Event routing including what we know about our own hides: a Hidden event for a
-/// window in `applied.hidden` is never an unmanage, and a Foreground event for one
-/// is noise caused by our own hiding.
+/// window in `applied.hidden` is never an unmanage. A Foreground event for one right
+/// after we hid it (`recent_hide`) is noise from our own hiding; a later one is the
+/// app activating itself and goes to `focus_on_window_activation` (a cloaked window
+/// would otherwise hold the keyboard while invisible).
 pub(crate) fn route(
     ev: PlatformEvent,
     managed: bool,
     tracked_hide: bool,
+    recent_hide: bool,
     applied: &Applied,
 ) -> EventDecision {
     let hidden_by_us = applied.hidden.contains(&event_id(ev));
     match ev {
-        PlatformEvent::Foreground(_) if hidden_by_us => EventDecision::Ignore,
+        PlatformEvent::Foreground(_) if hidden_by_us && recent_hide => EventDecision::Ignore,
         PlatformEvent::Hidden(_) => decide(ev, managed, tracked_hide || hidden_by_us),
         _ => decide(ev, managed, false),
     }
@@ -795,9 +798,17 @@ impl App {
     /// Handles one platform event. Does not flush; the caller flushes once per batch.
     pub fn on_event(&mut self, ev: PlatformEvent) {
         let id = event_id(ev);
-        let tracked_hide =
-            matches!(ev, PlatformEvent::Hidden(_)) && self.tracker.consume(id, Instant::now());
-        match route(ev, self.is_managed(id), tracked_hide, &self.applied) {
+        let now = Instant::now();
+        let tracked_hide = matches!(ev, PlatformEvent::Hidden(_)) && self.tracker.consume(id, now);
+        let recent_hide =
+            matches!(ev, PlatformEvent::Foreground(_)) && self.tracker.hid_recently(id, now);
+        match route(
+            ev,
+            self.is_managed(id),
+            tracked_hide,
+            recent_hide,
+            &self.applied,
+        ) {
             EventDecision::Ignore => {}
             EventDecision::TryManage => Self::try_manage_in(&mut self.wm, id),
             EventDecision::Unmanage => {
@@ -1377,17 +1388,29 @@ mod tests {
         let mut applied = Applied::default();
         applied.hidden.insert(WindowId(1));
         assert_eq!(
-            route(PlatformEvent::Hidden(WindowId(1)), true, false, &applied),
+            route(
+                PlatformEvent::Hidden(WindowId(1)),
+                true,
+                false,
+                false,
+                &applied
+            ),
             EventDecision::Ignore
         );
         // An id we did not hide still unmanages.
         assert_eq!(
-            route(PlatformEvent::Hidden(WindowId(2)), true, false, &applied),
+            route(
+                PlatformEvent::Hidden(WindowId(2)),
+                true,
+                false,
+                false,
+                &applied
+            ),
             EventDecision::Unmanage
         );
     }
     #[test]
-    fn foreground_of_hidden_window_is_ignored() {
+    fn foreground_of_just_hidden_window_is_ignored() {
         let mut applied = Applied::default();
         applied.hidden.insert(WindowId(1));
         assert_eq!(
@@ -1395,6 +1418,7 @@ mod tests {
                 PlatformEvent::Foreground(WindowId(1)),
                 true,
                 false,
+                true,
                 &applied
             ),
             EventDecision::Ignore
@@ -1403,6 +1427,22 @@ mod tests {
             route(
                 PlatformEvent::Foreground(WindowId(2)),
                 true,
+                false,
+                false,
+                &applied
+            ),
+            EventDecision::Focus
+        );
+    }
+    #[test]
+    fn hidden_window_activating_itself_later_is_a_focus_event() {
+        let mut applied = Applied::default();
+        applied.hidden.insert(WindowId(1));
+        assert_eq!(
+            route(
+                PlatformEvent::Foreground(WindowId(1)),
+                true,
+                false,
                 false,
                 &applied
             ),

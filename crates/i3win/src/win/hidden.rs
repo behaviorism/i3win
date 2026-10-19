@@ -10,6 +10,9 @@ use i3win_core::tree::WindowId;
 use super::{cloak, window};
 
 const EXPECT_TTL: Duration = Duration::from_secs(2);
+/// After we hide a window, its foreground events are stale noise for this long;
+/// later ones are the app activating itself.
+const ACTIVATION_GRACE: Duration = Duration::from_secs(1);
 
 /// Process-global copy of the hidden set, readable from panic hooks and
 /// console-control handlers where the `App` is unreachable.
@@ -23,6 +26,8 @@ fn lock_mirror() -> std::sync::MutexGuard<'static, BTreeSet<isize>> {
 #[derive(Default)]
 pub struct HideTracker {
     pending: HashMap<WindowId, Vec<Instant>>,
+    /// When each window was last hidden by us (not consumed by events).
+    last_hide: HashMap<WindowId, Instant>,
 }
 
 impl HideTracker {
@@ -32,6 +37,14 @@ impl HideTracker {
 
     pub fn expect(&mut self, id: WindowId, now: Instant) {
         self.pending.entry(id).or_default().push(now);
+        self.last_hide.insert(id, now);
+    }
+
+    /// Whether we hid `id` within the activation grace period.
+    pub fn hid_recently(&self, id: WindowId, now: Instant) -> bool {
+        self.last_hide
+            .get(&id)
+            .is_some_and(|t| now.saturating_duration_since(*t) <= ACTIVATION_GRACE)
     }
 
     /// Drops expired expectations, then removes one if present.
@@ -52,6 +65,7 @@ impl HideTracker {
 
     pub fn forget(&mut self, id: WindowId) {
         self.pending.remove(&id);
+        self.last_hide.remove(&id);
     }
 }
 
@@ -195,6 +209,21 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn tracker_reports_recent_hides_until_the_grace_ends() {
+        let t0 = Instant::now();
+        let mut t = HideTracker::new();
+        let w = WindowId(5);
+        assert!(!t.hid_recently(w, t0));
+        t.expect(w, t0);
+        // Consuming the hide event does not end the grace period.
+        assert!(t.consume(w, t0));
+        assert!(t.hid_recently(w, t0 + Duration::from_millis(900)));
+        assert!(!t.hid_recently(w, t0 + Duration::from_millis(1100)));
+        t.expect(w, t0);
+        t.forget(w);
+        assert!(!t.hid_recently(w, t0));
+    }
     #[test]
     fn tracker_consumes_expected_hides_and_expires() {
         let t0 = Instant::now();
