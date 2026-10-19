@@ -377,11 +377,13 @@ impl Wm {
                 return false;
             }
             if pn.layout == want {
-                if let Some(i) = pn.children.iter().position(|&s| s == c) {
+                // Parked siblings take no space: the neighbour is a live one.
+                let live = self.tree.live_children(p);
+                if let Some(i) = live.iter().position(|&s| s == c) {
                     let sib = if forward {
-                        pn.children.get(i + 1)
+                        live.get(i + 1)
                     } else {
-                        i.checked_sub(1).and_then(|j| pn.children.get(j))
+                        i.checked_sub(1).and_then(|j| live.get(j))
                     };
                     if let Some(&s) = sib {
                         break (p, s);
@@ -398,7 +400,15 @@ impl Wm {
         if total <= 0 {
             return false;
         }
-        let (pc, ps) = (self.tree.get(c).percent, self.tree.get(s).percent);
+        // Compute in the live share (what arrange lays out), store scaled back.
+        let share = self.tree.live_share(p, &self.tree.live_children(p));
+        if share <= 1e-12 {
+            return false;
+        }
+        let (pc, ps) = (
+            self.tree.get(c).percent / share,
+            self.tree.get(s).percent / share,
+        );
         let want_delta = f64::from(delta_px) / f64::from(total);
         let lo = (MIN_PERCENT - pc).min(0.0);
         let hi = (ps - MIN_PERCENT).max(0.0);
@@ -406,8 +416,8 @@ impl Wm {
         if !delta.is_finite() || delta.abs() < 1e-12 {
             return false;
         }
-        self.tree.get_mut(c).percent = pc + delta;
-        self.tree.get_mut(s).percent = ps - delta;
+        self.tree.get_mut(c).percent = (pc + delta) * share;
+        self.tree.get_mut(s).percent = (ps - delta) * share;
         true
     }
 }

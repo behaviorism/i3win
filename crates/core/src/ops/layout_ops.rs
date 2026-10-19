@@ -44,12 +44,12 @@ impl Wm {
             self.focused_container = None;
         }
         if is_ws {
-            if self.tree.get(target).children.len() <= 1 {
+            if self.tree.live_children(target).len() <= 1 {
                 self.tree.get_mut(target).layout = layout;
             }
         } else if is_window {
             match self.tree.parent(target) {
-                Some(p) if self.tree.get(p).children.len() == 1 => {
+                Some(p) if self.tree.live_children(p).len() == 1 => {
                     self.tree.get_mut(p).layout = layout;
                 }
                 Some(_) => {
@@ -162,7 +162,9 @@ impl Wm {
         if !grow {
             delta = -delta;
         }
-        let new = self.tree.get(c).percent + delta;
+        // Work in the live share, as arrange lays out.
+        let share = self.tree.live_share(p, &self.tree.live_children(p));
+        let new = self.tree.get(c).percent / share + delta;
         self.set_child_percent(p, c, new)
     }
 
@@ -219,7 +221,7 @@ impl Wm {
     }
 
     /// Nearest ancestor-or-self `c` of `target` whose parent `p` has layout
-    /// `want` and at least two children.
+    /// `want` and at least two live (not parked) children.
     fn resize_ancestor(
         &self,
         target: NodeId,
@@ -230,7 +232,10 @@ impl Wm {
         while c != ws {
             let p = self.tree.parent(c)?;
             let pn = self.tree.get(p);
-            if pn.layout == want && pn.children.len() >= 2 && pn.children.contains(&c) {
+            if pn.layout == want
+                && pn.children.contains(&c)
+                && self.tree.live_children(p).len() >= 2
+            {
                 return Some((c, p));
             }
             c = p;
@@ -238,12 +243,17 @@ impl Wm {
         None
     }
 
-    /// Gives child `c` of `p` the fraction `new`; siblings scale proportionally,
-    /// each staying at least 5%.
+    /// Gives child `c` of `p` the fraction `new` of the live children's
+    /// space; live siblings scale proportionally, each staying at least 5%.
+    /// Parked children keep their stored percent.
     fn set_child_percent(&mut self, p: NodeId, c: NodeId, new: f64) -> Result<(), String> {
-        let sibs = self.tree.get(p).children.clone();
+        let sibs = self.tree.live_children(p);
         let n = sibs.len();
-        let old = self.tree.get(c).percent;
+        let share = self.tree.live_share(p, &sibs);
+        if share <= 1e-12 {
+            return Err("cannot resize further".into());
+        }
+        let old = self.tree.get(c).percent / share;
         if !new.is_finite()
             || new < MIN_PERCENT - EPS
             || new > 1.0 - MIN_PERCENT * (n as f64 - 1.0) + EPS
@@ -257,16 +267,16 @@ impl Wm {
         let factor = (1.0 - new) / denom;
         let mut updates = Vec::with_capacity(n);
         for &s in sibs.iter().filter(|&&s| s != c) {
-            let v = self.tree.get(s).percent * factor;
+            let v = self.tree.get(s).percent / share * factor;
             if !v.is_finite() || v < MIN_PERCENT - EPS {
                 return Err("cannot resize further".into());
             }
-            updates.push((s, v));
+            updates.push((s, v * share));
         }
         for (s, v) in updates {
             self.tree.get_mut(s).percent = v;
         }
-        self.tree.get_mut(c).percent = new;
+        self.tree.get_mut(c).percent = new * share;
         Ok(())
     }
 
@@ -473,5 +483,99 @@ mod fix_tests {
         wm.tree.get_mut(ch[1]).percent = 0.85;
         let r = wm.run_command("resize shrink width 10 ppt");
         assert!(r[0].success, "{:?}", r[0].error);
+    }
+}
+
+#[cfg(test)]
+mod parked_tests {
+    use crate::geom::Direction;
+    use crate::testutil::*;
+    use crate::tree::{ScratchState, WindowId};
+
+    fn pct(wm: &crate::wm::Wm, i: isize) -> f64 {
+        wm.tree
+            .get(wm.tree.window_node(WindowId(i)).unwrap())
+            .percent
+    }
+
+    #[test]
+    fn move_right_steps_over_parked_sibling() {
+        let mut wm = test_wm();
+        for i in 1..=3 {
+            wm.manage(win(i));
+        }
+        wm.park(WindowId(2));
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        wm.focus_node(n1);
+        wm.run_command("move right");
+        assert_eq!(
+            wm.tree
+                .window_id(wm.tree.get(wm.focused_workspace()).children[2]),
+            Some(WindowId(1))
+        );
+        wm.unpark(WindowId(2));
+        // One press moved w1 past the one visible neighbour (w3).
+        let order: Vec<_> = wm
+            .tree
+            .get(wm.focused_workspace())
+            .children
+            .iter()
+            .filter(|&&c| wm.tree.window_id(c) != Some(WindowId(2)))
+            .filter_map(|&c| wm.tree.window_id(c))
+            .collect();
+        assert_eq!(order, vec![WindowId(3), WindowId(1)]);
+        check_invariants(&wm);
+    }
+
+    #[test]
+    fn resize_ignores_parked_sibling_and_keeps_sum() {
+        let mut wm = test_wm();
+        for i in 1..=3 {
+            wm.manage(win(i));
+        }
+        wm.park(WindowId(2));
+        let parked = pct(&wm, 2);
+        let (p1, p3) = (pct(&wm, 1), pct(&wm, 3));
+        let share = p1 + p3;
+        let n3 = wm.tree.window_node(WindowId(3)).unwrap();
+        wm.focus_node(n3);
+        assert!(wm.run_command("resize grow width 10 ppt")[0].success);
+        assert!((pct(&wm, 2) - parked).abs() < 1e-12);
+        // Visible pair: 50/50 became 60/40 of their share.
+        assert!((pct(&wm, 3) - 0.6 * share).abs() < 1e-9);
+        assert!((pct(&wm, 1) - 0.4 * share).abs() < 1e-9);
+        wm.unpark(WindowId(2));
+        check_invariants(&wm);
+        let sum = pct(&wm, 1) + pct(&wm, 2) + pct(&wm, 3);
+        assert!((sum - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mouse_resize_edge_ignores_parked_sibling() {
+        let mut wm = test_wm();
+        wm.config.bars.clear();
+        for i in 1..=3 {
+            wm.manage(win(i));
+        }
+        wm.park(WindowId(2));
+        let parked = pct(&wm, 2);
+        let n1 = wm.tree.window_node(WindowId(1)).unwrap();
+        assert!(wm.resize_edge(n1, Direction::Right, 100));
+        assert!((pct(&wm, 2) - parked).abs() < 1e-12);
+        assert!((pct(&wm, 1) + pct(&wm, 3) + parked - 1.0).abs() < 1e-9);
+        assert!(pct(&wm, 1) > pct(&wm, 3));
+    }
+
+    #[test]
+    fn parked_window_rehomed_to_scratch_is_tracked() {
+        let mut wm = test_wm();
+        wm.manage(win(1));
+        wm.manage(win(2));
+        wm.park(WindowId(2));
+        let n2 = wm.tree.window_node(WindowId(2)).unwrap();
+        let ws = wm.focused_workspace();
+        wm.on_node_rehomed(n2, Some(ws), wm.scratch);
+        assert!(wm.scratch_order.contains(&n2));
+        assert_eq!(wm.tree.get(n2).scratchpad, ScratchState::Fresh);
     }
 }

@@ -381,7 +381,8 @@ impl Wm {
         }
         let to_scratch = new == self.scratch;
         self.tree.get_mut(node).fullscreen = false;
-        for n in self.tree.windows_under(node) {
+        // Parked windows travel with their container too.
+        for n in self.tree.all_windows_under(node) {
             let nd = self.tree.get_mut(n);
             nd.fullscreen = false;
             if !to_scratch {

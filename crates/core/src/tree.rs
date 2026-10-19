@@ -348,6 +348,30 @@ impl Tree {
         }
     }
 
+    /// Tiling children of `id` that take space (not fully parked), in order.
+    pub fn live_children(&self, id: NodeId) -> Vec<NodeId> {
+        let mut kids = self.get(id).children.clone();
+        kids.retain(|&c| !self.fully_parked(c));
+        kids
+    }
+
+    /// Divisor arrange renormalises the live children's percents by: their
+    /// sum when some sibling is parked, 1.0 otherwise.
+    pub fn live_share(&self, id: NodeId, live: &[NodeId]) -> f64 {
+        if live.len() == self.get(id).children.len() {
+            1.0
+        } else {
+            live.iter().map(|&c| self.get(c).percent).sum()
+        }
+    }
+
+    /// Every window in `id`'s subtree, parked ones included.
+    pub fn all_windows_under(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        self.collect_windows(id, &mut out);
+        out
+    }
+
     fn move_to_front(&mut self, parent: NodeId, child: NodeId) {
         let f = &mut self.get_mut(parent).focus;
         f.retain(|&c| c != child);

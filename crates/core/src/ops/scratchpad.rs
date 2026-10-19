@@ -163,12 +163,10 @@ impl Wm {
             return Ok(());
         }
         self.scratch_order.retain(|&x| self.tree.contains(x));
-        let hidden = self
-            .scratch_order
-            .iter()
-            .rev()
-            .copied()
-            .find(|&x| self.tree.workspace_of(x) == Some(self.scratch));
+        let hidden =
+            self.scratch_order.iter().rev().copied().find(|&x| {
+                self.tree.workspace_of(x) == Some(self.scratch) && !self.tree.is_parked(x)
+            });
         match hidden {
             Some(n) => {
                 self.show_scratch_window(n);

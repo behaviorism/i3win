@@ -180,7 +180,7 @@ impl Wm {
             let is_ws = matches!(self.tree.get(p).kind, NodeKind::Workspace { .. });
             if self.tree.get(p).layout.orientation() != dir.orientation() {
                 if is_ws {
-                    if self.tree.get(p).children.len() <= 1 {
+                    if self.tree.live_children(p).len() <= 1 {
                         return Outcome::Output;
                     }
                     self.reorient_workspace(p, dir);
@@ -193,11 +193,13 @@ impl Wm {
                 return Outcome::Done;
             };
             if cur == n {
+                // Parked siblings take no space: step over them.
+                let kids = &self.tree.get(p).children;
+                let live = |k: &&NodeId| !self.tree.fully_parked(**k);
                 let neighbor = if forward {
-                    self.tree.get(p).children.get(i + 1).copied()
+                    kids.iter().skip(i + 1).find(live).copied()
                 } else {
-                    i.checked_sub(1)
-                        .and_then(|k| self.tree.get(p).children.get(k).copied())
+                    kids.iter().take(i).rev().find(live).copied()
                 };
                 match neighbor {
                     Some(nb) if matches!(self.tree.get(nb).kind, NodeKind::Window(_)) => {
